@@ -1,0 +1,20 @@
+# =====================================================
+# H2 洩漏智慧檢測系統 - Python 套件需求
+# Python 3.11 (conda env: leakdetect)
+# =====================================================
+
+fastapi==0.132.0
+uvicorn==0.41.0
+pydantic==2.12.5
+numpy==2.3.5
+pandas==2.3.3
+scipy==1.16.3
+scikit-learn==1.7.2
+xgboost==3.1.2
+matplotlib==3.10.7
+nptdms==1.10.0
+
+# nidaqmx 需要另外安裝 NI-DAQmx Runtime 驅動（不能只靠 pip）
+# Windows 請至 NI 官網下載：https://www.ni.com/zh-tw/support/downloads/drivers/download.ni-daq-mx.html
+# 驅動裝完後再執行：pip install nidaqmx==0.9.0
+nidaqmx==0.9.0

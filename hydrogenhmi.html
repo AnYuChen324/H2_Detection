@@ -1,0 +1,2494 @@
+<!-- ============================================================
+     網頁基本設定
+     建立 HTML 網頁、設定語言、編碼、畫面縮放，以及網頁標題與字型
+     ============================================================ -->
+<!DOCTYPE html>
+<html lang="zh-TW">     <!-- 主要語言是：繁體中文（台灣） -->
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">     <!-- 不同螢幕尺寸可以正常縮放 -->
+<title>H₂ 洩漏智慧檢測系統</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Noto+Sans+TC:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+  /* ============================================================
+       全域樣式設定
+       定義整個網頁會共用的顏色、字型與基本版面設定
+       ============================================================ */
+  :root {
+    --bg:#f0f4f8; --surface:#fff; --border:#d0dae6; --border-bright:#a8bcd0;
+    --text-primary:#1a2636; --text-secondary:#4a6080; --text-dim:#8aa0b8;
+    --accent-blue:#1a6fd4; --accent-cyan:#0099cc;
+    --ok:#00a854; --ok-dim:#e6f7ef;                                            /* normal 正常 - 綠色 */
+    --warn:#e65c00; --warn-dim:#fff3e0;                                        /* disturbance_suspect 疑似干擾 - 橘色 */
+    --leak:#d93025; --leak-dim:#fce8e6;                                        /* leak 洩漏 - 紅色 */
+    --mono:'Share Tech Mono',monospace; --sans:'Noto Sans TC',sans-serif;
+    }
+    
+  /* ============================================================
+       網頁基礎版面
+       清除瀏覽器預設間距，設定整體字型、背景、文字顏色與高度
+       ============================================================ */
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:var(--bg);color:var(--text-primary);font-family:var(--sans);min-height:100vh;display:flex;flex-direction:column;}
+  
+  /* ============================================================
+       背景網格效果
+       在整個網頁背景加上淡淡的水平與垂直網格線
+       ============================================================ */
+  body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:40px 40px;opacity:.4;pointer-events:none;}
+
+  /* ============================================================
+       Header
+       網頁最上方標題區域的版面與樣式
+       ============================================================ */
+  header{display:flex;align-items:center;justify-content:space-between;padding:14px 32px;border-bottom:1px solid var(--border);background:rgba(255,255,255,.95);backdrop-filter:blur(8px);position:sticky;top:0;z-index:100;box-shadow:0 1px 8px rgba(0,0,0,.06);}
+  .logo{display:flex;align-items:center;gap:12px;}
+  .logo-icon{width:36px;height:36px;border:1.5px solid var(--accent-cyan);border-radius:6px;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:13px;color:var(--accent-cyan);letter-spacing:-1px;box-shadow:0 0 12px rgba(0,153,204,.18);}
+  .logo-text{font-size:13px;color:var(--text-secondary);font-weight:300;}
+  .logo-text strong{display:block;font-size:15px;color:var(--text-primary);font-weight:500;}
+  .header-right{display:flex;align-items:center;gap:20px;}
+  .model-chip{display:flex;align-items:center;gap:7px;padding:5px 14px;background:rgba(26,111,212,.07);border:1px solid rgba(26,111,212,.2);border-radius:20px;font-size:12px;color:var(--accent-blue);font-weight:500;}
+  .chip-dot{width:6px;height:6px;border-radius:50%;background:var(--accent-blue);animation:breathe 3s ease-in-out infinite;}
+  .clock{font-family:var(--mono);font-size:13px;color:var(--text-secondary);}
+
+  /* ============================================================
+       分頁導覽列與頁面動畫
+       Tabs 切換、page 顯示/隱藏、淡入動畫與各種閃爍動畫
+       ============================================================ */
+  /* Tabs 3個頁面 */
+  .tabs{display:flex;border-bottom:1px solid var(--border);padding:0 32px;background:rgba(255,255,255,.85);}
+  .tab{padding:12px 24px;font-size:13px;color:var(--text-secondary);cursor:pointer;border-bottom:2px solid transparent;transition:all .2s;letter-spacing:.05em;user-select:none;}
+  .tab:hover{color:var(--text-primary);}
+  .tab.active{color:var(--accent-cyan);border-bottom-color:var(--accent-cyan);}
+
+  /* Pages */
+  .page{display:none;padding:32px 32px 48px;max-width:1200px;margin:0 auto;width:100%;}
+  .page.active{display:block;animation:fadeIn .25s ease;}
+
+  @keyframes fadeIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+  @keyframes breathe{0%,100%{opacity:1}50%{opacity:.4}}
+  @keyframes blinkRed{0%,100%{opacity:1}50%{opacity:.2}}
+  @keyframes blinkOrange{0%,100%{opacity:1}50%{opacity:.4}}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @keyframes pulseRed{0%,100%{box-shadow:0 2px 16px rgba(217,48,37,.12)}50%{box-shadow:0 4px 32px rgba(217,48,37,.32)}}
+  @keyframes pulseOrange{0%,100%{box-shadow:0 2px 16px rgba(230,92,0,.12)}50%{box-shadow:0 4px 24px rgba(230,92,0,.28)}}
+  @keyframes waveIn{from{opacity:0;transform:scaleY(.5)}to{opacity:1;transform:scaleY(1)}}
+
+  /* ============================================================
+       控制列（CONTROL ROW）
+       模型狀態徽章、即時檢測按鈕、TDMS 上傳區、來源標籤
+       ============================================================ */
+  .control-row{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:24px;flex-wrap:wrap;}
+  /* 主監控頁每張大卡之間的統一間距 */
+  .main-card-gap{margin-bottom:22px;}
+  .control-left{display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
+  .control-right{display:flex;align-items:center;gap:10px;}
+  .drop-label{font-size:12px;font-weight:500;color:var(--text-secondary);white-space:nowrap;}
+  .model-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;font-size:11px;font-weight:500;transition:all .3s;}
+  .model-badge.ready{background:rgba(0,168,84,.1);color:var(--ok);}
+  .model-badge.notready{background:rgba(230,92,0,.1);color:var(--warn);}   /* 後端有回應但未就緒：橘色 */
+  .model-badge.offline{background:rgba(217,48,37,.1);color:var(--leak);}   /* 連不到後端：紅色 */
+  .model-badge.load{background:rgba(26,111,212,.1);color:var(--accent-blue);}
+  .badge-dot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:breathe 2s ease-in-out infinite;}
+  .model-fixed-name{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--text-primary);padding:9px 14px;background:var(--surface);border:1.5px solid var(--border-bright);border-radius:8px;}
+  .btn-detect{display:inline-flex;align-items:center;gap:10px;padding:14px 34px;background:var(--accent-blue);color:white;border:none;border-radius:10px;font-size:16px;font-weight:800;font-family:var(--sans);cursor:pointer;box-shadow:0 3px 14px rgba(26,111,212,.28);transition:all .2s ease;}
+  .btn-detect:hover{background:#155bbf;transform:translateY(-1px);}
+  .btn-detect:disabled{background:var(--border-bright);color:var(--text-dim);box-shadow:none;cursor:not-allowed;transform:none;}
+  .btn-sec{display:inline-flex;align-items:center;gap:8px;padding:10px 18px;background:transparent;border:1px solid var(--border-bright);color:var(--text-secondary);border-radius:8px;font-size:13px;font-family:var(--sans);cursor:pointer;transition:all .2s;}
+  .btn-sec:hover{border-color:var(--text-secondary);color:var(--text-primary);}
+  .btn-icon{width:15px;height:15px;fill:currentColor;}
+
+  /* ── TDMS 上傳區：選擇或拖曳 .tdms 檔案，供離線測試使用 ── */
+  .upload-zone{display:flex;align-items:center;gap:10px;padding:10px 16px;background:rgba(0,153,204,.05);border:1.5px dashed rgba(0,153,204,.35);border-radius:8px;cursor:pointer;transition:all .2s;position:relative;}
+  .upload-zone:hover{background:rgba(0,153,204,.1);border-color:var(--accent-cyan);}
+  .upload-zone.has-file{background:rgba(0,168,84,.06);border-color:rgba(0,168,84,.4);border-style:solid;}
+  .upload-zone input[type=file]{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;}
+  /* ── 輸入來源小卡：包住即時監控與 TDMS 測試兩種輸入模式 ── */
+  .input-mode-card{border:1px solid rgba(160,185,210,.45);background:rgba(255,255,255,.58);border-radius:12px;padding:18px 22px;display:flex;flex-direction:column;gap:16px;}
+  /* 每一列輸入模式：左側是模式名稱，右側是實際操作元件 */
+  .input-mode-row{display:grid;grid-template-columns:130px 1fr;align-items:center;column-gap:22px;}
+  /* 左側模式名稱，例如「即時監控」「TDMS 測試」 */
+  .input-mode-label{font-size:12px;font-weight:800;color:var(--text-secondary);letter-spacing:.1em;white-space:nowrap;}
+  /* 右側操作區：按鈕、輸入框、上傳區都放在這裡 */
+  .input-mode-actions{display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+  /* ── TDMS 上傳區：選擇或拖曳 .tdms 檔案，供離線測試使用 ── */
+  .upload-icon{width:16px;height:16px;fill:var(--accent-cyan);flex-shrink:0;}
+  .upload-label{font-size:12px;color:var(--text-secondary);}
+  .upload-label strong{display:block;font-size:13px;color:var(--text-primary);font-weight:600;}
+  .upload-clear{display:none;margin-left:auto;width:18px;height:18px;border-radius:50%;background:rgba(217,48,37,.1);border:none;cursor:pointer;color:var(--leak);font-size:13px;line-height:1;align-items:center;justify-content:center;flex-shrink:0;z-index:1;position:relative;}
+  .upload-zone.has-file .upload-clear{display:flex;}
+  .btn-tdms{display:inline-flex;align-items:center;gap:8px;padding:10px 22px;background:linear-gradient(135deg,#0099cc,#006fa3);color:white;border:none;border-radius:8px;font-size:14px;font-weight:700;font-family:var(--sans);cursor:pointer;box-shadow:0 2px 10px rgba(0,153,204,.3);transition:all .2s;}
+  .btn-tdms:hover{background:linear-gradient(135deg,#007faa,#005c88);transform:translateY(-1px);}
+  .btn-tdms:disabled{background:var(--border-bright);color:var(--text-dim);box-shadow:none;cursor:not-allowed;transform:none;}
+  .source-tag{font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:10px;font-weight:600;letter-spacing:.06em;}
+  .source-tag.live{background:rgba(0,168,84,.12);color:var(--ok);}
+  .source-tag.file{background:rgba(0,153,204,.12);color:var(--accent-cyan);}
+  .source-tag.idle{background:rgba(138,160,184,.15);color:var(--text-secondary);}   /* 待機：灰色 */
+  .source-tag.reconnect{background:rgba(230,92,0,.1);color:var(--warn);}              /* 重新連線中：橘色 */
+
+  /* ============================================================
+       診斷結果 Banner（STATUS BANNER）
+       三種狀態：ok（正常）/ warn（疑似干擾）/ leak（洩漏）
+       包含狀態燈、文字、計算時間列
+       ============================================================ */
+  .status-banner{border-radius:12px;padding:28px 36px;display:flex;align-items:center;justify-content:center;gap:28px;margin-top:22px;margin-bottom:22px;border:1px solid;transition:all .5s;position:relative;overflow:hidden;min-height:210px;}
+  .status-banner::before{content:'';position:absolute;inset:0;opacity:.04;background:radial-gradient(circle at 20% 50%,currentColor 0%,transparent 60%);}
+  .status-banner.ok{background:var(--ok-dim);border-color:var(--ok);color:var(--ok);box-shadow:0 2px 16px rgba(0,168,84,.1);}
+  .status-banner.warn{background:var(--warn-dim);border-color:var(--warn);color:var(--warn);animation:pulseOrange 2s ease-in-out infinite;}
+  .status-banner.leak{background:var(--leak-dim);border-color:var(--leak);color:var(--leak);animation:pulseRed 2s ease-in-out infinite;}
+  .status-indicator{width:60px;height:60px;border-radius:50%;border:2px solid currentColor;display:flex;align-items:center;justify-content:center;flex-shrink:0;position:absolute;left:9%;top:50%;transform:translateY(-50%);}
+  .status-indicator::after{content:'';position:absolute;width:44px;height:44px;border-radius:50%;background:currentColor;opacity:.12;}
+  .status-dot{width:26px;height:26px;border-radius:50%;background:currentColor;position:relative;z-index:1;}
+  .status-banner.ok   .status-dot{animation:breathe 3s ease-in-out infinite;box-shadow:0 0 10px var(--ok);}
+  .status-banner.warn .status-dot{animation:blinkOrange 1.2s ease-in-out infinite;box-shadow:0 0 10px var(--warn);}
+  .status-banner.leak .status-dot{animation:blinkRed 1s ease-in-out infinite;box-shadow:0 0 10px var(--leak);}
+  .status-info{ width:min(820px, 75%);text-align:center;}
+  .status-label{font-size:11px;letter-spacing:.15em;opacity:.7;margin-bottom:5px;font-weight:500;}
+  .status-text{font-size:28px;font-weight:700;}
+  .status-sub{font-size:12px;opacity:.6;margin-top:3px;font-family:var(--mono);}
+  .calc-row{display:flex;align-items:center;gap:14px;margin-top:12px;padding-top:12px;border-top:1px solid currentColor;opacity:.75;}
+  .calc-label{font-size:10px;letter-spacing:.12em;text-transform:uppercase;font-family:var(--mono);}
+  .calc-val{font-family:var(--mono);font-size:22px;font-weight:700;}
+  .calc-unit{font-size:11px;margin-left:2px;opacity:.7;}
+  .spinner{display:none;align-items:center;gap:8px;font-size:12px;font-family:var(--mono);}
+  .spinner.on{display:flex;}
+  .spin-ring{width:15px;height:15px;border:2px solid rgba(0,0,0,.1);border-top-color:currentColor;border-radius:50%;animation:spin .7s linear infinite;}
+
+  /* ============================================================
+       數值指標卡片（METRICS）
+       窗口統計、Leak Score 進度條
+       ============================================================ */
+  .metrics-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:22px;}
+  .metric-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px 28px;position:relative;overflow:hidden;}
+  .metric-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--accent-blue),var(--accent-cyan));opacity:.7;}
+  .metric-label{font-size:11px;letter-spacing:.12em;color:var(--text-secondary);font-weight:500;margin-bottom:12px;text-transform:uppercase;}
+  .metric-value{font-family:var(--mono);font-size:46px;color:var(--text-primary);line-height:1;letter-spacing:-1px;}
+  .metric-value .unit{font-size:15px;color:var(--text-secondary);margin-left:4px;letter-spacing:0;}
+  .metric-bar{margin-top:14px;height:4px;background:var(--border);border-radius:2px;overflow:hidden;}
+  .metric-bar-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--accent-blue),var(--accent-cyan));transition:width .8s cubic-bezier(.4,0,.2,1);}
+  .metric-range{display:flex;justify-content:space-between;margin-top:5px;font-family:var(--mono);font-size:10px;color:var(--text-dim);}
+  .metric-sub-row{display:flex;gap:18px;margin-top:14px;font-family:var(--mono);font-size:11px;color:var(--text-secondary);}
+  .metric-sub-row b{color:var(--text-primary);}
+
+  /* ============================================================
+       聲射訊號波形圖（WAVEFORM）
+       Canvas 波形顯示區、空白提示、波形資訊列
+       ============================================================ */
+  .wave-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px 24px;}
+  .wave-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;}
+  .wave-title{display:flex;align-items:center;gap:8px;font-size:11px;font-weight:500;color:var(--text-secondary);letter-spacing:.1em;text-transform:uppercase;}
+  .wave-meta{font-family:var(--mono);font-size:11px;color:var(--text-dim);}
+  .wave-empty{height:240px;display:flex;align-items:center;justify-content:center;border:1px dashed var(--border);border-radius:6px;color:var(--text-dim);font-family:var(--mono);font-size:12px;letter-spacing:.06em;}
+  .wave-canvas{width:100%;height:240px;display:none;border-radius:6px;background:#f8fafc;animation:waveIn .4s ease;}
+  .wave-footer{display:flex;gap:22px;margin-top:10px;font-family:var(--mono);font-size:11px;color:var(--text-dim);flex-wrap:wrap;}
+  .ws-label{opacity:.65;margin-right:4px;}
+  .ws-val{color:var(--text-secondary);font-weight:600;}
+
+  /* ============================================================
+       詳細設定頁（SETTINGS PAGE）
+       左欄：本機顯示設定（只影響前端）
+       右欄：後端 Runtime 參數唯讀表格
+       ============================================================ */
+  .settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:28px;}
+  .settings-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px;}
+  .settings-card-title{font-size:12px;font-weight:600;color:var(--text-secondary);letter-spacing:.1em;text-transform:uppercase;margin-bottom:20px;display:flex;align-items:center;gap:8px;}
+  .settings-card-title svg{width:14px;height:14px;fill:var(--accent-blue);}
+  .settings-card-note{font-size:11px;color:var(--text-dim);margin:-12px 0 18px;line-height:1.6;}
+  .field-group{margin-bottom:18px;}
+  .field-label{font-size:12px;font-weight:500;color:var(--text-secondary);margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;}
+  .field-unit{font-family:var(--mono);font-size:11px;color:var(--text-dim);}
+  .field-input{width:100%;background:var(--bg);border:1.5px solid var(--border-bright);border-radius:7px;padding:9px 12px;font-size:13px;font-family:var(--mono);color:var(--text-primary);transition:border-color .2s;}
+  .field-input:focus{outline:none;border-color:var(--accent-blue);background:white;}
+  .field-hint{font-size:11px;color:var(--text-dim);margin-top:5px;}
+  .param-table{width:100%;border-collapse:collapse;}
+  .param-table th{text-align:left;padding:7px 10px;font-size:10px;color:var(--text-dim);letter-spacing:.08em;border-bottom:1px solid var(--border);font-weight:400;text-transform:uppercase;}
+  .param-table td{padding:8px 10px;font-size:12px;font-family:var(--mono);color:var(--text-secondary);border-bottom:1px solid rgba(208,218,230,.4);}
+  .param-table td:first-child{color:var(--text-dim);font-size:11px;}
+  .param-highlight{color:var(--accent-blue)!important;font-weight:600;}
+  .save-btn{display:inline-flex;align-items:center;gap:8px;margin-top:8px;padding:10px 22px;background:var(--accent-blue);color:white;border:none;border-radius:8px;font-size:13px;font-weight:600;font-family:var(--sans);cursor:pointer;transition:all .2s;}
+  .save-btn:hover{background:#155bbf;}
+  .save-note{display:inline-block;margin-left:12px;font-size:12px;color:var(--ok);opacity:0;transition:opacity .3s;}
+  .save-note.show{opacity:1;}
+
+  /* ============================================================
+       歷史紀錄頁（LOG PAGE）
+       紀錄表格、信心值進度條、分頁器、匯出 CSV 按鈕
+       ============================================================ */
+  .log-toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;}
+  .log-count{font-family:var(--mono);font-size:12px;color:var(--text-dim);}
+  .export-btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;background:rgba(0,168,84,.1);border:1px solid var(--ok);color:var(--ok);border-radius:7px;font-size:12px;font-weight:500;font-family:var(--sans);cursor:pointer;transition:all .2s;}
+  .export-btn:hover{background:rgba(0,168,84,.2);}
+  .export-limit-label{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary);}
+  .export-select{padding:6px 8px;border:1px solid var(--border-bright);border-radius:6px;font-family:var(--mono);font-size:12px;color:var(--text-primary);background:var(--surface);}
+  .export-btn:disabled{opacity:.5;cursor:not-allowed;}
+  .log-table{width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);}
+  .log-table th{text-align:left;padding:10px 14px;color:var(--text-dim);letter-spacing:.08em;border-bottom:1px solid var(--border);font-weight:400;font-size:10px;text-transform:uppercase;}
+  .log-table td{padding:10px 14px;color:var(--text-secondary);border-bottom:1px solid var(--border);}
+  .log-table th, .log-table td{white-space:nowrap;}                                        /* 標題和內容不換行 */
+  .log-source{max-width:220px;overflow:hidden;text-overflow:ellipsis;}                       /* 來源太長時用 … 截斷 */
+  .log-table tr:hover td{background:rgba(26,111,212,.02);}
+  .log-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;vertical-align:middle;}
+  .conf-bar{display:flex;align-items:center;gap:8px;}
+  .conf-track{flex:1;height:3px;background:var(--border);border-radius:2px;}
+  .conf-fill{height:100%;border-radius:2px;background:var(--accent-cyan);}
+
+  /* 分頁器 */
+  .pagination{display:flex;align-items:center;gap:8px;margin-top:20px;justify-content:center;}
+  .page-btn{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border:1px solid var(--border-bright);border-radius:7px;font-family:var(--mono);font-size:13px;color:var(--text-secondary);cursor:pointer;transition:all .2s;background:var(--surface);}
+  .page-btn:hover{border-color:var(--accent-blue);color:var(--accent-blue);}
+  .page-btn.active{background:var(--accent-blue);color:white;border-color:var(--accent-blue);}
+  .page-btn:disabled,.page-btn[disabled]{opacity:.35;cursor:not-allowed;}
+  .page-info{font-family:var(--mono);font-size:11px;color:var(--text-dim);padding:0 8px;}
+
+  /* ============================================================
+       共用元件
+       section 標題線、清除確認對話框（Overlay）、捲軸樣式
+       ============================================================ */
+  .section-title{font-size:11px;letter-spacing:.15em;color:var(--text-secondary);text-transform:uppercase;margin-bottom:16px;display:flex;align-items:center;gap:12px;}
+  .section-title::after{content:'';flex:1;height:1px;background:var(--border);}
+
+  /* Overlay */
+  .overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);backdrop-filter:blur(4px);z-index:200;align-items:center;justify-content:center;}
+  .overlay.show{display:flex;animation:fadeIn .2s;}
+  .dialog{background:var(--surface);border:1px solid var(--border-bright);border-radius:12px;padding:32px;max-width:380px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,.12);}
+  .dialog-title{font-size:16px;font-weight:600;margin-bottom:8px;}
+  .dialog-desc{font-size:13px;color:var(--text-secondary);margin-bottom:24px;line-height:1.6;}
+  .dialog-btns{display:flex;gap:12px;justify-content:flex-end;}
+  .btn-danger{display:inline-flex;align-items:center;padding:9px 18px;background:rgba(217,48,37,.08);border:1px solid var(--leak);color:var(--leak);border-radius:8px;font-size:13px;font-family:var(--sans);cursor:pointer;transition:background .2s;}
+  .btn-danger:hover{background:rgba(217,48,37,.18);}
+
+  ::-webkit-scrollbar{width:5px;}
+  ::-webkit-scrollbar-track{background:var(--bg);}
+  ::-webkit-scrollbar-thumb{background:var(--border-bright);border-radius:3px;}
+  
+  /* ── 資料過期樣式 ── */
+  .stale {opacity: 0.60; filter: grayscale(60%); transition: opacity 0.3s, filter 0.3s;}
+  .stale::after {content: '　⚠️ 資料可能已過期'; font-size: 0.75em; color: #e74c3c;}
+
+  /* ── 右下角提示框 ── */
+  .toast{position:fixed;right:24px;bottom:24px;z-index:300;max-width:360px;padding:12px 16px;border-radius:8px;font-size:13px;line-height:1.5;color:#fff;box-shadow:0 6px 20px rgba(0,0,0,.15);opacity:0;transform:translateY(8px);pointer-events:none;transition:opacity .2s,transform .2s;}
+  .toast.show{opacity:1;transform:translateY(0);}
+  .toast.error{background:var(--leak);}              /* 錯誤：紅色 */
+  .toast.info{background:var(--text-secondary);}     /* 一般資訊：灰藍色 */
+
+</style>
+</head>
+<body>
+
+<!-- ============================================================
+     顯示連線中斷的文字
+     ============================================================ -->
+  <div id="conn-error-banner" style="display:none; background:#c0392b; color:#fff; 
+    padding:10px 16px; text-align:center; font-weight:bold;"></div>
+
+    <!-- 一般操作訊息：右下角小提示框，5 秒後自動消失 -->
+    <div id="toast" class="toast"></div>  
+
+<!-- ============================================================
+     Header：最上方標題列
+     顯示系統名稱、模型狀態標籤（從 /models 取得）、即時時鐘
+     ============================================================ -->
+<header>
+  <div class="logo">
+    <div class="logo-icon">H₂</div>
+    <div class="logo-text"><strong>氫能洩漏智慧檢測</strong>HMS-3000 監控系統 · v5.0</div>
+  </div>
+  <div class="header-right">
+    <div class="model-chip"><div class="chip-dot"></div><span id="chipName">XGBoost（雙感測器）</span></div>
+    <div class="clock" id="clock">--:--:--</div>
+  </div>
+</header>
+
+<!-- ============================================================
+     分頁導覽列
+     三個頁面：主監控 / 詳細設定 / 歷史紀錄
+     點擊後呼叫 switchTab() 切換 .page.active
+     ============================================================ -->
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('main',this)">主監控</div>
+  <div class="tab"        onclick="switchTab('settings',this)">詳細設定</div>
+  <div class="tab"        onclick="switchTab('log',this)">歷史紀錄</div>
+</div>
+
+<!-- ============================================================
+     主監控頁面（page-main）
+     ============================================================ -->
+<div class="page active" id="page-main">
+
+  <!-- 第一列：模型連線狀態列
+       左：診斷模型名稱 + 連線狀態徽章（就緒 / Demo 模式 / 連線中）
+       右：清除資料按鈕（呼叫 showClearConfirm → clearData → /clear）
+  -->
+  <div class="control-row" style="margin-bottom:12px">
+    <div class="control-left">
+      <span class="drop-label">診斷模型</span>
+      <span class="model-fixed-name">XGBoost（雙感測器）</span>
+      <div class="model-badge load" id="modelBadge">
+        <span class="badge-dot"></span><span id="badgeText">連線中...</span>
+      </div>
+    </div>
+    <div class="control-right">
+      <button class="btn-sec" onclick="showClearConfirm()">
+        <svg class="btn-icon" viewBox="0 0 24 24"><path d="M19 4h-3.5l-1-1h-5l-1 1H5v2h14M6 19a2 2 0 002 2h8a2 2 0 002-2V7H6v12z"/></svg>
+        清除資料
+      </button>
+    </div>
+  </div>
+
+  <!-- 第二列：輸入來源選擇面板
+       三種輸入方式：
+       1. 即時感測器（btn-detect → runLive() → POST /realtime）
+       2. TDMS 上傳（upload-zone → onFileSelect → runTdms() → POST /predict/tdms）
+       3. 來源標籤（顯示目前是 live / file / demo）
+  -->
+  <div class="main-card-gap" style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 20px;">
+    <div style="font-size:11px;letter-spacing:.12em;color:var(--text-secondary);text-transform:uppercase;margin-bottom:14px;font-weight:500;">輸入來源 · Input Source</div>
+    <div class="input-mode-card">
+
+    <!-- 第一列：即時監控
+        正式現場使用入口。
+        按下「開始自動監控」後，前端會通知後端啟動 DAQ，
+        接著依照畫面更新間隔定期讀取 /realtime 的最新結果。
+        注意：畫面更新間隔只控制前端刷新頻率，不控制實際 DAQ 取樣週期。
+    -->
+    <div class="input-mode-row">
+      <div class="input-mode-label">即時監控</div>
+
+      <div class="input-mode-actions">
+        <button class="btn-detect" id="autoBtn" type="button" onclick="toggleAuto()">
+          <svg id="autoButtonIcon" viewBox="0 0 24 24" fill="currentColor" width="20" height="20">
+            <path d="M8 5v14l11-7z"></path>
+          </svg>
+          <span id="autoButtonText">開始自動監控</span>
+        </button>
+
+        <!-- 畫面更新間隔設定：
+            只控制前端多久向後端 /realtime 讀取一次最新結果。
+            實際感測器取樣頻率由後端 DAQ_LOOP_INTERVAL_SEC 控制。
+        -->
+        <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary);">
+          <span>畫面更新間隔</span>
+          <input type="number" id="cfg_interval"
+                style="width:55px;padding:5px 8px;border:1px solid var(--border-bright);
+                        border-radius:6px;font-family:var(--mono);font-size:13px;text-align:center;"
+                value="2" min="1" step="1"
+                onchange="cfg.interval = normalizePollInterval(this.value); this.value = cfg.interval">
+          <span>秒</span>
+          <span style="font-size:10px;color:var(--text-dim)">
+            （只更新畫面；實際感測器取樣由後端設定控制）
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 第二列：TDMS 測試
+        離線測試入口。
+        使用者可上傳既有 TDMS 檔案，後端會走完整 runtime pipeline：
+        讀取 TDMS → 特徵工程 → XGBoost 推論 → 後處理規則 → 回傳結果。
+        這不會啟動實體 DAQ，也不會使用即時 queue。
+    -->
+    <div class="input-mode-row">
+      <div class="input-mode-label">TDMS 測試</div>
+
+      <div class="input-mode-actions">
+        <span style="font-size:12px;color:var(--text-dim);">上傳測試檔</span>
+
+        <!-- TDMS 上傳區：
+            點擊可選擇檔案，也支援拖曳 .tdms 到此區塊。
+            選到檔案後會啟用「分析檔案」按鈕。
+        -->
+        <div class="upload-zone" id="uploadZone">
+          <input type="file" id="tdmsInput" accept=".tdms" onchange="onFileSelect(this)">
+          <svg class="upload-icon" viewBox="0 0 24 24">
+            <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6zM13 3.5L18.5 9H13V3.5zM8 13h8v1.5H8V13zm0 3h5v1.5H8V16z"/>
+          </svg>
+          <div class="upload-label">
+            <strong id="uploadFileName">選擇 TDMS 檔案</strong>
+            <span id="uploadFileSize">點擊瀏覽或拖曳 .tdms 到此</span>
+          </div>
+          <button class="upload-clear" onclick="clearFile(event)" title="移除">×</button>
+        </div>
+
+        <!-- TDMS 分析按鈕：
+            預設 disabled，等使用者選擇 TDMS 後才允許執行 runTdms()。
+        -->
+        <button class="btn-tdms" id="tdmsBtn" onclick="runTdms()" disabled>
+          <svg viewBox="0 0 24 24" fill="currentColor" width="17" height="17">
+            <path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/>
+          </svg>
+          分析檔案
+        </button>
+
+        <!-- 來源標籤：
+            顯示目前畫面結果來源，例如即時感測器、TDMS 檔案或待機狀態。
+        -->
+        <div style="display:flex;align-items:center;gap:8px;margin-left:auto;">
+          <span style="font-size:11px;color:var(--text-dim)">來源</span>
+          <span class="source-tag idle" id="sourceTag">待機</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+  <!-- 第三列：診斷結果 Banner
+       三種狀態：ok（正常）/ warn（疑似干擾）/ leak（洩漏）
+       由後端 leak_status 決定，前端不自行判斷
+       包含：狀態燈、診斷文字、計算時間
+  -->
+  <div class="status-banner ok" id="statusBanner">
+    <div class="status-indicator"><div class="status-dot"></div></div>
+    <div class="status-info">
+      <div class="status-label">診斷結果 · DIAGNOSTIC RESULT</div>
+      <div class="status-text" id="statusText">等待檢測</div>
+      <div class="status-sub"  id="statusSub">請按下「即時檢測」或上傳 TDMS 檔案</div>
+
+      <!-- 暖機進度條 -->
+      <div id="warmup-bar-wrap" style="display:none; margin-top:6px; margin-bottom:4px;">
+        <div style="background:rgba(255,255,255,0.15); border-radius:4px; height:6px; overflow:hidden;">
+          <div id="warmup-bar" style="height:100%; width:0%; background:#2ecc71; transition:width 0.3s;"></div>
+        </div>
+      </div>
+
+      <div class="calc-row">
+        <span class="calc-label">模型計算時間</span>
+        <span class="spinner" id="spinner"><span class="spin-ring"></span>計算中...</span>
+        <span id="calcDisplay" style="display:none">
+          <span class="calc-val" id="calcVal">—</span><span class="calc-unit">秒</span>
+        </span>
+      </div>
+
+      <!-- 健康指標列 -->
+      <div class="calc-row" id="health-row" style="display:none; margin-top:4px; font-size:0.85em; opacity:0.85;">
+        <span id="health-lag"></span>
+        <span id="health-overrun" style="display:none; color:#e74c3c; font-weight:bold; margin-left:12px;">
+          ⚠️ 推論佇列溢出
+        </span>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- 第四列：數值指標卡片
+       左卡：窗口統計（leak / disturbance / total 窗數 + 進度條）
+       右卡：Leak Score（本次最高分 + threshold 進度條）
+  -->
+  <div class="metrics-grid">
+    <div class="metric-card">
+      <div class="metric-label">窗口判定統計 · 近 10 秒滑動窗口 · Recent 10s Window</div>
+      <div class="metric-value"><span id="leakWinVal">—</span><span class="unit">/ <span id="totalWinVal">—</span> 窗 leak</span></div>
+      <div class="metric-bar"><div class="metric-bar-fill" id="winBar" style="width:0%"></div></div>
+      <div class="metric-sub-row">
+        <span>疑似干擾窗: <b id="distWinVal">—</b></span>
+        <span>異常窗比例: <b id="confVal">—</b>%</span>
+      </div>
+    </div>
+    <div class="metric-card">
+      <div class="metric-label">Leak Score · 本次擷取最高值</div>
+      <div class="metric-value"><span id="scoreVal">—</span></div>
+      <div class="metric-bar"><div class="metric-bar-fill" id="scoreBar" style="width:0%"></div></div>
+      <div class="metric-range"><span>0</span><span>threshold = <span id="thresholdVal">—</span></span><span>1.0</span></div>
+    </div>
+  </div>
+
+  <!--
+      第五列：聲射訊號波形圖
+      顯示後端回傳的 signal_preview_ai1（去除 DC、未套用帶通濾波）
+      三色對應：藍＝正常／橘＝疑似干擾／紅＝洩漏
+      底部資訊列：RMS／Peak／fs／Duration／狀態
+    -->
+  <div class="wave-card">
+    <div class="wave-header">
+      <div class="wave-title">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none"
+             stroke="var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="3,12 5,12 7,5 9,19 11,9 13,15 15,12 19,12 21,12"/>
+        </svg>
+        即時訊號波形 · AE 去直流波形（ai1 · 近端感測器）· 最近 5 次擷取
+      </div>
+      <div class="wave-meta" id="waveMeta">等待第一次檢測...</div>
+    </div>
+    <div class="wave-empty" id="waveEmpty">按下「即時檢測」後顯示聲射訊號波形</div>
+    <canvas id="waveCanvas" class="wave-canvas"></canvas>
+    <div class="wave-footer">
+      <span><span class="ws-label">RMS</span><span class="ws-val" id="waveRms">—</span></span>
+      <span><span class="ws-label">Peak</span><span class="ws-val" id="wavePeak">—</span></span>
+      <span><span class="ws-label">fs</span><span class="ws-val" id="waveFs">—</span></span>
+      <span><span class="ws-label">Duration</span><span class="ws-val" id="waveDur">—</span></span>
+      <span><span class="ws-label">狀態</span><span class="ws-val" id="waveStatus">—</span></span>
+    </div>
+  </div>
+
+</div><!-- /page-main -->
+
+<!-- ============================================================
+     詳細設定頁面（page-settings）
+     顯示後端 Runtime 參數（唯讀），從 /models 讀回
+     ============================================================ -->
+<div class="page" id="page-settings">
+  <div class="section-title">後端 Runtime 參數</div>
+  
+  <div class="settings-card" style="max-width:600px;">
+    <div class="settings-card-title">
+      <svg viewBox="0 0 24 24"><path d="M9 3L5 6.99h3V14h2V6.99h3L9 3zm7 14.01V10h-2v7.01h-3L15 21l4-3.99h-3z"/></svg>
+      目前載入的模型與設定（唯讀）
+    </div>
+    
+    <div style="margin-bottom:16px;">
+      <div class="field-label" style="margin-bottom:6px;">目前使用模型</div>
+      <div style="font-family:var(--mono);font-size:15px;color:var(--accent-blue);font-weight:700" 
+           id="settingsModelName">—</div>
+    </div>
+
+    <table class="param-table" id="paramTable">
+      <thead>
+        <tr><th>參數名稱</th><th>數值</th></tr>
+      </thead>
+      <tbody id="paramTableBody">
+        <tr>
+          <td colspan="2" style="text-align:center;color:var(--text-dim);padding:20px">
+            連線中...
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div style="margin-top:14px;color:var(--text-dim);font-size:12px;line-height:1.8;">
+      <div id="samplingPolicyNote">
+        目前為人工巡檢週期式取樣：每 — 秒擷取 — 秒訊號進行推論。
+      </div>
+      <div>
+        ℹ️ 以上參數由後端設定檔決定，如需修改請聯繫系統管理員調整 config/資料夾內的設定檔。
+      </div>
+    </div>
+  </div>
+
+</div><!-- /page-settings -->
+
+<!-- ============================================================
+     歷史紀錄頁面（page-log）
+     顯示所有推論結果的時間序列記錄
+     欄位：時間 / 來源 / 診斷結果 / Score / Threshold / 窗口統計 / 計算時間 / 異常窗比例
+     支援分頁顯示（renderLogPage）和匯出 CSV（exportCSV）
+     ============================================================ -->
+<div class="page" id="page-log">
+
+  <div class="log-toolbar">
+    <div>
+      <span class="log-count" id="logCount">共 0 筆</span>
+      <span style="font-family:var(--mono);font-size:11px;color:var(--text-dim);margin-left:12px" id="logPageInfo"></span>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center">
+      <!-- 匯出筆數選單：預設值要和 JS 的 EXPORT_DEFAULT_LIMIT 一致 -->
+      <label class="export-limit-label">
+        匯出筆數
+        <select id="exportLimit" class="export-select">
+          <option value="200">最近 200 筆（與畫面相同）</option>
+          <option value="400">最近 400 筆</option>
+          <option value="600">最近 600 筆</option>
+          <option value="800">最近 800 筆</option>
+          <option value="1000" selected>最近 1000 筆</option>
+        </select>
+      </label>
+      <button class="export-btn" id="exportBtn" onclick="exportCSV()">
+        <svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+        匯出 CSV
+      </button>
+      <button class="btn-sec" onclick="showClearConfirm()">
+        <svg class="btn-icon" viewBox="0 0 24 24"><path d="M19 4h-3.5l-1-1h-5l-1 1H5v2h14M6 19a2 2 0 002 2h8a2 2 0 002-2V7H6v12z"/></svg>
+        清除
+      </button>
+    </div>
+  </div>
+
+  <div class="main-card-gap" style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 20px;">
+    <table class="log-table">
+      <thead>
+        <tr>
+          <th>#</th><th>時間</th><th>來源</th><th>診斷結果</th>
+          <th>Score</th><th>Threshold</th><th>leak/dist/total 窗</th><th>模型計算時間 (s)</th><th>異常窗比例</th>
+        </tr>
+      </thead>
+      <tbody id="logBody">
+        <tr><td colspan="9" style="text-align:center;color:var(--text-dim);padding:40px">尚無檢測紀錄</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 分頁器 -->
+  <div class="pagination" id="pagination"></div>
+
+</div><!-- /page-log -->
+
+
+<!-- ============================================================
+     清除確認對話框（confirmOverlay）
+     按下「清除資料」後彈出，確認後：
+     1. 呼叫 POST /clear → 後端清除歷史紀錄 + 重置 signal buffer
+     2. 前端同步重置所有顯示數值和狀態
+     取消則關閉對話框不做任何動作
+     ============================================================ -->
+<div class="overlay" id="confirmOverlay">
+  <div class="dialog">
+    <div class="dialog-title">確認清除資料</div>
+    <div class="dialog-desc">此操作將清除所有檢測資料且無法復原。</div>
+    <div class="dialog-btns">
+      <button class="btn-sec" onclick="hideConfirm()">取消</button>
+      <button class="btn-danger" id="confirmClearBtn" type="button" onclick="clearData()">確認清除</button>
+    </div>
+  </div>
+</div>
+
+
+<script>
+// ═══════════════════════════════════════
+// 全域常數與設定
+// API_BASE：後端位址（FastAPI 跑在 localhost:8000）
+// MODEL_DISPLAY_NAME：前端顯示的模型名稱
+// STATE_MAP：leak_status → 顯示文字 / CSS class 的對應表
+// cfg：前端本機設定（備用取樣率、畫面更新間隔），定義在下方
+// ═══════════════════════════════════════
+const API_BASE = location.origin;                  // 定義後端 FastAPI 伺服器的基礎網路位址：用跟這個網頁相同的主機位址去打 API
+const MODEL_DISPLAY_NAME = 'XGBoost（雙感測器）';    // 網頁介面上要顯示的模型名稱
+
+// 【核心架構：狀態映射表】：後端傳回的 `leak_status` 字串（權威判斷）對應前端的 CSS 樣式名稱、繁中文字與英文子標題
+// 前端「絕對不」根據 confidence 或 is_leak 自己重算三態，全部信任後端。
+const STATE_MAP = {
+  normal:               { css: 'ok',   text: '正常狀態',         sub: 'SYSTEM NOMINAL' },
+  disturbance_suspect:  { css: 'warn', text: '疑似干擾，建議複查', sub: 'DISTURBANCE SUSPECT' },
+  leak:                 { css: 'leak', text: '洩漏狀態',         sub: 'LEAK DETECTED' },
+};
+
+
+// ═══════════════════════════════════════
+// 即時波形顯示狀態
+// 後端每 DAQ_LOOP_INTERVAL_SEC 秒擷取 DAQ_CAPTURE_SEC 秒，批與批之間有空白，
+// 因此以「批」為單位保留最近幾批，畫面上標出接縫，不當成連續訊號。
+// 這只是降採樣後的顯示資料，與後端模型的 Raw Buffer 無關。
+// ═══════════════════════════════════════
+const LIVE_WAVE_MAX_BATCHES = 5;          // 最多顯示最近幾批(一批（DAQ 擷取一次）= 1 秒，每 5 秒一批)
+
+let lastWave = null;                      // 最後一次畫出的波形，視窗縮放時重畫用
+let liveWaveChunks = [];                  // 最近幾批波形，每批為 { signal, durationSec }
+let liveWaveBuffer = [];                  // 顯示緩衝區：畫圖用的陣列，新資料接在右邊、超過長度就從左邊移除
+let liveWaveBoundaries = [];              // 第二批起每批在 liveWaveBuffer 中的起點索引，用來畫接縫
+let liveWaveDurationSec = 0;              // 各批實際訊號長度加總（不含批次之間的空白）
+let lastWaveformSeq = null;               // 上一批波形的序號（對應後端 waveform_seq），避免重複加入
+
+
+// ═══════════════════════════════════════
+// 加入一批即時波形
+// 保留最近 LIVE_WAVE_MAX_BATCHES 批，超過時移除最舊的一批
+// 回傳各批接起來的陣列，並記錄每批的起點位置供畫接縫
+// ═══════════════════════════════════════
+function appendLiveWaveChunk(chunk, chunkDurationSec, waveformSeq,) {
+  // 安全防線 1：// 沒有資料時維持原狀
+  if ( !Array.isArray(chunk) || chunk.length === 0 ) {       
+    return liveWaveBuffer;
+  }
+       
+  // ── 防止重複接料 ──
+  //    同一批已經加過（前端輪詢比後端擷取快），不重複加入
+  if ( waveformSeq != null && waveformSeq === lastWaveformSeq) {
+    return liveWaveBuffer;
+  }
+  lastWaveformSeq = waveformSeq;      // 通過檢查，正式將當前序號記錄為「最新渲染過的舊序號」
+  
+  // 後端沒給時長或數值異常時，以 1 秒計
+  const durationSec = Number(chunkDurationSec) > 0 ? Number(chunkDurationSec) : 1;
+  
+  // 新批加到最後，超過上限就移除最舊的
+  liveWaveChunks.push({ signal: chunk, durationSec });
+  while (liveWaveChunks.length > LIVE_WAVE_MAX_BATCHES) {
+    liveWaveChunks.shift();
+  }
+
+  // 重新組出畫圖用的陣列與接縫位置
+  liveWaveBuffer = [];
+  liveWaveBoundaries = [];
+  liveWaveDurationSec = 0;
+
+  liveWaveChunks.forEach((c, i) => {
+    if (i > 0) { liveWaveBoundaries.push(liveWaveBuffer.length); }
+    liveWaveBuffer.push(...c.signal);
+    liveWaveDurationSec += c.durationSec;
+  });
+
+  return liveWaveBuffer;
+}
+
+
+// ═══════════════════════════════════════
+// 全域變數
+// ═══════════════════════════════════════
+// 歷史紀錄分頁
+const logHistory = [];              // 全部記錄:存放所有紀錄的陣列，最新在最前面
+const PAGE_SIZE  = 20;              // 每頁資料只顯示 20 筆（表格分頁限制，優化 UI 渲染效能）
+const HISTORY_DISPLAY_LIMIT = 200;  // 畫面最多保留 200 筆，更早的紀錄請用匯出
+const EXPORT_DEFAULT_LIMIT = 1000;  // 匯出 CSV 的預設筆數
+let currentPage  = 1;               // 當前分頁頁碼，預設為第一頁
+
+// 即時監控的狀態
+let autoTimer    = null;     // 下一次 autoLoop() 的計時器編號，停止時用 clearTimeout(autoTimer) 取消
+let autoRunning = false;     // 記錄當前前端網頁是不是正處於「自動監控全速刷新中」的狀態
+let monitorSessionId = 0;    // 記錄當前前端網頁的「自動監控」會話 ID，每次按下「開始自動監控」就 +1，避免舊的 setInterval 仍在跑時，誤把舊資料覆蓋到新畫面上
+let failCount = 0;           // realtime 連續失敗次數，決定退避等待時間（2→4→8→15 秒）
+let hasSeenOverrun = false;  // models 回傳的 is_available，決定徽章顯示「模型就緒」或「Demo 模式」
+let backendReady = false;    // 記錄後端模型與設定是否準備完成（對應後端 get_status 的 ready 欄位）
+
+// 互斥鎖（防止操作互相打架）：確保同一時間只會有一件事在跟後端溝通
+let tdmsRunning = false;            // 為 true 時代表，TDMS 檔案分析中
+let clearRunning = false;           // 為 true 時代表，清除流程進行中
+let monitorTransitioning = false;   // 為 true 時代表，正在等 /monitor/start 或 /monitor/stop 回應
+
+// 歷史頁輪詢
+let logPollTimer = null;      // 下一次讀 /history 的計時器
+let logPollSessionId = 0;     // 跟 monitorSessionId 同樣的作廢機制。離開歷史頁時 +1，還在路上的舊請求回來後就不會更新畫面
+
+// 其他
+let inlineErrorTimer = null;  // 一般錯誤提示「5 秒後自動消失」的計時器。新錯誤出現時先取消舊計時器，避免舊計時器把新訊息提早關掉
+let lastLiveLogKey = null;    // 最後紀錄的即時結果識別值
+
+
+// ═══════════════════════════════════════
+// 退避設定:連線失敗時，不是固定每 2 秒狂打後端，而是失敗越多次、等越久再試
+// ═══════════════════════════════════════
+const RETRY_DELAYS_MS = [2000, 4000, 8000, 15000];
+
+function getRetryDelayMs() {
+  const index = Math.min(Math.max(failCount - 1, 0), RETRY_DELAYS_MS.length - 1,);
+  return RETRY_DELAYS_MS[index];
+}
+
+
+// ═══════════════════════════════════════
+// 前端本機 Demo 參數配置
+// ═══════════════════════════════════════
+const DEFAULT_POLL_INTERVAL_SEC = 2;   // 畫面更新間隔預設值，需與 HTML 輸入框的 value 一致
+
+// 本機顯示設定（只影響 Demo 波形與圖表座標軸，不送後端）
+// 這些參數主要是當後端沒準備好、前端要單獨跑純網頁模擬或繪製 X 軸時間刻度（如 interval: 2 秒一格）時使用的參考變數
+let cfg = {
+  fs:        1000000,     // 模擬採樣率 1 MHz
+  interval: 2,            // 每格 2 秒
+};
+
+
+// ═══════════════════════════════════════
+// 把輸入值整理成合法的畫面更新間隔
+// 空白、0、負數 → 用預設值；小於 1 秒 → 拉到 1 秒
+// ═══════════════════════════════════════
+function normalizePollInterval(value) {
+  const n = Number(value);
+  return n > 0 ? Math.max(1, n) : DEFAULT_POLL_INTERVAL_SEC;
+}
+
+
+// ═══════════════════════════════════════
+// 時鐘:每秒更新右上角時間顯示
+// ═══════════════════════════════════════
+function tick(){ document.getElementById('clock').textContent=new Date().toLocaleTimeString('zh-TW',{hour12:false}); }
+tick(); setInterval(tick,1000);
+
+
+// ═══════════════════════════════════════
+// 分頁切換：在「主監控／詳細設定／歷史紀錄」三個分頁之間切換
+// 同一時間只顯示一個分頁，其他分頁隱藏
+// name：分頁名稱（'main'、'settings'、'log'）
+// el：被點擊的分頁標籤元素
+// ═══════════════════════════════════════
+function switchTab(name,el){
+  // 1. 移除所有分頁標籤的 active 狀態
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));     
+  // 2. 移除所有頁面的 active 狀態，全部頁面先隱藏
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  // 3. 被點擊的標籤加上 active，顯示為選取狀態
+  el.classList.add('active');
+  // 4. 對應的頁面（id 為 page-名稱）加上 active，顯示該頁面
+  document.getElementById('page-'+name).classList.add('active');
+  // 5. 切到設定頁時，重新向後端讀取參數，確保顯示最新設定
+  if(name==='settings') refreshSettingsPage();
+  // 6. 切到歷史紀錄頁時開始定期讀取紀錄；切到其他頁時停止讀取
+  if (name === 'log') {startLogPolling();} else {stopLogPolling();}
+}
+
+
+// ═══════════════════════════════════════
+// 更新「開始/停止自動監控」按鈕是否可按
+// 監控中：只要不在切換狀態，一律可以按停止
+// 未監控：後端就緒、且沒有 TDMS 分析或清除進行中，才可以按開始
+// ═══════════════════════════════════════
+function updateAutoButtonState() {
+  const button = document.getElementById('autoBtn');
+  if (!button) return;
+
+  const canStart = backendReady && !tdmsRunning && !clearRunning;
+  button.disabled = monitorTransitioning || (!autoRunning && !canStart);
+
+  // 滑鼠停在按鈕上時顯示原因
+  button.title = (!autoRunning && !backendReady) ? '後端未就緒，無法開始監控' : '';
+}
+
+
+// ═══════════════════════════════════════
+// 後端狀態檢查
+// 呼叫 /models，依結果更新頂部的狀態徽章與開始按鈕：
+//   後端就緒          → 綠色「模型就緒」，可開始監控
+//   後端有回應但未就緒  → 橘色「後端未就緒」，停用開始按鈕
+//   連不到後端         → 紅色「無法連線後端」，停用開始按鈕
+// 未就緒時每 5 秒重新檢查一次，後端啟動後會自動解鎖
+// ═══════════════════════════════════════
+// 全域變數宣告：
+let runtimeParams = null;        // 用來準備存放從 /cfg 讀回來的詳細時間與告警參數設定（唯讀）
+let modelCheckTimer = null;       // 未就緒時重新檢查的計時器
+const MODEL_RECHECK_MS = 5000;    // 未就緒時：每 5 秒檢查，後端一啟動就能盡快解鎖
+const MODEL_HEALTH_CHECK_MS = 30000;  // 已就緒時：每 30 秒確認後端仍在運作
+
+async function initModels(showConnecting = true){
+  // 抓到網頁頂部用來顯示狀態的徽章外殼（badge）與文字標籤（bt）
+  const badge=document.getElementById('modelBadge');
+  const bt=document.getElementById('badgeText');
+  const wasReady = backendReady;
+
+  // 【初始狀態】：只有第一次檢查才顯示「連線中」，重新檢查時不要讓徽章閃爍
+  if (showConnecting) { badge.className='model-badge load'; bt.textContent='連線中...'; }
+  
+  try{
+    // 呼叫 /models，超過 3 秒沒回應視為失敗
+    const res=await fetch(API_BASE+'/models',{signal:AbortSignal.timeout(3000)});
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+
+    // 取第一個模型，確認是否就緒
+    const models=await res.json();
+    const m = Array.isArray(models) ? models[0] : null;
+    backendReady = !!(m && m.is_available);   // 轉成 true / false
+
+    if(backendReady){
+      // 綠色：模型就緒
+      badge.className='model-badge ready'; bt.textContent='模型就緒';
+    } else {
+      // 橘色：後端有回應，但設定檔或模型沒載入
+      badge.className='model-badge notready'; bt.textContent='後端未就緒（設定檔未載入）';
+    }
+  }catch{
+    // 紅色：後端沒開、網路斷、逾時或狀態碼錯誤
+    backendReady = false;
+    badge.className='model-badge offline'; bt.textContent='無法連線後端';
+  }
+  
+  updateAutoButtonState();
+
+  // 排定下一次檢查：未就緒時間隔短，已就緒時間隔長
+  // 未就緒時每 5 秒重新檢查，後端啟動後自動解鎖
+  // 已就緒時每 30 秒確認一次，後端中斷時徽章會轉為紅色並停用開始按鈕
+  if (modelCheckTimer) { clearTimeout(modelCheckTimer); modelCheckTimer = null; }
+  const nextCheckMs = backendReady ? MODEL_HEALTH_CHECK_MS : MODEL_RECHECK_MS;
+  modelCheckTimer = setTimeout(() => { modelCheckTimer = null; void initModels(false); }, nextCheckMs);
+
+  // 停在設定頁時，第一次檢查或就緒狀態改變才重新讀取參數，避免每 5 秒閃一次「讀取中」
+  const onSettingsPage = document.getElementById('page-settings').classList.contains('active');
+  if (onSettingsPage && (showConnecting || wasReady !== backendReady)) refreshSettingsPage();
+}
+initModels();     // 頁面載入時執行一次
+
+
+
+// ═══════════════════════════════════════
+// 從後端讀取歷史紀錄
+// 由 startLogPolling() 在停留於歷史頁時定期呼叫
+// 讀取成功：用後端最近 200 筆紀錄覆蓋前端的 logHistory
+// 讀取失敗或格式錯誤：保留目前畫面，不清空紀錄
+// sessionId：輪詢工作階段編號，用來丟棄離開歷史頁後才回來的舊請求
+// ═══════════════════════════════════════
+async function loadHistoryFromBackend(sessionId = null,) {
+  try {
+    // 讀取最近 HISTORY_DISPLAY_LIMIT(200筆) 筆紀錄，超過 3 秒沒回應視為失敗
+const res = await fetch(API_BASE + '/history?limit=' + HISTORY_DISPLAY_LIMIT, { signal: AbortSignal.timeout(3000) });
+    // 後端回傳錯誤碼時，保留目前畫面
+    if (!res.ok) return;   
+    // 解開成 JSON 格式。
+    const data = await res.json();
+
+    // 請求回來時已離開歷史頁（或已開始新的輪詢），不更新畫面
+    if (sessionId !== null && sessionId !== logPollSessionId) {return;}
+    // 回傳格式不正確時，保留目前畫面
+    if (!Array.isArray(data.records)) {return;}
+
+    // 用後端紀錄覆蓋前端紀錄
+    // 後端順序為「舊→新」，反轉成「新→舊」讓最新紀錄顯示在最上面
+    // 先 slice() 複製再反轉，避免改動到原始資料
+    logHistory.length = 0;
+    logHistory.push(...data.records.slice().reverse());
+
+    // 記下最新一筆的時間戳，讓 addLog() 不會重複加入同一筆即時結果
+    const newestRecord = logHistory[0];
+    if (newestRecord?.timestamp) {lastLiveLogKey = String(newestRecord.timestamp);}
+
+    // 重畫表格，停留在使用者目前看的頁碼
+    renderLogPage(currentPage);
+    }catch (err) {
+    // 離開歷史頁後才失敗的舊請求，不需要顯示警告
+    if ( sessionId !== null && sessionId !== logPollSessionId) {return;}
+
+    console.warn('讀取歷史紀錄失敗：', err);
+  }
+}
+
+
+// ═══════════════════════════════════════
+// 歷史頁輪詢：停留在歷史頁時定期重新讀取紀錄
+// 每次讀取完成後才開始倒數下一次，同一時間只會有一個請求
+// 離開歷史頁時由 stopLogPolling() 停止
+// ═══════════════════════════════════════
+function startLogPolling() {
+  // 先停止舊的輪詢，避免重複執行
+  stopLogPolling();     
+
+  // 建立這一輪輪詢的編號，用來判斷自己是否已經過期
+  logPollSessionId += 1;
+  const sessionId = logPollSessionId;
+
+  async function pollHistory() {
+    // 兩次過期檢查
+    // 第一次：執行前，已經離開歷史頁或開啟了新的輪詢
+    if (sessionId !== logPollSessionId) {return;}
+
+    // 讀取紀錄，等完成後才繼續
+    await loadHistoryFromBackend(sessionId);
+
+    // 第二次：等待期間已離開歷史頁，不再排下一次
+    if (sessionId !== logPollSessionId) {return;}
+
+    // 完成後兩秒才安排下一次
+    logPollTimer = setTimeout(() => {logPollTimer = null;void pollHistory();}, 2000);}
+
+  // 進入歷史頁後立即讀取第一次
+  void pollHistory();
+}
+
+
+// ═══════════════════════════════════════
+// 停止歷史頁輪詢
+// 由 switchTab() 在離開歷史頁時呼叫，startLogPolling() 啟動前也會先呼叫一次
+// 兩種停止方式都要做：
+//   1. 編號 +1：正在等後端回應的請求，回來後會發現已過期而放棄
+//   2. 取消計時器：正在倒數中的下一輪直接取消
+// ═══════════════════════════════════════
+function stopLogPolling() {
+  // 讓正在等待回應的請求失效
+  logPollSessionId += 1;
+
+  // 取消正在倒數的計時器
+  if (logPollTimer) {
+    clearTimeout(logPollTimer);     // 真的把這個計時器關掉，之後它就不會再自動呼叫 loadHistoryFromBackend()
+    logPollTimer = null;             // 關掉之後記得歸零，代表「現在沒有計時器在跑」，避免下次誤判
+  }
+}
+
+
+// ═══════════════════════════════════════
+// 設定頁：讀取後端參數
+// 由 switchTab() 切到設定頁時呼叫，initModels() 發現後端狀態改變時也會呼叫
+// 呼叫 /cfg 取得執行參數，存進 runtimeParams，再由 renderParamTable() 畫成唯讀表格
+// ═══════════════════════════════════════
+let settingsRequestId = 0;   // 設定頁請求編號，用來丟棄較舊的回應
+
+async function refreshSettingsPage() {
+  // 這次請求的編號
+  const requestId = ++settingsRequestId;
+
+  // 等待回應期間，先顯示預設模型名稱與「讀取中」
+  document.getElementById('settingsModelName').textContent = MODEL_DISPLAY_NAME;
+  renderParamMessage('讀取後端參數中...');
+
+  try {
+    // 呼叫 /cfg，超過 3 秒沒回應視為失敗
+    const res = await fetch(API_BASE + '/cfg', { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) { throw new Error('HTTP ' + res.status); }
+
+    const data = await res.json();
+
+    // 等待期間已有更新的請求送出，放棄這次結果
+    if (requestId !== settingsRequestId) return;
+
+    runtimeParams = data;
+    // 顯示後端回傳的模型名稱，沒有則保留預設名稱
+    document.getElementById('settingsModelName').textContent = runtimeParams.model || MODEL_DISPLAY_NAME;
+  } catch (error) {
+    // 等待期間已有更新的請求送出，不處理這次的錯誤
+    if (requestId !== settingsRequestId) return;
+
+    // 後端未啟動、逾時或狀態碼錯誤
+    console.error('讀取 /cfg 失敗：', error);
+    runtimeParams = null;
+  }
+
+  // 成功或失敗都重畫表格：有資料顯示參數，失敗顯示錯誤提示
+  renderParamTable();
+}
+
+
+// ═══════════════════════════════════════
+// 設定頁：把 runtimeParams 畫成唯讀參數表格
+// runtimeParams 為 null（讀取失敗）時，顯示錯誤提示
+// ═══════════════════════════════════════
+// 表格內只顯示一列置中提示文字（讀取中、讀取失敗等）
+function renderParamMessage(message) {
+  document.getElementById('paramTableBody').innerHTML =
+    '<tr><td colspan="2" style="text-align:center;color:var(--text-dim);padding:20px">' +
+    escHtml(message) +
+    '</td></tr>';
+}
+
+// 數值加上單位；沒有值時顯示「—」
+function withUnit(value, unit) {
+  return value != null ? value + ' ' + unit : '—';
+}
+
+
+// ═══════════════════════════════════════
+// 把後端參數畫成設定頁的表格
+// 這裡不會去問後端，只是把 runtimeParams 裡已經有的資料顯示出來
+// ═══════════════════════════════════════
+function renderParamTable() {
+  // 表格下面那行取樣說明
+  const samplingNote = document.getElementById('samplingPolicyNote');
+
+  // 讀取失敗：表格與取樣說明都顯示無法讀取
+  if (!runtimeParams) {
+    renderParamMessage('無法讀取後端參數');
+    if (samplingNote) { samplingNote.textContent = '無法讀取取樣設定。'; }
+    return;
+  }
+
+  const p = runtimeParams;
+
+  // 取樣說明：DAQ 週期式擷取，模型與波形使用同一批資料
+  if (samplingNote) {
+    const loopSec = p.daq_loop_interval_sec;
+    const captureSec = p.daq_capture_sec;
+
+    if (loopSec == null || captureSec == null) {
+      samplingNote.textContent = '取樣設定未提供。';
+    } else {
+      samplingNote.textContent =
+        `目前為週期式取樣：每 ${loopSec} 秒擷取 ${captureSec} 秒訊號，進行推論與波形顯示，以降低運算量與延遲。`;
+    }
+  }
+
+  // 模型特徵數：後端提供特徵名稱陣列時計算長度
+  const featureCount = Array.isArray(p.model_feature_names) ? p.model_feature_names.length : '—';
+
+  // 表格內容，每列為 [欄位名稱, 數值]，沒有值的欄位一律顯示「—」
+  const rows = [
+    ['狀態',             p.is_available ? '就緒（正式設定已載入）' : '未就緒'],
+    ['模型 ID',          p.model_id ?? '—'],
+    ['視窗長度',         withUnit(p.window_sec, '秒')],             // 模型每次看多長的一小段
+    ['滑動間隔',         withUnit(p.hop_sec, '秒')],                // 每一小段之間隔多久
+    ['單窗判斷門檻',     p.window_threshold ?? '—'],                // 分數超過多少算這一小段有洩漏
+    ['告警方法',         p.alarm_method ?? '—'],                    // 很多小段的結果怎麼合起來決定要不要告警
+    ['連續命中窗數',     p.consecutive ?? '—'],                     // 要連續幾小段都有洩漏才告警
+    ['最短告警時間',     withUnit(p.min_leak_duration_sec, '秒')],  // 洩漏至少要持續多久才告警
+    ['DAQ 每次擷取',     withUnit(p.daq_capture_sec, '秒')],        // 每次抓多長的訊號
+    ['DAQ 取樣週期',     withUnit(p.daq_loop_interval_sec, '秒')],  // 每隔多久抓一次
+    ['Raw Buffer',       withUnit(p.buffer_sec, '秒')],             // 後端給模型用的訊號保留多久
+    // 後端沒說有沒有開，就顯示「—」，不要直接當成「否」
+    ['是否使用 Veto',    p.use_veto == null ? '—' : (p.use_veto ? '是' : '否')],
+    ['模型特徵數',       featureCount],
+    ['感測器模式',       p.sensor_mode ?? '—'],
+  ];
+
+  // 把每一列變成表格的一行，全部接起來後一次放進表格
+  // escHtml() 是把特殊符號轉掉，避免內容被當成網頁標籤
+  document.getElementById('paramTableBody').innerHTML = rows
+    .map(([key, value]) =>
+      '<tr><td>' + escHtml(key) + '</td><td class="param-highlight">' + escHtml(value) + '</td></tr>'
+    )
+    .join('');
+}
+
+
+// ═══════════════════════════════════════
+// 自動監控輪詢：每隔 cfg.interval 秒呼叫 runLive() 讀取一次 /realtime
+// 每一輪等上一輪完成才排下一輪，避免請求重疊
+// 後端每 DAQ_LOOP_INTERVAL_SEC 秒才產生一批新結果，
+// 前端讀到相同批次時，由 waveform_seq 與 timestamp 去重
+// ═══════════════════════════════════════
+async function autoLoop(sessionId) {
+  // 已經按了停止，或這是上一次監控留下來的循環，就不再跑
+  if (!autoRunning || sessionId !== monitorSessionId) {
+    return;
+  }
+  // 讀一次最新結果，等它讀完再往下
+  const success = await runLive(sessionId);
+  // 讀的這段時間裡，使用者可能按了停止或重新開始，再檢查一次
+  if (!autoRunning || sessionId !== monitorSessionId) {
+    return;
+  }
+
+  // 決定下一次要等多久
+  // 讀成功：照畫面上設定的秒數（最少 1 秒）
+  // 讀失敗：失敗越多次等越久（2、4、8、15 秒）
+  const delayMs = success
+    ? Math.max(1000, cfg.interval * 1000)    // 成功：照使用者設定的間隔
+    : getRetryDelayMs();                     // 失敗：照退避表
+
+  // 時間到了就再跑一次，計時器存起來是為了按停止時可以取消
+  autoTimer = setTimeout(() => { autoTimer = null; void autoLoop(sessionId);}, delayMs);
+}
+
+
+// ============================================================
+// 即時監控／離線分析互斥控制
+// 即時監控和 TDMS 分析不能同時做，監控中就把這一列鎖起來
+// disabled = true：鎖住；false：解鎖
+// ============================================================
+// 即時監控期間停用 TDMS 選擇與分析。
+function setOfflineControlsDisabled(disabled,) {
+  // 抓取網頁上負責處理檔案上傳的三個實體 HTML 元素：
+  const input = document.getElementById('tdmsInput',);    // 選檔案用的隱藏輸入框
+  const button = document.getElementById('tdmsBtn',);     // 「分析檔案」按鈕
+  const zone = document.getElementById('uploadZone',);    // 虛線框的上傳區
+  
+  // 如果檔案選擇器存在，根據傳入的 `disabled`（True/False）來鎖定或解鎖它
+  if (input) {input.disabled = disabled;}
+
+  // 分析按鈕能不能按，同時看兩個條件：只要「正在監控中」（disabled=true）或「根本還沒選檔案」（!selectedFile），任一個成立按鈕就鎖死。
+  if (button) {button.disabled = disabled || !selectedFile;}
+
+  // ── 視覺與滑鼠事件全面封鎖 ──
+  if (zone) {
+    // 點擊和拖曳都沒反應（框裡的 × 按鈕也一樣）
+    zone.style.pointerEvents =disabled ? 'none' : '';
+    // 變半透明，讓人看得出來被鎖住；解鎖時恢復原本樣式
+    zone.style.opacity =disabled ? '0.5' : '';
+  }
+}
+
+
+// ============================================================
+// 自動監控切換按鈕
+// ============================================================
+function setAutoButtonIcon(mode) {
+  const icon = document.getElementById('autoButtonIcon');
+  if (!icon) return;
+
+  if (mode === 'stop') {
+    // 停止狀態：方形 stop icon
+    icon.innerHTML = '<path d="M7 7h10v10H7z"></path>';
+  } else {
+    // 開始狀態：三角形 play icon
+    icon.innerHTML = '<path d="M8 5v14l11-7z"></path>';
+  }
+}
+
+
+// ============================================================
+// 啟動自動監控：通知 API 啟動 DAQ，開始自動輪詢
+// 「按下開始監控按鈕」這個動作背後,網頁依序要做的所有準備跟收尾工作——先防呆、告訴後端開始工作、等後端確認、然後把畫面上所有跟「現在是不是在監控」有關的東西(按鈕文字、按鈕能不能按、標籤、舊資料)全部同步更新好,最後才真正啟動那個會一直抓新結果回來的迴圈
+// ============================================================
+async function startAuto() {
+  // 檢查能不能開始 4 步驟：
+  if (!backendReady) { showInlineError('⚠️ 後端未就緒，無法開始監控'); return; }
+  // TDMS 分析期間禁止啟動即時監控
+  if (tdmsRunning) {
+      showInlineError('⚠️ TDMS 檔案正在分析中，請等待分析完成');
+      return;
+    }
+  // 清除進行中不允許啟動
+  if (clearRunning) {
+    showInlineError('⚠️ 資料正在清除中，請稍候再啟動監控',);
+    return;
+  }
+  // 啟動或停止流程已經在進行
+  if (monitorTransitioning) {return;}
+  // 更新間隔必須大於 0（toggleAuto() 已經檢查過，這裡是保險）
+  if (cfg.interval <= 0) { showInlineError('⚠️ 請先設定大於 0 的更新間隔'); return; }
+  // 防止重複啟動，如果系統早就「已經在自動監控中」（autoRunning 為 true），直接跳出，防止使用者手滑連點按鈕,導致同時發出好幾個「啟動監控」的請求
+  if (autoRunning) { return;}
+
+  // 鎖住按鈕，通知後端
+  monitorTransitioning = true;     // 標記「正在切換中」，這段期間所有會衝突的操作都會被擋
+  failCount = 0;                   // 新的監控，連線失敗次數從頭算
+  hasSeenOverrun = false;          // 上一次監控的佇列溢出警告不帶到這次
+  clearConnectionError();          // 清掉畫面上方的紅色錯誤橫幅
+  
+  // 抓取 DOM 元素：把網頁上「自動監控」按鈕本身、跟按鈕裡顯示文字的那個元素抓出來,存成變數,方便後面直接操作它們的狀態跟文字。
+  const autoButton = document.getElementById('autoBtn');
+  const autoButtonText = document.getElementById('autoButtonText');
+
+  // 切換中會鎖住按鈕，避免連點；按鈕文字改成「啟動中...」
+  // 如果按鈕存在，立刻將按鈕設為停用（disabled = true）
+  updateAutoButtonState();
+  if (autoButtonText) {autoButtonText.textContent = '啟動中...';}
+
+  try {
+    // 通知後端啟動 DAQ 和推論兩個背景執行緒，最多等 10 秒
+    // 設定檔和模型在後端開機時就已經載入，這裡不會重新讀取
+    const response = await fetch(API_BASE + '/monitor/start', {
+      method: 'POST',
+      signal: AbortSignal.timeout(10000),
+    },);
+
+    if (!response.ok) {
+      // 防禦性寫法:先嘗試把回應內容解析成 JSON,如果解析失敗(例如後端根本沒回 JSON,或連線中斷),就用 .catch() 接住,給一個預設的錯誤訊息物件,避免因為解析失敗又拋出另一個例外、掩蓋掉原本真正的錯誤。
+      const error = await response .json() .catch( () => ({detail:'即時監控啟動失敗'}));
+      throw new Error( error.detail || '即時監控啟動失敗',);
+    }
+    // 處理結果
+    // 失敗時：按鈕恢復成「開始」的樣子，顯示錯誤，然後 return。畫面上原本的結果不會被清掉。
+  } catch (err) {
+    if (autoButton) { autoButton.classList.remove('active');}
+    if (autoButtonText) { autoButtonText.textContent = '開始自動監控';}
+    setAutoButtonIcon('play');
+
+    // 逾時的英文錯誤訊息換成中文
+    const errorMessage = err.name === 'TimeoutError' ? '後端沒有回應' : (err.message || '未知錯誤');
+    // 後端的錯誤訊息開頭可能已經有「即時監控啟動失敗：」，去掉避免重複
+    const cleanMessage = errorMessage.replace(/^即時監控啟動失敗：/, '');
+    showInlineError('⚠️ 即時監控啟動失敗：' + cleanMessage);
+    return;
+  } finally {
+    // 成功、失敗或逾時都解除切換鎖，解除「切換中」，重新決定按鈕能不能按
+    monitorTransitioning = false;
+    updateAutoButtonState();
+  }
+
+  // 啟動成功後,重置前端的波形狀態
+  liveWaveChunks = [];
+  liveWaveBuffer = [];
+  liveWaveBoundaries = [];
+  liveWaveDurationSec = 0;
+  lastWaveformSeq = null;
+  lastWave = null;
+  lastLiveLogKey = null;
+
+  // 重置畫面，Banner 改回綠色、藏起舊波形，避免上一次的結果（例如紅色洩漏）在暖機期間還留著
+  document.getElementById('statusBanner').className = 'status-banner ok';
+  document.getElementById('statusText').textContent = '暖機中...';
+  document.getElementById('statusSub').textContent = '等待第一批感測器資料';
+  document.getElementById('waveCanvas').style.display = 'none';
+  document.getElementById('waveEmpty').style.display = 'flex';
+  document.getElementById('waveEmpty').textContent = '等待第一批波形...';
+
+  // 卡片數字也清掉，避免顯示上一次監控的結果
+  ['leakWinVal','totalWinVal','distWinVal','confVal','scoreVal','thresholdVal']
+    .forEach(id => document.getElementById(id).textContent = '—');
+  ['winBar','scoreBar']
+    .forEach(id => document.getElementById(id).style.width = '0%');
+  document.getElementById('calcVal').textContent = '—';
+  document.getElementById('health-row').style.display = 'none';
+  
+  // 正式標記為「監控中」狀態
+  autoRunning = true;
+  // 建立新的監控工作階段
+  monitorSessionId += 1;
+  const sessionId = monitorSessionId;
+
+  // 即時監控期間不允許執行 TDMS 分析。
+  setOfflineControlsDisabled(true);
+
+  // 更新按鈕視覺狀態
+  updateAutoButtonState();
+  if (autoButton) { autoButton.classList.add('active'); }
+  if (autoButtonText) {autoButtonText.textContent = '停止自動監控'; }
+  setAutoButtonIcon('stop');
+  // 更新來源標籤
+  setSourceTag('live', '即時感測器',);
+
+  // 開始循環：傳入這次監控的工作階段編號
+  void autoLoop(sessionId);
+}
+
+
+// ═══════════════════════════════════════
+// 停止自動監控
+// 1. 前端先停止輪詢，還在路上的請求回來後會被丟掉
+// 2. 通知後端 /monitor/stop 停止 DAQ 和推論
+// 3. 後端確認停止：畫面切回「已停止」，可以重新開始或分析 TDMS
+//    後端停止失敗：不確定後端是否還在跑，維持監控中並恢復輪詢，讓使用者再按一次
+// 回傳 true 代表已停止，false 代表停止失敗（clearData() 會用這個判斷能不能繼續清除）
+// ═══════════════════════════════════════
+async function stopAuto() {
+  // 正在啟動或停止中，不能再按
+  if (monitorTransitioning) {
+    showInlineError('⚠️ 監控狀態正在切換中，請稍候',);
+    return false;
+  }
+
+  // 先確認「現在真的有在監控中」，如果根本沒在監控中，就不用做任何事，直接結束。
+  if (!autoRunning) {return true;}
+
+  // 標記為「切換中」
+  monitorTransitioning = true;
+
+  // 前端先停：不再排下一輪，還在路上的請求回來後也不會更新畫面
+  autoRunning = false;
+  // 讓尚未完成的舊 /realtime 回應全部失效
+  monitorSessionId += 1;
+  if (autoTimer) {clearTimeout(autoTimer); autoTimer = null;}
+
+  // 舊的 runLive 不會再負責關閉 spinner，這裡主動重置
+  setBusy(false);
+
+  // 把按鈕 disable、文字改成「停止中...」— 讓使用者知道正在處理，不要連點。
+  const autoButton = document.getElementById('autoBtn');
+  const autoButtonText = document.getElementById('autoButtonText');
+  updateAutoButtonState();
+  if (autoButtonText) {autoButtonText.textContent ='停止中...';}
+  
+  // 呼叫 /monitor/stop 通知後端真的停止硬體監控
+  try {
+    // 通知後端停止，最多等 5 秒
+    const response = await fetch(API_BASE + '/monitor/stop', { 
+      method: 'POST',
+      signal: AbortSignal.timeout(5000),
+    });
+    
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({detail:'停止監控失敗'}));
+      const detail = typeof error.detail === 'string' ? error.detail : '停止監控失敗';
+      throw new Error(detail);
+    }
+  } catch (err) { 
+    console.warn('停止後端監控失敗：', err);
+
+    // 無法確認後端已停止，因此保持「監控中」狀態。
+    autoRunning = true;
+    if (autoButton) {autoButton.classList.add('active'); }  
+    if (autoButtonText) { autoButtonText.textContent = '停止自動監控'; }
+    setAutoButtonIcon('stop');
+    showInlineError('⚠️ 停止監控失敗，後端可能仍在運作，請重試');
+
+    // 停止失敗，後端可能仍在監控，因此恢復前端輪詢
+    void autoLoop(monitorSessionId);
+    return false;
+  } finally {
+    // 不管成功或失敗，都解除「切換中」
+    monitorTransitioning = false;
+    updateAutoButtonState();
+  }
+
+  // ── 以下只有停止成功才會執行 ──
+
+  // 清掉連線錯誤橫幅和過期樣式（停止後不會再重試了）
+  clearConnectionError();
+  markDataFresh();
+
+  // 停止成功後隱藏暖機條
+  const warmupWrap = document.getElementById('warmup-bar-wrap');
+  const warmupBar = document.getElementById('warmup-bar');
+  if (warmupWrap) { warmupWrap.style.display = 'none';}
+  if (warmupBar) { warmupBar.style.width = '0%';}
+
+  // 還在暖機就按停止：沒有任何判斷結果，改成「已停止」，不要停在「暖機中」
+  const statusText = document.getElementById('statusText');
+  if (statusText && statusText.textContent === '暖機中...') {
+    statusText.textContent = '監控已停止';
+    document.getElementById('statusSub').textContent = '暖機期間停止，尚無判斷結果';
+  }
+
+  // TDMS 區解鎖，按鈕改回「開始」
+  setOfflineControlsDisabled(false);
+  updateAutoButtonState();
+  if (autoButton) {updateAutoButtonState(); autoButton.classList.remove('active'); }
+  if (autoButtonText) { autoButtonText.textContent = '開始自動監控'; }
+  setAutoButtonIcon('play');
+  setSourceTag('idle', '待機');
+
+  return true;
+}
+
+
+// ═══════════════════════════════════════
+// 「開始／停止自動監控」按鈕
+// 監控中：按下是停止
+// 沒在監控：讀取畫面更新間隔後開始
+// ═══════════════════════════════════════
+async function toggleAuto() {
+  // 監控中，這次按下是要停止，就呼叫 stopAuto()，然後 return 結束，不會往下跑。
+  if (autoRunning) {await stopAuto();return;}
+
+  // 未監控：讀取主監控頁的「畫面更新間隔」
+  // 這個值只控制前端多久向 /realtime 讀取一次，不會送到後端
+  const intervalInput = document.getElementById('cfg_interval');
+
+  // 空白、0、負數用預設值；小於 1 秒的拉到 1 秒（autoLoop() 最快也是 1 秒一次）
+  cfg.interval = normalizePollInterval(intervalInput ? intervalInput.value : DEFAULT_POLL_INTERVAL_SEC);
+
+  // 把實際使用的數字寫回輸入框，畫面上看到的就是真正的間隔
+  if (intervalInput) { intervalInput.value = cfg.interval; }
+
+  await startAuto();
+}
+
+
+// ═══════════════════════════════════════
+// 波形顏色：依狀態回傳線條和填色的顏色
+// leak → 紅、warn → 橘、其他（正常）→ 藍
+// ═══════════════════════════════════════
+// waveColor 查表函式：輸入現在的狀態文字，輸出一組顏色設定（線的顏色 + 底下填滿漸層的顏色）-> leak_status → canvas 顏色
+function waveColor(cssState){
+  // 如果狀態是 'leak'（洩漏）→ 紅色系 /  'warn'（疑似干擾）→ 橘色系 / 其他情況（也就是 'ok' 正常，或任何沒對到的字）→ 藍色系，當作預設值。
+  if(cssState==='leak') return {line:'rgba(217,48,37,.85)',fill:['rgba(217,48,37,.12)','rgba(217,48,37,.03)']};
+  if(cssState==='warn') return {line:'rgba(230,92,0,.85)',fill:['rgba(230,92,0,.12)','rgba(230,92,0,.03)']};
+  return {line:'rgba(26,111,212,.82)',fill:['rgba(26,111,212,.1)','rgba(26,111,212,.03)']};
+}
+
+// ═══════════════════════════════════════
+// 畫波形
+// signal(ai1)：要畫的訊號（已降採樣）
+// cssState   ：目前狀態，決定顏色
+// durationSec：訊號總長度（秒）
+// boundaries ：即時模式時，各批的起點位置；有值就畫接縫，沒值（TDMS）就畫秒數
+// ═══════════════════════════════════════
+function drawWaveform(signal, cssState, durationSec = null, boundaries = null) {     // 即時模式：各批起點索引；有值時畫接縫與批次標籤
+  // 把畫布準備好，還沒開始畫真正的波形，只是把背景跟底色、格線畫上去，並把「沒有資料」的提示文字藏起來。
+  const canvas=document.getElementById('waveCanvas');
+  const empty=document.getElementById('waveEmpty');
+  canvas.style.display='block'; 
+  empty.style.display='none';
+
+  // 依螢幕解析度設定畫布大小，Retina 螢幕才不會模糊
+  const dpr=window.devicePixelRatio||1;
+  const W=canvas.clientWidth||800, H=240;
+  canvas.width=W*dpr; 
+  canvas.height=H*dpr; 
+  canvas.style.height=H+'px';
+  const ctx=canvas.getContext('2d'); 
+  ctx.scale(dpr,dpr);     // 之後都用 W × H 的座標來畫
+
+  // 把底色塗成淺灰藍（#f8fafc）。
+  ctx.fillStyle='#f8fafc'; 
+  ctx.fillRect(0,0,W,H);     
+
+  // 畫 4 條淺色的水平格線，當作背景的刻度參考線（像方格紙一樣）
+  ctx.strokeStyle='rgba(180,200,220,.4)'; 
+  ctx.lineWidth=0.7;    
+  for(let i=0;i<=4;i++){
+    const y=H*i/4;
+    ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+
+  // 資料檢查(少於 2 點畫不出線，只留底色和格線) + 準備畫波形
+  if (!signal || signal.length < 2) return;
+  // (1) 防呆檢查「有沒有資料可以畫」
+  const n=signal.length;     
+
+  // 最大振幅，用來把波形縮放到畫布高度內（全部是 0 時用 1，避免除以 0）
+  const max=signal.reduce((m,v)=>Math.max(m,Math.abs(v)),0)||1;   
+
+  // 訊號點換算成畫布座標
+  const toX = i => (i / (n - 1)) * W;
+  const toY = v => H / 2 - (v / max) * (H / 2 - 6);   // 上下各留 6 像素
+
+  // 中間的 0 基準線（虛線）
+  ctx.setLineDash([4,4]);
+  ctx.strokeStyle='rgba(120,150,180,.25)';
+  ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(0,H/2);ctx.lineTo(W,H/2);ctx.stroke();
+  ctx.setLineDash([]);
+
+  // 畫出波形本體（底色填滿 + 線條）
+  const col=waveColor(cssState);     // 拿到目前狀態對應的顏色（紅/橘/藍）
+
+  if (n > W) {
+    // 點比畫布像素多：每一個像素欄畫一條「最小值到最大值」的直線
+    // 這樣所有尖峰都會被畫出來，不會因為跳點而漏掉
+    const cols = Math.floor(W);
+    ctx.strokeStyle = col.line;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let c = 0; c < cols; c++) {
+      const start = Math.floor(c * n / cols);
+      const end = Math.max(start + 1, Math.floor((c + 1) * n / cols));
+      let lo = Infinity, hi = -Infinity;
+      for (let i = start; i < end; i++) {
+        const v = signal[i];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+      const x = c + 0.5;   // 對齊像素中心，線才會清楚
+      ctx.moveTo(x, toY(hi));
+      ctx.lineTo(x, toY(lo));
+    }
+    ctx.stroke();
+  } else {
+    // 點比畫布像素少：直接連線，並在波形和中線之間填色
+    const fillG = ctx.createLinearGradient(0, 0, 0, H);
+    fillG.addColorStop(0, col.fill[0]);
+    fillG.addColorStop(.5, col.fill[1]);
+    fillG.addColorStop(1, col.fill[0]);
+    ctx.beginPath();
+    ctx.moveTo(0, H / 2);
+    for (let i = 0; i < n; i++) ctx.lineTo(toX(i), toY(signal[i]));
+    ctx.lineTo(W, H / 2);
+    ctx.closePath();
+    ctx.fillStyle = fillG;
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.strokeStyle = col.line;
+    ctx.lineWidth = 1.4;
+    for (let i = 0; i < n; i++) {
+      i === 0 ? ctx.moveTo(toX(i), toY(signal[i])) : ctx.lineTo(toX(i), toY(signal[i]));
+    }
+    ctx.stroke();
+  }
+
+  // X 軸標示
+  ctx.fillStyle = 'rgba(100,120,140,.8)';
+  ctx.font = '11px sans-serif';
+
+  if (Array.isArray(boundaries)) {
+    // 即時模式：批與批之間有空白，畫接縫虛線並標示批次，不使用秒數刻度
+    const batchCount = boundaries.length + 1;
+    const starts = [0, ...boundaries];
+
+    ctx.save();
+    ctx.setLineDash([3, 4]);
+    ctx.strokeStyle = 'rgba(100,120,140,.5)';
+    ctx.lineWidth = 1;
+    boundaries.forEach(idx => {
+      ctx.beginPath(); ctx.moveTo(toX(idx), 0); ctx.lineTo(toX(idx), H); ctx.stroke();
+    });
+    ctx.restore();
+
+    starts.forEach((idx, i) => {
+      const batchesAgo = batchCount - 1 - i;
+      ctx.fillText(batchesAgo === 0 ? '最新' : `前 ${batchesAgo} 批`, toX(idx) + 4, H - 6);
+    });
+  } else if (durationSec && durationSec > 0) {
+    // TDMS 模式：整段是連續訊號，從檔案開頭算時間
+    const ticks = [0, durationSec / 2, durationSec];
+    ticks.forEach((t, i) => {
+      const x = (t / durationSec) * W;
+      const label = t.toFixed(1) + 's';
+      // 最右邊的字往左移，避免超出畫布
+      const offset = i === ticks.length - 1 ? -ctx.measureText(label).width - 4 : 4;
+      ctx.fillText(label, x + offset, H - 6);
+    });
+  }
+
+  // 訊號長度：優先用後端給的秒數，沒有才用點數 ÷ 取樣率估算
+  const actualDurationSec = Number(durationSec) > 0 ? Number(durationSec) : n / cfg.fs;
+  // 即時模式顯示「幾批 × 每批長度」，避免誤以為是連續 5 秒
+  const formatSec = s => s >= 1 ? s.toFixed(1) + ' s' : (s * 1000).toFixed(0) + ' ms';
+
+  if (Array.isArray(boundaries)) {
+    // 即時模式顯示「幾批 × 每批長度」，避免誤以為是連續的
+    const batchCount = boundaries.length + 1;
+    document.getElementById('waveDur').textContent = batchCount + ' 批 × ' + formatSec(actualDurationSec / batchCount);
+  } else {
+    document.getElementById('waveDur').textContent = formatSec(actualDurationSec);
+  }
+
+  // 狀態文字和顏色
+  const statusMap={ok:'正常 ●',warn:'疑似干擾 ◉',leak:'洩漏 ⚠'};
+  const el = document.getElementById('waveStatus');
+  el.textContent=statusMap[cssState]||'—';
+  el.style.color=cssState==='leak'?'var(--leak)':cssState==='warn'?'var(--warn)':'var(--ok)';
+}
+
+
+// ═══════════════════════════════════════
+// TDMS 檔案選擇與上傳
+// ═══════════════════════════════════════
+let selectedFile = null;
+// onFileSelect：選擇 .tdms 檔案後更新 UI
+function onFileSelect(input){
+  const file = input.files[0];   // 使用者從檔案選擇視窗選了一個檔案
+  if(!file) return;    // 防呆：如果使用者按了選擇視窗又取消（沒真的選檔案），就什麼都不做。
+  // 選到檔案後：存到全域變數 selectedFile（之後上傳時會用到這個檔案物件）；把上傳區塊加上樣式 class 表示「已有檔案」；把檔名、檔案大小（換算成 KB）顯示出來；把「開始分析」按鈕解鎖（disabled=false）；把來源標籤改成「已選擇 TDMS」。
+  selectedFile = file;
+  const zone = document.getElementById('uploadZone');
+  zone.classList.add('has-file');
+  document.getElementById('uploadFileName').textContent = file.name;
+  document.getElementById('uploadFileSize').textContent = (file.size / 1024).toFixed(1) + ' KB · 點擊可更換';
+  document.getElementById('tdmsBtn').disabled = false;
+  setSourceTag('file', '已選擇 TDMS');
+}
+
+// clearFile：清除已選檔案(把上面 onFileSelect 做的事情全部復原)
+function clearFile(e){
+  e.stopPropagation();
+  // 把 selectedFile 設回 null、清空檔案輸入框的值、拿掉「已有檔案」樣式、文字改回預設提示、把「開始分析」按鈕重新鎖起來（因為沒檔案了不能分析）、標籤改回「待機」。
+  // 邏輯上跟 onFileSelect 完全對稱，沒有遺漏任何要復原的欄位。
+  selectedFile = null;
+  document.getElementById('tdmsInput').value = '';
+  const zone = document.getElementById('uploadZone');
+  zone.classList.remove('has-file');
+  document.getElementById('uploadFileName').textContent = '選擇 TDMS 檔案';
+  document.getElementById('uploadFileSize').textContent = '點擊瀏覽或拖曳 .tdms 到此';
+  document.getElementById('tdmsBtn').disabled = true;
+  setSourceTag('idle', '待機');
+}
+
+// setSourceTag：更新「輸入來源」標籤文字(把標籤的 CSS class 換成 'source-tag ' + type)
+function setSourceTag(type, text){
+  const tag = document.getElementById('sourceTag');
+  tag.className = 'source-tag ' + type;
+  tag.textContent = text;
+}
+
+
+// ═══════════════════════════════════════
+// 共用 UI 工具
+// setBusy：設定/解除「計算中」狀態（禁用按鈕、顯示 spinner）
+// finishResult：收到後端結果後更新所有 UI
+//   - TDMS 上傳不需要 buffer_ready 檢查
+//   - 即時擷取：buffer 尚未累積至後端 BUFFER_SEC 時顯示「暖機中」
+// ═══════════════════════════════════════
+// 忙碌狀態的畫面控制 setBusy：設定/解除「計算中」狀態（禁用按鈕、顯示 spinner）
+function setBusy(busy) {
+  // 三個要控制的畫面元素：spinner（轉圈圈動畫）、calcDisplay（顯示計算結果的區塊）、tdmsBtn（開始分析 TDMS 的按鈕）
+  const spinner = document.getElementById('spinner',);
+  const calculationDisplay = document.getElementById('calcDisplay',);
+  const tdmsButton = document.getElementById('tdmsBtn',);
+  // TDMS 按鈕「該不該被鎖住」的判斷：只要「正在計算中」（busy=true）或「正在自動監控中」（autoRunning=true）或「根本還沒選檔案」（!selectedFile），任一個成立就鎖住按鈕。
+  if (tdmsButton) {tdmsButton.disabled = busy || autoRunning || !selectedFile;}
+  // 把結果顯示區塊藏起來（display:none）——代表「還在算，先別看舊結果」。
+  if (busy) {spinner.classList.add('on');calculationDisplay.style.display = 'none';
+  } else {
+    // 把 spinner 藏起來、結果顯示區塊變回來（display:inline）——代表「算完了，可以看結果」
+    spinner.classList.remove('on');calculationDisplay.style.display = 'inline';
+  }
+}
+
+// ═══════════════════════════════════════
+// 收到後端結果後，更新畫面
+// 順序：健康資訊 → 計算時間 → 波形 → （暖機中就停在這裡）→ 正式判斷結果
+// 波形放在暖機判斷之前，所以暖機期間也看得到訊號
+// ═══════════════════════════════════════
+function finishResult(data, sourceLabel) {
+  // 檔名是 .tdms 結尾就是離線分析，否則是即時監控
+  const isTdms = typeof sourceLabel === 'string' && sourceLabel.toLowerCase().endsWith('.tdms');
+  
+  // 健康資訊（延遲、佇列溢出）只有即時監控才有意義
+  const healthRow = document.getElementById('health-row');
+  if (isTdms) {
+    if (healthRow) {healthRow.style.display = 'none';}
+  } else {
+    updateHealthBar(data);
+  }
+
+  // 暖機期間也顯示本批模型計算時間
+  const calcValue = Number(data.calc_time_sec);
+  const calcElement = document.getElementById('calcVal');
+  if (calcElement) {
+    calcElement.textContent = Number.isFinite(calcValue) && calcValue > 0 ? calcValue.toFixed(2) : '—';
+  }
+
+  // 後端的狀態字串轉成畫面用的顏色和文字
+  const st = STATE_MAP[data.leak_status] || STATE_MAP.normal;
+
+  // =========================================================
+  // 波形顯示要放在 Buffer 暖機判斷之前，即使模型尚未開始推論，也要顯示本次收到的感測器訊號。
+  // =========================================================
+  // 檢查後端這次有沒有給「波形預覽資料」
+  const hasPreview = Array.isArray(data.signal_preview_ai1) && data.signal_preview_ai1.length > 0;
+
+  if (hasPreview) {
+    let displaySignal; 
+    let displayDurationSec;
+
+    if (isTdms) {
+      // 離線 TDMS 維持原本整段預覽方式。
+      displaySignal = data.signal_preview_ai1;
+      displayDurationSec = Number( data.signal_preview_duration_sec) || 1;     // 時長也直接用後端給的數字（如果沒給或是 0，就用 1 秒當保底）
+    } else {
+      // 即時模式：保留最近幾批，並記錄接縫位置
+      displaySignal = appendLiveWaveChunk(
+        data.signal_preview_ai1,
+        data.signal_preview_duration_sec,
+        data.waveform_seq,
+      );
+      displayDurationSec = liveWaveDurationSec;
+    }
+
+    // 把算好的「要畫的訊號」、「顏色狀態」（用剛才從 STATE_MAP 查到的 st.css）、「時長」，存進一個叫 lastWave 的全域變數
+    lastWave = {
+      sig: displaySignal,
+      cssState: st.css,
+      durationSec: displayDurationSec,
+      boundaries: isTdms ? null : liveWaveBoundaries.slice(),   // TDMS 為連續訊號，不畫接縫
+    };
+
+    // 畫波形
+    drawWaveform(lastWave.sig, lastWave.cssState, lastWave.durationSec, lastWave.boundaries);
+
+    // 取樣率：優先用後端給的
+    const displayFs = data.signal_preview_fs || cfg.fs;
+    document.getElementById('waveFs').textContent = (displayFs/1000).toFixed(0) + ' kHz';
+    
+    // RMS 和 Peak 用後端以原始訊號算好的值（即時模式為最新一批）
+    const rms = Number(data.signal_rms_ai1);
+    const peak = Number(data.signal_peak_ai1);
+    document.getElementById('waveRms').textContent = Number.isFinite(rms) ? rms.toExponential(3) : '—';
+    document.getElementById('wavePeak').textContent = Number.isFinite(peak) ? peak.toExponential(3) : '—';
+    // 沒有波形：藏起波形圖，統計數字也清掉
+  } else { 
+    lastWave = null;
+    document.getElementById('waveCanvas').style.display = 'none';
+    document.getElementById('waveEmpty').style.display = 'flex';
+    document.getElementById('waveEmpty').textContent = '本次沒有收到波形預覽。';
+    document.getElementById('waveRms').textContent = '—';
+    document.getElementById('wavePeak').textContent = '—';
+  }
+
+  // 波形卡片右上角的小字：模型名稱 · 時間 · 來源
+  const srcNote = sourceLabel ? ' · ' + sourceLabel : '';
+  document.getElementById('waveMeta').textContent =
+      (data.model_display_name || MODEL_DISPLAY_NAME) +' · ' +
+      (data.waveform_timestamp || data.timestamp) +
+      srcNote;
+
+  // ── 暖機中：只更新進度，不顯示判斷結果 ──
+  if (!isTdms && data.buffer_ready === false) {
+    // 將後端資料安全轉成數字
+    const currentValue = Number(data.buffer_sec_current);
+    const targetValue = Number(data.buffer_sec_target);
+    const current = Number.isFinite(currentValue) && currentValue >= 0 ? currentValue : 0;
+    const target = Number.isFinite(targetValue) && targetValue > 0 ? targetValue : 0;      
+    // target 沒給或是 0 時不做除法
+    const progress = target > 0 ? Math.max( 0, Math.min(100, current / target * 100),): 0;
+
+    document.getElementById('statusText').textContent = '暖機中...'; 
+
+    // 暖機秒數只算實際擷取的訊號，實際等待時間要乘上「取樣週期 ÷ 每次擷取」
+    // 例如每 5 秒擷取 1 秒，累積 5 秒訊號實際要約 25 秒
+    const loopSec = Number(runtimeParams?.daq_loop_interval_sec) || 5;
+    const captureSec = Number(runtimeParams?.daq_capture_sec) || 1;
+    const remainSec = Math.max(0, Math.ceil((target - current) / captureSec * loopSec));
+
+    document.getElementById('statusSub').textContent =
+      `已擷取 ${current.toFixed(1)} / ${target > 0 ? target.toFixed(1) : '—'} 秒訊號，預計還需約 ${remainSec} 秒`;
+    // 進度條
+    document.getElementById('warmup-bar-wrap').style.display = 'block';
+    document.getElementById('warmup-bar').style.width = Math.round(progress) + '%';
+
+    setBusy(false);
+    return;
+  }
+
+  // 暖機完成後隱藏進度條，顯示正式判斷結果
+  document.getElementById('warmup-bar-wrap').style.display = 'none';
+  // Buffer 完成後才更新正式模型判斷結果。
+  applyResult( data, sourceLabel,);
+}
+
+
+// ═══════════════════════════════════════
+// 顯示即時監控的處理狀態（只在即時模式呼叫）
+// 延遲：這批資料從擷取完成到判斷完成花了幾秒
+//       不超過 DAQ 週期（5 秒）就代表跟得上，不會越積越多
+// 溢出：推論太慢、後端丟掉了部分資料。出現過一次就一直顯示，
+//       直到重新開始監控或清除資料
+// ═══════════════════════════════════════
+function updateHealthBar(data) {
+  const latencyValue = Number(data.latency_sec);
+  const latencyIsValid = data.latency_sec != null && Number.isFinite(latencyValue);
+  const realtimeOk = data.stream_realtime_ok === true;
+  const overrun = data.streaming_overrun === true;
+
+  // 顯示這一列（用 flex，跟 CSS 的 .calc-row 一致）
+  const healthRow = document.getElementById('health-row');
+  if (healthRow) { healthRow.style.display = 'flex'; }
+
+  // 延遲文字:顯示這一筆資料從進入 Queue 到完成判斷的時間
+  const lagEl = document.getElementById('health-lag');
+  if (lagEl) {
+    if (latencyIsValid) {
+      // 還沒有任何一批處理完（剛開始暖機時）
+      lagEl.textContent = '等待第一筆處理結果';
+      lagEl.style.color = 'var(--text-dim)';
+    } else {
+      lagEl.textContent = `本次結果延遲 ${latencyValue.toFixed(2)} 秒 ` +
+        (realtimeOk ? '✅ 已在下一批前完成' : '⚠️ 處理未能在下一批前完成');
+      lagEl.style.color = realtimeOk ? 'var(--ok)' : 'var(--leak)';
+    }
+  }
+
+  // Queue 曾經滿載就持續警告，直到重新開始監控
+  if (overrun) { hasSeenOverrun = true; }
+  const overrunEl = document.getElementById('health-overrun');
+  if (overrunEl) {
+    overrunEl.style.display = hasSeenOverrun ? 'inline' : 'none';
+  }
+}
+
+
+// ═══════════════════════════════════════
+// 即時感測器檢測：讀取 API 最新波形與推論結果
+// 讀一次即時結果（由 autoLoop() 定期呼叫）
+// /realtime 只是讀後端算好的最新結果，不會觸發計算，也不需要送參數
+// 回傳 true：讀取成功（或是舊請求，直接略過）
+// 回傳 false：讀取失敗，autoLoop() 會依退避表延後重試
+// ═══════════════════════════════════════
+async function runLive(sessionId){
+  try{
+    const res = await fetch(API_BASE+'/realtime', {
+      method: 'POST',
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if(!res.ok){
+      const err = await res.json().catch(() => ({}));
+      const detail = typeof err.detail === 'string' ? err.detail : 'HTTP ' + res.status;
+      // 把狀態碼一起帶出去，catch 裡用來判斷是哪一種錯誤
+      const error = new Error(detail);
+      error.status = res.status;
+      throw error;
+    }
+
+    const data = await res.json();
+
+    // 如果監控已停止或已換成新工作階段，這筆舊資料不能更新畫面。
+    if (!autoRunning || sessionId !== monitorSessionId) {return true;}
+
+    // 讀取成功：清掉錯誤狀態，更新畫面
+    failCount = 0;
+    clearConnectionError();
+    markDataFresh();
+    setSourceTag('live', '即時感測器');
+    finishResult(data, '即時');
+    return true;
+
+  }catch(err){
+  // 舊請求的錯誤，不顯示在目前畫面上
+  if (!autoRunning || sessionId !== monitorSessionId) {return false;}
+
+  // 409：後端已經不在監控（後端重啟過，或之前的停止其實成功了）
+  // 一直重試也不會好，前端直接切成已停止
+  if (err.status === 409) {
+    // 先停止，停止完成後才顯示訊息（stopAuto() 成功時會清掉橫幅，所以要放在後面）
+    void stopAuto().then(() => {
+      showInlineError('⚠️ 後端目前沒有在監控（可能已重新啟動），已停止自動監控');
+    });
+    return false;
+  }
+
+  failCount += 1;     // 先加 1
+  markDataStale();
+  const retrySeconds = getRetryDelayMs() / 1000;    // 算出要等幾秒，顯示在錯誤橫幅
+
+  // 依錯誤類型顯示不同訊息
+  let message;
+  if (err.name === 'TimeoutError') {
+    message = '後端沒有回應';
+  } else if (err.status) {
+    message = '後端回報錯誤：' + err.message;     // 例如 DAQ 硬體錯誤
+  } else {
+    message = `無法連線後端（${err.message}）`;   // 後端沒開或網路斷
+  }
+
+  showConnectionError(`${message}，${retrySeconds} 秒後自動重試`);
+    setSourceTag('reconnect', '重新連線中');
+    console.warn(`[runLive] 第 ${failCount} 次失敗，${retrySeconds} 秒後重試：`, err.message);
+
+    // 不停止監控，讓 autoLoop() 繼續重試
+    return false;
+  }
+}
+
+
+// ═══════════════════════════════════════
+// 顯示過期提示
+// 標記畫面上的判斷結果是否已過期
+// 讀取失敗時標記過期：Banner 變灰，並顯示「資料可能已過期」
+// 讀取成功時清除標記
+// ═══════════════════════════════════════
+function markDataStale(){
+  const statusBanner = document.getElementById('statusBanner');
+  if (statusBanner) {statusBanner.classList.add('stale');}
+}
+
+// 清除資料過期狀態
+function markDataFresh(){
+  const statusBanner = document.getElementById('statusBanner');
+  if (statusBanner) {statusBanner.classList.remove('stale');}
+}
+
+
+// ═══════════════════════════════════════
+// 連線錯誤：頁面最上方的紅色橫幅
+// 持續顯示，直到呼叫 clearConnectionError()
+// ═══════════════════════════════════════
+function showConnectionError(msg) {     // 問題會一直持續（連不到後端） → showConnectionError
+  const text = msg || '連線中斷，請確認後端是否運行';
+  const banner = document.getElementById('conn-error-banner');
+  if (!banner) { console.error('[連線錯誤]', text); return; }
+
+  banner.textContent = '⚠️ ' + text;
+  banner.style.display = 'block';
+}
+
+
+// ═══════════════════════════════════════
+// 隱藏連線錯誤：：頁面最上方的紅色橫幅
+// ═══════════════════════════════════════
+// 使用時機：讀取成功，連線恢復了、開始新的監控，清掉上次的錯誤、停止成功，不會再重試了、清除資料
+function clearConnectionError() {
+  const banner = document.getElementById('conn-error-banner');
+  if (!banner) return;
+  banner.textContent = '';
+  banner.style.display = 'none';
+}
+
+
+// ═══════════════════════════════════════
+// 一般訊息：右下角的提示框，5 秒後自動消失
+// type：'error'（紅色，預設）或 'info'（灰藍色）
+// 跟連線錯誤分開顯示，兩者不會互相蓋掉
+// ═══════════════════════════════════════
+function showInlineError(msg, type = 'error') {     // 只是這一次失敗（按了某個按鈕沒成功） → showInlineError
+  const toast = document.getElementById('toast');
+  if (!toast) { console.warn('[操作訊息]', msg); return; }
+
+  // 連續顯示時，取消上一則的計時器，讓新訊息完整顯示 5 秒
+  if (inlineErrorTimer !== null) { clearTimeout(inlineErrorTimer); inlineErrorTimer = null; }
+
+  toast.textContent = msg;
+  toast.className = 'toast show ' + type;
+
+  inlineErrorTimer = setTimeout(() => {
+    toast.classList.remove('show');
+    inlineErrorTimer = null;
+  }, 5000);
+}
+
+
+// ═══════════════════════════════════════
+// TDMS 檔案分析
+// 把選好的 .tdms 檔上傳到 /predict/tdms，後端會把整個檔案分析完再回傳結果
+// 這是離線分析，跟即時監控完全分開，每次分析都是獨立的
+// ═══════════════════════════════════════
+async function runTdms() {
+  // 1.先檢查能不能分析
+  // 防止重複執行
+  if (tdmsRunning) {return;}    // 已經在分析
+
+  // 即時監控、清除與 TDMS 分析不能同時執行
+  if (monitorTransitioning) {showInlineError('⚠️ 監控狀態切換中，請稍候再分析 TDMS',); return;}
+  if (clearRunning) {showInlineError('⚠️ 資料正在清除中，請稍候再分析 TDMS',); return;}
+  if (autoRunning) {showInlineError('⚠️ 請先按「停止監控」，再上傳 TDMS 分析檔案',); return;}
+  if (!selectedFile) {showInlineError('⚠️ 請先選擇一個 .tdms 檔案'); return;}
+
+  // 2.鎖住畫面
+  // 先記住這次要分析的檔案，分析途中就算 selectedFile 被改掉，這次還是用同一個檔案，結果和檔名才對得上
+  const analysisFile = selectedFile;
+  // 進入 TDMS 分析狀態，標記分析中
+  tdmsRunning = true;
+  // 分析期間禁止相關操作：鎖住開始監控按鈕、鎖住檔案區
+  updateAutoButtonState();
+  setOfflineControlsDisabled(true);
+  setBusy(true);   // 顯示計算中
+  setSourceTag('file', '分析中...');    // 來源標籤改成「分析中...」
+
+  // 3.把檔案送給後端
+  // 把檔案包成表單格式上傳，最多等120秒
+  const formData = new FormData();
+  formData.append('file', analysisFile);
+  try {
+    // 檔案可能很大，最多等 120 秒
+    const response = await fetch(API_BASE + '/predict/tdms',{
+        method: 'POST',
+        body: formData,
+        signal: AbortSignal.timeout(120000),
+      },
+    );
+    // 後端回傳錯誤時，取出錯誤說明
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ detail: '未知錯誤',}));
+      const detail = typeof error.detail === 'string' ? error.detail : `HTTP ${response.status}`;
+      throw new Error(detail);}
+
+    const data = await response.json();
+
+    // 更新畫面
+    // 成功：顯示波形和診斷結果，標籤改成「檔案分析完成」。檔名用這次分析的檔案，不要用 selectedFile.name
+    finishResult(data, analysisFile.name);
+    setSourceTag('file', '檔案分析完成');
+  } catch (err) {
+    console.error('TDMS 分析失敗：', err);
+
+    // 失敗：右下角跳出錯誤，標籤改成「分析失敗」。
+    // 依錯誤類型給中文說明，原始英文訊息放在括號裡
+    let errorMessage;
+    if (err.name === 'TimeoutError') {
+      errorMessage = '分析時間超過 120 秒';
+    } else if (err.name === 'TypeError') {
+      // 連不到後端時，瀏覽器丟出的是 TypeError（Safari：Load failed、Chrome：Failed to fetch）
+      errorMessage = `無法連線後端（${err.message}）`;
+    } else {
+      errorMessage = err.message;   // 後端回傳的錯誤原因，本來就是中文
+    }
+    showInlineError(`⚠️ TDMS 分析失敗：${errorMessage}`,);
+    setSourceTag('file', '分析失敗');
+
+  // 4.解鎖：不論成功、失敗或逾時，都解除鎖定
+  } finally {
+    tdmsRunning = false;
+    updateAutoButtonState();
+    setOfflineControlsDisabled(false);
+    setBusy(false);
+  }
+}
+
+// ═══════════════════════════════════════
+// 結果顯示
+// applyResult：把後端 DetectResponse 填入所有 UI 元件, 更新分數、狀態與 Window 統計
+//   - leak_status → banner 顏色 / 文字
+//   - n_leak_windows / n_total_windows → 窗口統計
+//   - score / threshold → Leak Score 進度條
+// ═══════════════════════════════════════
+function applyResult(data, sourceLabel){
+  const banner=document.getElementById('statusBanner');
+  const st = STATE_MAP[data.leak_status] || STATE_MAP.normal;
+  const srcStr = sourceLabel ? ' [' + sourceLabel + ']' : '';
+
+  // 1. 中間的大 Banner（診斷結果）
+  // 依後端的判斷換顏色：正常→綠、疑似干擾→橘、洩漏→紅，大字：「正常狀態」、「洩漏狀態」等
+  banner.className='status-banner '+st.css;
+  document.getElementById('statusText').textContent = data.label || st.text;
+  document.getElementById('statusSub').textContent = st.sub+' · '+data.timestamp+srcStr;
+
+  // 2. 左邊卡片（窗口判定統計）
+  const nTotal = data.n_total_windows ?? 0;
+  const nLeak  = data.n_leak_windows ?? 0;
+  const nDist  = data.n_disturbance_windows ?? 0;
+  document.getElementById('leakWinVal').textContent = nLeak;    // leakWinVal  ← 幾個窗判定為洩漏 
+  document.getElementById('totalWinVal').textContent = nTotal;  // totalWinVal ← 總共幾個窗
+  document.getElementById('distWinVal').textContent = nDist;    // distWinVal  ← 幾個窗判定為干擾
+  document.getElementById('confVal').textContent = (data.confidence ?? 0);   // confVal ← 異常窗比例
+  document.getElementById('winBar').style.width = (nTotal>0 ? Math.min(100*nLeak/nTotal,100) : 0)+'%';    // winBar  ← 進度條：洩漏窗 ÷ 總窗數
+
+  // 3. 右邊卡片（Leak Score）
+  const score = data.score ?? 0;
+  const threshold = data.threshold ?? 0;
+  document.getElementById('scoreVal').textContent = score.toFixed ? score.toFixed(3) : score;                     // scoreVal ← 這次最高的洩漏分數
+  document.getElementById('thresholdVal').textContent = threshold != null ? Number(threshold).toFixed(3) : '—';   // thresholdVal ← 門檻值
+  document.getElementById('scoreBar').style.width = Math.min(100*score,100)+'%';                                  // scoreBar ← 進度條：分數 × 100%
+
+  // 4. 加一筆歷史紀錄:把這次結果加到「歷史紀錄」頁的表格裡。
+  addLog(data, sourceLabel);
+}
+
+
+// ═══════════════════════════════════════
+// 加一筆紀錄到歷史紀錄表格（由 applyResult() 呼叫，暖機中的結果不會進來）
+// ═══════════════════════════════════════
+function addLog(data, sourceLabel){
+  const source = sourceLabel || '即時';
+
+  // 即時監控：前端讀得比後端算得快，同一筆結果會被讀到好幾次
+  // 時間戳一樣就代表是同一筆，不重複加入
+  if (source === '即時') {
+    const liveLogKey = String(data.timestamp ?? '');
+    if (liveLogKey && liveLogKey === lastLiveLogKey) {return;}
+    lastLiveLogKey = liveLogKey;
+  }
+
+  // 複製一份，拿掉表格用不到的波形資料，避免記憶體越吃越多
+  const record = { ...data, _source: source };
+  delete record.signal_preview_ai0;
+  delete record.signal_preview_ai1;
+  delete record.signal_preview_ai0_filtered;
+  delete record.signal_preview_ai1_filtered;
+  delete record.window_probas;
+
+  // 加在最前面（最新的在表格第一列）
+  logHistory.unshift(record);
+
+  // 最多保留 HISTORY_DISPLAY_LIMIT 筆，超過就刪掉最舊的
+  if (logHistory.length > HISTORY_DISPLAY_LIMIT) {
+    logHistory.length = HISTORY_DISPLAY_LIMIT;
+  }
+
+  // 重畫表格，停在使用者目前看的頁
+  renderLogPage(currentPage);
+}
+
+
+// ═══════════════════════════════════════
+// 把文字裡的特殊符號轉成安全格式，再放進網頁
+// 避免檔名或後端回傳的內容被當成網頁語法
+// ═══════════════════════════════════════
+function escHtml(s) {
+  // 要把文字放進網頁時，有些符號會被瀏覽器當成「網頁語法」而不是文字
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+
+// ═══════════════════════════════════════
+// 決定歷史紀錄「來源」欄要顯示什麼
+// TDMS 顯示檔名，即時監控顯示「即時」
+// 歷史表格和匯出 CSV 都用這個
+// ═══════════════════════════════════════
+function getHistorySource(record) {
+  // 後端標記是 TDMS	檔名（沒有檔名就顯示 TDMS）
+  if (record.source === 'tdms') {
+    return (
+      record.source_name ||
+      record._source ||
+      'TDMS'
+    );
+  }
+  // 後端標記是即時	即時
+  if (record.source === 'live') { return '即時';}
+  // 後端沒有標記（舊資料）	前端自己記的來源，沒有就顯示「即時」
+  return record._source || '即時';
+}
+
+
+// ═══════════════════════════════════════
+// 畫歷史紀錄表格和分頁按鈕
+// page：要顯示第幾頁
+// 每次紀錄有變動、或使用者按頁碼時呼叫
+// ═══════════════════════════════════════
+function renderLogPage(page){
+  // 1. 算出這一頁要顯示哪幾筆
+  const total = logHistory.length;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  // 頁碼限制在 1 到總頁數之間（資料變少時不會停在不存在的頁）
+  currentPage = Math.min(Math.max(1, page), totalPages);
+  // 這一頁要顯示的紀錄
+  const start = (currentPage - 1) * PAGE_SIZE;
+  const rows = logHistory.slice(start, start + PAGE_SIZE);
+
+  document.getElementById('logCount').textContent = '共 ' + total + ' 筆';
+  document.getElementById('logPageInfo').textContent = '第 ' + currentPage+' / ' + totalPages + ' 頁';
+
+  // 2. 畫表格
+  const tbody=document.getElementById('logBody');
+  if(total===0){
+    tbody.innerHTML='<tr><td colspan="9" style="text-align:center;color:var(--text-dim);padding:40px">尚無檢測紀錄</td></tr>';
+  }else{
+    tbody.innerHTML=rows.map((r,i)=>{
+      const globalNo=total-(start+i);    // 編號：最新的最大
+      const st = STATE_MAP[r.leak_status] || STATE_MAP.normal;
+      const dotColor = st.css === 'leak' ? 'var(--leak)' : st.css === 'warn' ? 'var(--warn)' : 'var(--ok)';
+      const conf=parseFloat(r.confidence)||0;
+      // 歷史紀錄刻意顯示 6 位小數，比主畫面（3 位）細，方便事後比對
+      const score=(r.score!=null)?Number(r.score).toFixed(6):'—';
+      const thr=(r.threshold!=null)?Number(r.threshold).toFixed(3):'—';
+      const winStr=(r.n_leak_windows??'—')+'/'+(r.n_disturbance_windows??'—')+'/'+(r.n_total_windows??'—');
+      const calc = r.calc_time_sec != null ? Number(r.calc_time_sec).toFixed(2) : '—';
+
+      return '<tr>'
+        + '<td style="color:var(--text-dim)">' + globalNo + '</td>'
+        + '<td>' + escHtml(r.timestamp) + '</td>'
+        + '<td class="log-source" style="font-size:11px" title="' + escHtml(getHistorySource(r)) + '">' + escHtml(getHistorySource(r)) + '</td>'
+        + '<td><span class="log-dot" style="background:' + dotColor + '"></span>' + escHtml(r.label || st.text) + '</td>'
+        + '<td>' + score + '</td>'
+        + '<td>' + thr + '</td>'
+        + '<td>' + winStr + '</td>'
+        + '<td>' + calc + '</td>'
+        + '<td><div class="conf-bar"><div class="conf-track"><div class="conf-fill" style="width:' + conf + '%"></div></div><span>' + conf + '%</span></div></td>'
+        + '</tr>';
+    }).join('');
+  }
+
+  // ── 分頁按鈕 ──
+  const pg=document.getElementById('pagination');
+  if(totalPages<=1){pg.innerHTML='';return;}      // 只有 1 頁不用分頁
+
+  // 最多顯示 4 個頁碼，盡量讓目前頁在中間
+  let startP = Math.max(1, currentPage - 1);
+  let endP = Math.min(totalPages, startP + 3);
+  if (endP - startP < 3) startP = Math.max(1, endP - 3);
+
+  let html = '';
+  html += '<button class="page-btn" onclick="renderLogPage(currentPage-1)" ' + (currentPage <= 1 ? 'disabled' : '') + '>&lt;</button>';
+  for (let p = startP; p <= endP; p++) {
+    html += '<button class="page-btn' + (p === currentPage ? ' active' : '') + '" onclick="renderLogPage(' + p + ')">' + p + '</button>';
+  }
+  html += '<button class="page-btn" onclick="renderLogPage(currentPage+1)" ' + (currentPage >= totalPages ? 'disabled' : '') + '>&gt;</button>';
+  html += '<span class="page-info">共 ' + totalPages + ' 頁 · ' + PAGE_SIZE + ' 筆/頁</span>';
+  pg.innerHTML = html;
+}
+
+
+// ═══════════════════════════════════════
+// 匯出 CSV
+// 依下拉選單選的筆數，直接向後端要資料，整理成 CSV 讓瀏覽器下載
+// 不是匯出畫面上的表格，所以不受畫面 200 筆的限制
+// ═══════════════════════════════════════
+async function exportCSV(){
+  // ── 1. 讀取使用者選了幾筆 ──
+  const select = document.getElementById('exportLimit');   // 下拉選單
+  const button = document.getElementById('exportBtn');     // 匯出按鈕
+
+  // 選單的值是文字（例如 "400"），轉成數字；讀不到或不是數字就用預設 1000
+  const limit = Number(select ? select.value : EXPORT_DEFAULT_LIMIT) || EXPORT_DEFAULT_LIMIT;
+
+  // 讀取期間鎖住按鈕，避免連按下載好幾份
+  if (button) { button.disabled = true; }
+
+  // ── 2. 向後端要資料 ──
+  let records;      // 宣告在 try 外面，因為後面組 CSV 還要用
+  try {
+    // 資料量較大，逾時放寬到 10 秒
+    const res = await fetch(API_BASE + '/history?limit=' + limit, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) { throw new Error('HTTP ' + res.status); }
+
+    const data = await res.json();
+    if (!Array.isArray(data.records)) { throw new Error('後端回傳格式不正確'); }
+
+    // 後端給的是「舊的在前」，倒過來變成「新的在前」，跟畫面表格一樣
+    records = data.records.slice().reverse();    // 先 slice() 複製一份再倒，不改到原本的資料
+  } catch (err) {
+    // 依錯誤類型給中文說明
+    let errorMessage;
+    if (err.name === 'TimeoutError') {
+      errorMessage = '讀取逾時';
+    } else if (err.name === 'TypeError') {
+      errorMessage = `無法連線後端（${err.message}）`;   // 後端沒開或網路斷
+    } else {
+      errorMessage = err.message;
+    }
+    showInlineError('⚠️ 匯出失敗：' + errorMessage);
+    return;
+  } finally {
+    // 不管成功或失敗，按鈕都要解鎖
+    if (button) { button.disabled = false; } 
+  }
+
+  // ── 3. 整理成 CSV 格式 ──
+  // 後端沒有任何紀錄，不產生空檔案
+  if (records.length === 0) { showInlineError('ℹ️ 尚無資料可匯出', 'info'); return; }
+  // CSV 第一列：欄位名稱
+  const headers = ['序號','時間','來源','診斷結果','Score','Threshold','leak窗','disturbance窗','total窗','模型計算時間(s)','異常窗比例(%)'];
+  // 每筆紀錄轉成一列，順序要跟 headers 一樣
+  const rows = records.map((r, i) => [
+    records.length - i,            // 序號：最新的編號最大
+    r.timestamp,
+    getHistorySource(r),           // 「即時」或 TDMS 檔名
+    r.label || r.leak_status,      // 有中文標籤就用標籤，沒有就用狀態代碼
+    r.score ?? '',                 // ?? ''：有值就用值，沒值就填空白。
+    r.threshold ?? '',
+    r.n_leak_windows ?? '',
+    r.n_disturbance_windows ?? '',
+    r.n_total_windows ?? '',
+    r.calc_time_sec ?? '',
+    r.confidence ?? '',
+  ]);
+
+  // 把標題和每一列組成 CSV 文字：
+  //   每個值前後加雙引號（內容有逗號時才不會被切成兩欄）
+  //   內容本身的雙引號要寫兩次（CSV 規則）
+  //   同一列用逗號連接，每列之間換行
+  const csv = [headers, ...rows]
+    .map(row => row.map(v => '"' + String(v).replace(/"/g, '""') + '"').join(','))
+    .join('\n');
+
+  // ── 4. 讓瀏覽器下載 ──
+  // 把 CSV 文字包成檔案；開頭加一個看不見的記號（\uFEFF），Excel 才認得中文
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);    // 給這個檔案一個暫時的網址
+
+  // 做一個看不見的下載連結，設定好網址和檔名，再用程式點一下它
+  const a = document.createElement('a');
+  a.href = url;
+  // 檔名：H2_detection_筆數rows_本地時間.csv
+  a.download = 'H2_detection_' + records.length + 'rows_' + formatLocalTimestamp(new Date()) + '.csv';
+  a.click();
+
+  // 1 秒後刪掉暫時網址釋放記憶體（太早刪的話 Safari 會下載失敗）
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+  // 實際筆數少於選擇的筆數時提示，代表後端目前只有這麼多資料
+  if (records.length < limit) {
+    showInlineError('ℹ️ 後端目前共 ' + records.length + ' 筆，已全部匯出', 'info');
+  }
+}
+
+
+// ═══════════════════════════════════════
+// 把時間變成檔名用的格式：2026-10-01_11-24-05
+// 用本地時間；toISOString() 是國際標準時間，台灣會少 8 小時
+// ═══════════════════════════════════════
+function formatLocalTimestamp(date) {
+  const pad = n => String(n).padStart(2, '0');      // 把數字補成兩位數
+
+  // getMonth() 從 0 開始算（1 月是 0），所以要 +1
+  // 時間用「-」不用「:」，因為 Windows 檔名不能有冒號
+  return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + '_' +
+         pad(date.getHours()) + '-' + pad(date.getMinutes()) + '-' + pad(date.getSeconds());
+}
+
+
+// ═══════════════════════════════════════
+// 清除資料
+// 按「清除資料」→ 跳出確認對話框 → 按「確認清除」才會執行 clearData()
+// 順序：先停止監控 → 叫後端清除 → 後端成功才清畫面
+// 後端失敗時畫面不動，避免畫面和後端資料對不上
+// ═══════════════════════════════════════
+// 顯示確認對話框
+function showClearConfirm(){document.getElementById('confirmOverlay').classList.add('show');}
+// 關閉確認對話框
+function hideConfirm(){document.getElementById('confirmOverlay').classList.remove('show');}
+
+async function clearData(){
+  // 已經有清除流程正在執行，忽略重複點擊
+  if (clearRunning) {return; }
+
+  // 正在開始或停止監控，不能清除
+  if (monitorTransitioning) {
+    hideConfirm();
+    showInlineError('⚠️ 監控狀態切換中，請稍候再清除',);
+    return;
+  }
+
+  // 正在分析 TDMS，不能清除
+  if (tdmsRunning) {
+    hideConfirm();
+    showInlineError('⚠️ TDMS 檔案正在分析中，請等待分析完成後再清除');
+    return;
+  }
+
+  // 標記為清除中（這段期間開始監控按鈕會被鎖住）
+  clearRunning = true;
+
+  // 「確認清除」按鈕鎖住，改成「清除中...」
+  const clearButton = document.getElementById('confirmClearBtn');
+  if (clearButton) {
+    clearButton.disabled = true;
+    clearButton.textContent = '清除中...';
+  }
+
+  try {
+    // ── 1. 先停止監控（沒在監控會直接當作成功） ──
+    const stopped = await stopAuto();
+    if (!stopped) {
+      // 停止失敗，不能清除。錯誤訊息 stopAuto() 已經顯示過了
+      hideConfirm();
+      return; 
+    }
+
+    // ── 2. 叫後端清除，最多等 5 秒 ──
+    try {
+      const response = await fetch(API_BASE + '/clear', {
+        method: 'POST',
+        signal: AbortSignal.timeout(5000),
+      });
+
+      // 後端回傳錯誤時，取出錯誤原因
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        const detail = typeof error.detail === 'string' ? error.detail : `HTTP ${response.status}`;
+        throw new Error(detail);
+      }
+    } catch (err) {
+      hideConfirm();
+
+      // 依錯誤類型給中文說明
+      let errorMessage;
+      if (err.name === 'TimeoutError') {
+        errorMessage = '後端清除逾時';
+      } else if (err.name === 'TypeError') {
+        errorMessage = `無法連線後端（${err.message}）`;
+      } else {
+        errorMessage = err.message;
+      }
+
+      showInlineError(`⚠️ 清除失敗：${errorMessage}，畫面資料尚未清除`);
+      return;
+    }
+
+    // ── 3. 後端清除成功，開始清畫面 ──
+    hideConfirm();
+    // 錯誤提示、過期樣式、失敗次數、溢出警告都歸零
+    clearConnectionError();
+    markDataFresh();
+    failCount = 0;
+    hasSeenOverrun = false;
+
+    // 歷史紀錄清空
+    lastLiveLogKey = null;
+    logHistory.length = 0;
+    renderLogPage(1);
+
+    // 波形資料清空
+    liveWaveChunks = [];
+    liveWaveBuffer = [];
+    liveWaveBoundaries = [];
+    liveWaveDurationSec = 0;
+    lastWaveformSeq = null;
+    lastWave = null;
+
+    // 診斷結果 Banner 回到綠色「等待檢測」
+    const banner=document.getElementById('statusBanner');
+    banner.className='status-banner ok';
+    document.getElementById('statusText').textContent='等待檢測';
+    document.getElementById('statusSub').textContent='請按下「開始自動監控」或上傳 TDMS 檔案';
+
+    // 兩張數字卡片清成「—」，進度條歸零
+    ['leakWinVal','totalWinVal','distWinVal','confVal','scoreVal','thresholdVal'].forEach(id=>document.getElementById(id).textContent='—');
+    ['winBar','scoreBar'].forEach(id=>document.getElementById(id).style.width='0%');
+
+    // 模型計算時間清空
+    document.getElementById('calcVal').textContent='—';
+    document.getElementById('spinner').classList.remove('on');
+    document.getElementById('calcDisplay').style.display='none';
+
+    // 隱藏暖機與健康狀態
+    document.getElementById('warmup-bar-wrap').style.display = 'none';
+    document.getElementById('warmup-bar').style.width = '0%';
+    document.getElementById('health-row').style.display = 'none';
+    document.getElementById('health-overrun').style.display = 'none';
+    document.getElementById('health-lag').textContent = '';
+
+    // 波形圖藏起來，顯示提示文字
+    document.getElementById('waveCanvas').style.display = 'none';
+    document.getElementById('waveEmpty').style.display = 'flex';
+    document.getElementById('waveEmpty').textContent = '按下「開始自動監控」後顯示聲射訊號波形';
+    document.getElementById('waveMeta').textContent ='等待第一次檢測...';
+
+    // 波形下方的數字清成「—」
+    ['waveRms', 'wavePeak', 'waveDur', 'waveStatus', 'waveFs',
+    ].forEach(id => { document.getElementById(id).textContent = '—';
+    });
+    
+    // 重置 TDMS 上傳狀態：取消已選的 TDMS 檔案，上傳區回到初始樣子
+    selectedFile=null;
+    const input = document.getElementById('tdmsInput');
+    const uploadZone = document.getElementById('uploadZone');
+    const fileName = document.getElementById('uploadFileName');
+    const fileSize = document.getElementById('uploadFileSize');
+    const tdmsButton = document.getElementById('tdmsBtn');
+
+    if (input) {input.value = '';}
+    if (uploadZone) {uploadZone.classList.remove('has-file');}
+    if (fileName) {fileName.textContent = '選擇 TDMS 檔案';}
+    if (fileSize) {fileSize.textContent ='點擊瀏覽或拖曳 .tdms 到此';}
+    if (tdmsButton) {tdmsButton.disabled = true;}
+
+    // 來源標籤改成待機
+    setSourceTag('idle','待機');
+  } finally {
+    // 不管成功、失敗或中途結束，都要解除清除中的鎖定
+    clearRunning = false;
+    updateAutoButtonState();
+
+    if (clearButton) {
+      clearButton.disabled = false;
+      clearButton.textContent = '確認清除';
+    }
+  }
+}
+
+// ═══════════════════════════════════════
+// Resize 重繪
+// ═══════════════════════════════════════
+window.addEventListener('resize', () => {
+  if (lastWave) {
+    drawWaveform(lastWave.sig, lastWave.cssState, lastWave.durationSec, lastWave.boundaries);
+  }
+});
+</script>
+</body>
+</html>
