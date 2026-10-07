@@ -48,6 +48,7 @@
     - 與 offband 重疊的格子（FIXED_EXCLUDED_RANGES）一律預設 include = false，並標示 fixed_excluded
     - 上次核准時排除的格子（EXCLUDED_RANGES）會預設 include = false，並標示 previously_excluded
     - diff_vs_approved 以「範圍」比對正式版，分成新增 / 移除 / 類型改變；預設不納入的格子不計入
+    - 只有弱證據、沒有任何聲道有強證據的格子，一律預設 include = false，並標示 weak_only
 
 說明：
 本程式找出的不是嚴格物理定義下的固有模態頻率，而是根據實際敲擊量測資料，在扣除寬頻趨勢後仍局部凸起、且可跨天重現的頻帶，因此稱為「共振候選頻帶」。
@@ -80,10 +81,15 @@
   對每個搜尋候選峰，在驗證資料的 ±validation_tol_hz 範圍內，
   選擇局部凸起最大的頻率點，並在同一頻率點檢查 local dB
   與 Tap/Background dB 差。
+  
+- 片段時間：manifest 的時間為手動點擊記錄，與實際錄製的 0.5 秒存在數百毫秒的誤差，
+  敲擊 / 背景的分類可能因此有少量錯誤；這類錯誤只會讓共振變弱，不會產生假的共振
 
 - 輸出注意：
-  重複使用相同的 --output-csv 名稱時會寫入相同輸出資料夾；
+  每次分析會在輸出名稱後自動加入執行日期時間，因此不同執行結果會存放在不同資料夾。
   執行前應確認其中沒有被誤認為本次結果的舊檔案。
+  
+- 位置：只有「搜尋批次與驗證批次都有錄到」的位置會納入分析（整體分析與分位置分析皆同）
 
 本程式的目的，是從真實量測資料中找出穩定且可重現的共振候選頻帶，作為後續特徵工程、洩漏分析與模型驗證的候選依據。
 """
@@ -356,7 +362,11 @@ def parse_args() -> argparse.Namespace:
     output = parser.add_argument_group("輸出")
     output.add_argument(
         "--output-csv", type=Path, default=DEFAULT_OUTPUT,
-        help="輸出的主檔名與路徑；其他輸出會放在同名資料夾下的 tables/spectra/figures/configs",
+        help=(
+            "輸出名稱與根目錄的基準路徑；"
+            "程式會自動在名稱後加入執行日期時間，"
+            "並建立 tables/spectra/figures/configs 子資料夾"
+        ),
     )
 
     return parser.parse_args()
@@ -799,18 +809,54 @@ def read_tdms_channel(filepath: Path,                      # filepath：TDMS 檔
 
 
 # ============================================================
-# 對多個片段做平均 PSD(每支 TDMS 的 PSD 只算一次，分位置分析時直接重用)
+# 訊號 QC + PSD 計算（每支 TDMS、每個聲道只檢查並計算一次）
 # ============================================================
-_PSD_CACHE: dict = {}    # 記住算過的結果
+_PSD_CACHE: dict = {}      # 記住算過的 PSD；未通過 QC 的存 None
+QC_LOG: list[dict] = []    # 記錄被排除或有警告的片段，最後輸出成 QC 報表
+
+# 資料硬性檢查
+def signal_qc(x: np.ndarray, nperseg: int, rms_min: float = 1e-6) -> str | None:
+    """硬性檢查，回傳排除原因；通過則回傳 None。門檻和特徵工程的 check_signal_quality() 一致。"""
+    if x.size == 0:
+        return "empty"
+    if not np.isfinite(x).all():
+        return "nan_or_inf"
+    if np.allclose(x, 0):
+        return "all_zero"
+    if np.sqrt(np.mean(x ** 2)) < rms_min:
+        return "rms_too_low"
+    if len(x) < nperseg:
+        return "too_short"
+    return None
+
+
 # 算一個檔案的頻譜，並記起來
-def file_psd(tdms_path, channel_name, fs, nperseg):
+def file_psd(tdms_path, channel_name, fs, nperseg, expected_len: int | None = None):
+    """讀取訊號 → 硬性 QC → 計算 Welch PSD。未通過 QC 回傳 None，原因記在 QC_LOG。"""
     # 用「檔案 + 聲道 + 取樣率 + nperseg」當作 key。第一次遇到這個組合時才真的讀檔、計算；之後再遇到就直接回傳記住的結果。
     key = (str(tdms_path), channel_name, fs, nperseg)
     if key not in _PSD_CACHE:
-        # 讀出訊號，用 Welch 方法算頻譜
-        signal = read_tdms_channel(tdms_path, channel_name)
+        try:
+            # 讀出訊號，用 Welch 方法算頻譜
+            signal = read_tdms_channel(tdms_path, channel_name)
+            # 訊號硬性檢查
+            reason = signal_qc(signal, nperseg)
+        except ValueError:                       # 找不到這個聲道
+            signal, reason = None, "missing_channel"
+        
+        if reason is not None:
+            QC_LOG.append({"tdms_path": str(tdms_path), "channel": channel_name,
+                           "level": "excluded", "reason": reason})
+        elif expected_len:
+            # 樣本數和 manifest 的時間長度差太多：可能是 --fs 設錯或檔案異常（先只警告）
+            dev = abs(len(signal) - expected_len) / expected_len
+            if dev > 0.05:
+                QC_LOG.append({"tdms_path": str(tdms_path), "channel": channel_name,
+                               "level": "warning",
+                               "reason": f"length_mismatch（實際 {len(signal)}，預期約 {expected_len}）"})
+
         # 太短的片段直接跳過，避免頻率軸長度不一致
-        _PSD_CACHE[key] = None if len(signal) < nperseg else welch(signal, fs=fs, nperseg=nperseg)
+        _PSD_CACHE[key] = None if reason else welch(signal, fs=fs, nperseg=nperseg)
     return _PSD_CACHE[key]
 
 # 把多個片段的頻譜平均起來
@@ -823,7 +869,9 @@ def averaged_psd(records: list[SliceRecord],    # 很多個片段清單
         raise ValueError("沒有可用片段可計算 PSD")
     freqs, psd_sum, n_used, n_skipped = None, None, 0, 0
     for record in records:
-        res = file_psd(record.tdms_path, channel_name, fs, nperseg)
+        # tdms 預期長度
+        expected_len = int(round((record.t_end - record.t_start) * fs))
+        res = file_psd(record.tdms_path, channel_name, fs, nperseg, expected_len)
         if res is None:
             n_skipped += 1
             continue
@@ -838,11 +886,11 @@ def averaged_psd(records: list[SliceRecord],    # 很多個片段清單
         
     # 所有片段都不能用就報錯；否則回傳頻率軸和平均頻譜。
     if n_used == 0:
-        raise ValueError(f"所有片段都短於 nperseg={nperseg}")
+        raise ValueError(f"{channel_name}：所有片段都未通過訊號 QC")
         
     if n_skipped:
-        print(f"  ⚠️ {channel_name}：{n_skipped} 個片段短於 nperseg={nperseg}，已略過（使用 {n_used} 個）")
-        
+        print(f"  ⚠️ {channel_name}：{n_skipped} 個片段未通過訊號 QC，已略過（使用 {n_used} 個；原因見 QC 報表）")
+            
     return freqs, psd_sum / n_used
 
 
@@ -1705,12 +1753,16 @@ def build_resonance_proposal(vote_df, overall_by_channel, channels,
         # 和 offband 有重疊的格子，固定不納入（用「有重疊」判斷，因為 315～325k 沒有對齊 10k 格子）
         fixed_excluded = any(
             min(row["f_high"], hi) - max(row["f_low"], lo) > 0 for lo, hi in FIXED_EXCLUDED_RANGES)
-                
+        
+        # 沒有任何聲道有強證據、只有弱證據的格子：證據最薄弱，預設不納入
+        weak_only = not strong
+        
         # 整理成提案的一筆
         bands.append({
-            "include": not (previously_excluded or fixed_excluded),          # 上次核准時排除的，預設維持排除
-            "previously_excluded": previously_excluded,                      # 標示這格是上次核准時排除的
-            "fixed_excluded": fixed_excluded,                                # 與 offband 重疊，固定不納入
+            "include": not (previously_excluded or fixed_excluded or weak_only),
+            "previously_excluded": previously_excluded,      # 上次核准時排除的
+            "fixed_excluded": fixed_excluded,                # 與 offband 重疊，固定不納入
+            "weak_only": weak_only,                          # 只有弱證據，預設不納入
             "name": f"{prefix}_{row['cell']}",
             "f_low": int(row["f_low"]),
             "f_high": int(row["f_high"]),
@@ -1980,6 +2032,32 @@ def main() -> None:
         print(f"  ⚠️ 資料混有多種壓力：{pressures} bar，結果會被平均在一起；"
               "如需分開分析，請先依壓力整理資料")
 
+    # 整體分析也只用「搜尋與驗證四組都有」的位置，讓跨天比較的位置組成一致（分位置分析本來就只分析這些位置；其他位置等補錄驗證資料後會自動納入）
+    # 確認驗證資料存在
+    if val_tap_records and val_bg_records:
+        # 找出四組共同位置(搜尋 Tap 有的位置 ∩ 搜尋 Background 有的位置 ∩ 驗證 Tap 有的位置 ∩ 驗證 Background 有的位置)
+        common_positions = (
+            {r.position for r in tap_records} & {r.position for r in bg_records}
+            & {r.position for r in val_tap_records} & {r.position for r in val_bg_records}
+        )
+        
+        # 完全沒有共同位置就停止
+        if not common_positions:
+            raise SystemExit("搜尋資料與驗證資料沒有共同位置，無法進行跨天驗證")
+        
+        # 找出哪些位置被略過
+        dropped = sorted({r.position for r in all_records + validation_records} - common_positions)
+        if dropped:
+            print(f"  ⚠️ 整體分析只使用搜尋與驗證共同的位置 {sorted(common_positions)}；已略過：{dropped}")
+        
+        # 篩選函式(不會修改 TDMS 檔案，只會產生一份篩選後的 Python 清單)
+        def keep(recs):
+            return [r for r in recs if r.position in common_positions]
+
+        # 四組資料全部套用相同篩選
+        tap_records, bg_records = keep(tap_records), keep(bg_records)
+        val_tap_records, val_bg_records = keep(val_tap_records), keep(val_bg_records)
+
     # 整理要分析的聲道
     channels = list(dict.fromkeys(args.channels))       # 去除重複、保留順序
     min_channels = args.min_channels or len(channels)   # min_channels 沒指定時，預設是「全部聲道都要有強證據」
@@ -2009,8 +2087,10 @@ def main() -> None:
     
     # 決定輸出資料夾結構
     output_anchor = args.output_csv
-    run_name = output_anchor.stem
-    output_root = output_anchor.parent / run_name
+    # 每次分析自動建立不同的執行名稱，避免覆蓋或混入舊資料
+    run_timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    run_name = (f"{output_anchor.stem}_{run_timestamp}")
+    output_root = (output_anchor.parent / run_name)
     
     # 建立四個子資料夾
     tables_dir = output_root / "tables"       # 表格
@@ -2124,6 +2204,7 @@ def main() -> None:
         if proposal["resonance_bands"]:
             for b in proposal["resonance_bands"]:
                 tag = ("（與 offband 重疊，固定不納入）" if b["fixed_excluded"]
+                       else "（僅弱證據，預設不納入）" if b["weak_only"]
                        else "（上次排除，預設不納入）" if b["previously_excluded"] else "")
                 print(f"  {b['name']:<20} 強：{b['strong_channels']}  弱：{b['weak_channels']}{tag}")
         else:
@@ -2144,8 +2225,19 @@ def main() -> None:
         print("\n⚠️ 沒有任何位置同時具備搜尋與驗證資料，本次不產生共振頻帶提案。")
         
     # ============================================================
-    # 6. 摘要表、落差稽核、畫圖
+    # 6. QC、摘要表、落差稽核、畫圖
     # ============================================================
+    # 訊號 QC 報表：列出被排除或有警告的片段
+    qc_csv = tables_dir / f"{run_name}_qc_report.csv"
+    if QC_LOG:
+        qc_df = pd.DataFrame(QC_LOG)
+        qc_df.to_csv(qc_csv, index=False, encoding="utf-8-sig")
+        print("\n=== 訊號 QC ===")
+        print(qc_df.groupby(["level", "channel"])["reason"].value_counts().to_string())
+        print(f"  詳細清單：{qc_csv}")
+    else:
+        print("\n✅ 訊號 QC：所有片段都通過硬性檢查")
+    
     # 摘要表：每個聲道各做一份，再合併（加上 channel 欄位）
     summaries = [
         build_band_summary_table(res).assign(channel=ch)
