@@ -24,8 +24,7 @@ Baseline 保存的內容包括：
 ----------------
 
 1. discovery 模式
-
-    BASELINE_MODE = "discovery"
+     %runfile build_site_baseline_v2.py --args "--mode discovery"
 
 用途：
 - 產生與 Step2a 相同的完整滑動候選頻帶
@@ -41,8 +40,7 @@ Baseline 保存的內容包括：
 
 
 2. final 模式
-
-    BASELINE_MODE = "final"
+    %runfile build_site_baseline_v2.py
 
 用途：
 - 讀取 schema_status=final 的 band_config_step2.json
@@ -53,9 +51,13 @@ Baseline 保存的內容包括：
 輸出：
 - site_baseline.json
 
-注意：
+3. 測試模式
+    %runfile build_site_baseline_v2.py --args "--tdms-limit 10"
 
-BASELINE_MODE="final" 表示使用正式頻帶，
+    只使用前 N 支 TDMS，輸出到 *_test.json，不會覆蓋正式的 baseline。
+
+注意：
+--mode final 表示使用正式頻帶，
 不代表 site_baseline.json 的 schema_status 一定是 final。
 
 Baseline 的 schema_status 應依正常資料來源與品質決定：
@@ -67,8 +69,8 @@ Baseline 的 schema_status 應依正常資料來源與品質決定：
 ----------------
 Step 1：
 使用正常 calibration TDMS 執行 discovery Baseline。
-
-    BASELINE_MODE = "discovery"
+    discovery 模式
+    %runfile build_site_baseline_v2.py --args "--mode discovery"
 
 輸出 discovery_baseline.json。
 
@@ -82,7 +84,7 @@ Step2a 使用 discovery_baseline.json 對候選頻帶建立 raw、rel、z、CUSU
 Step 3：
 人工檢查候選結果：
 - 定案 leak-focused bands
-- 保留需要的 resonance bands
+- 從 approved_resonance_bands.json 複製正式共振頻帶（由共振程式提案、人工核准）
 - 加入 offband
 - 確認 temporal_band_names
 - 另存為 band_config_step2.json
@@ -90,8 +92,8 @@ Step 3：
 
 Step 4：
 使用正式頻帶重新建立 Baseline。
-
-    BASELINE_MODE = "final"
+    final 模式（預設，直接執行即可）
+    %runfile build_site_baseline_v2.py
 
 輸出 site_baseline.json。
 
@@ -166,13 +168,22 @@ import pandas as pd
 from dataclasses import dataclass
 import hashlib
 from datetime import datetime
+from collections import Counter
+import argparse
+import shutil
 
 from shared_feature_utils import (
+    BandConfig,
+    calculate_file_sha256,
+    load_feature_extraction_config,
     load_or_compute_features_by_file,
-    merge_band_groups,
+    load_band_config,
     build_offband_summary_features,
     configure_temporal_band_names,
-    generate_sliding_bands
+    generate_sliding_bands,
+    select_all_raw_feature_columns,
+    GRID_F_MIN, GRID_F_MAX, GRID_WIDTH, GRID_STRIDE,
+    SIGNAL_RMS_MIN,
 )
 
 
@@ -180,46 +191,48 @@ from shared_feature_utils import (
 # ============================================================
 # 設定全域參數
 # ============================================================
-# BASELINE_MODE 決定使用哪一套頻帶範圍：
-# discovery：完整掃描候選頻帶
-# final：已定案的正式頻帶
-# 注意：BASELINE_MODE="final" 不代表輸出的 baseline schema_status, 一定是 final；schema_status 仍由資料來源與品質決定。
-#BASELINE_MODE = "discovery"
-BASELINE_MODE = "final"
-
-# 使用 Step2a 相同的頻段拆解
-DISCOVERY_F_MIN = 5_000
-DISCOVERY_F_MAX = 500_000
-DISCOVERY_BAND_WIDTH = 10_000
-DISCOVERY_STRIDE = 5_000
+# 頻帶搜尋網格：沿用 shared_feature_utils 的共用設定（與 Step2a、共振程式一致）
+DISCOVERY_F_MIN = GRID_F_MIN
+DISCOVERY_F_MAX = GRID_F_MAX
+DISCOVERY_BAND_WIDTH = GRID_WIDTH
+DISCOVERY_STRIDE = GRID_STRIDE
 
 
 # ============================================================
 # 儲存探索用頻帶設定
 # ============================================================
 def save_discovery_band_config(
-        output_path,         # 檔案路徑輸出
-        discovery_bands,     # 頻帶搜尋（Step2a）掃出來的候選頻帶清單
+        output_path,         # 輸出路徑（band_config_step2_discovery.json）
+        discovery_bands,     # generate_sliding_bands() 產生的完整掃描網格
     ):
+    """把完整掃描網格寫成 discovery 版的 band config，供 discovery baseline 與 Step2a 使用。
+
+    注意：
+    - 內容只由網格參數決定，不要加入時間戳記等每次都會變的欄位。
+      baseline 會用這份檔案的 SHA-256 產生快取指紋；內容不變，快取才能重複使用。
+    - schema_status = "discovery"，load_band_config() 在 final 模式會拒絕它，避免誤用在正式流程。
+    """
+    
     # 建立要寫出去的字典 payload
     payload = {
-        # schema_name 跟 schema_version 都跟你正式版 band config（load_frozen_band_config 那支）驗證的欄位對得起來——同一個 schema 家族，版本一致
+        # 和正式版 band config 同一個 schema 家族，由 load_band_config() 驗證
         "schema_name": "band_config",
         "schema_version": 2,
-        "schema_status": "discovery",                   # 確保這份「還沒篩選過」的原始掃描結果不會被誤用在正式流程裡
-        "baseline_scope": "discovery_scan_grid",        # 這份頻帶設定的產生範疇/依據，是一個地毯式掃描網格（grid），而不是針對特定漏檢測訊號精挑出來的結果
-        "band_merge_policy": (
-            "keep_primary_overlap_"
-            "drop_secondary_overlap_v1"
-        ),
+        "schema_status": "discovery",                   # 尚未篩選的原始掃描結果，不可用於正式流程
+        "baseline_scope": "discovery_scan_grid",        # 地毯式掃描網格，不是針對洩漏訊號挑選的結果
+        "band_merge_policy": "keep_primary_overlap_drop_secondary_overlap_v1",
+        
+        # 為了沿用 band_config 的資料結構，探索階段暫時把完整掃描頻帶放在 leak_focused_bands；
+        # 這些只是候選，不代表已定案為正式洩漏頻帶。
         "leak_focused_bands": list(discovery_bands),    # 為了沿用 band_config 的共同資料結構，探索階段暫時把完整掃描頻帶放在 leak_focused_bands。此時這些只是 discovery candidates，不代表已經定案為正式洩漏頻帶。
         "resonance_bands": [],
         "offband_bands": [],
-        "temporal_band_names": sorted(                  # 既然這是探索階段、還沒篩選，乾脆全部候選都先納入 temporal 名單
-            band["name"]
-            for band in discovery_bands
-        ),
-        "discovery_parameters": {                       # 探索階段獨有、正式版完全沒有
+        
+        # 探索階段尚未篩選，全部候選都建立 temporal 特徵（約 98 個頻帶，計算量較大）
+        "temporal_band_names": sorted(band["name"] for band in discovery_bands),
+        
+        # 探索階段獨有：記錄這份網格是用什麼參數產生的
+        "discovery_parameters": {                       
             "f_min": DISCOVERY_F_MIN,                   # 掃描的最低/最高頻率 f_min/f_max
             "f_max": DISCOVERY_F_MAX,
             "band_width": DISCOVERY_BAND_WIDTH,         # 每個候選頻帶的寬度 band_width
@@ -229,170 +242,104 @@ def save_discovery_band_config(
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True,)
-
     # 把這串 JSON 字串寫入檔案，指定用 UTF-8 編碼寫入
-    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2,), encoding="utf-8",)
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8",)
 
     return output_path
 
 
 # ============================================================
-# 定義一個資料類別 BandConfig (專門拿來裝 band 設定的小盒子)
-# ============================================================
-@dataclass(frozen=True)             # 這份 band 設定是正式設定，不應該在程式中途被亂改
-class BandConfig:
-    '''
-    專門拿來裝 band 設定的小盒子。
-    frozen=True 的意思是：建立之後，內容不能隨便改。
-    好處是：避免你後面程式不小心把 band 改掉。
-    '''
-    leak_focused_bands: list[dict]   # 正式主判斷的洩漏頻帶
-    resonance_bands: list[dict]      # Step1 找出來的共振頻帶
-    offband_bands: list[dict]        # 額外拿來做 broadband / veto 判斷的頻帶
-    temporal_band_names: list[str]   # 指定基礎特徵提取器需要建立 temporal raw/base 特徵的頻帶
-    
-
-# ============================================================
-# 定義一個新的資料類別存放的是load_or_compute_features_by_file實際需要的三種 band :low_bands、core_bands、aux_bands
+# 特徵萃取器使用的三組頻帶（離線與 runtime 共用的分組方式）
 # ============================================================
 @dataclass(frozen=True)
 class RuntimeBandGroups:
-    low_bands: list[dict]
-    core_bands: list[dict]
-    aux_bands: list[dict]
+    """load_or_compute_features_by_file() 需要的三組頻帶。
+    名稱有 Runtime，但離線特徵萃取也使用同一種分組。"""
+    low_bands: list[dict]     # 舊版低頻頻帶（目前固定為空）
+    core_bands: list[dict]    # 洩漏頻帶 + 共振頻帶：完整萃取特徵
+    aux_bands: list[dict]     # offband：只萃取少量摘要特徵
 
 
 # ============================================================
-# 轉換函：:輸入是語意版的BandConfig,輸出是load_or_compute_features_by_file可以直接吃的RuntimeBandGroups
+# 轉換函式：語意版 BandConfig → 特徵萃取器使用的 RuntimeBandGroups
 # ============================================================
 def resolve_runtime_band_groups(band_config: BandConfig) -> RuntimeBandGroups:
+    """
+    把語意版的 BandConfig 轉成特徵萃取器使用的 low / core / aux 三組頻帶。
+    - core = 洩漏頻帶 + 共振頻帶（共振頻帶和洩漏頻帶重疊時會被排除，並印出提示）
+    - aux  = offband（和 core 重疊時直接報錯：offband 必須是 core 以外的參照頻帶）
+    """
+    # 使用 BandConfig.final_main_bands，讓「core 怎麼合併」只定義在一個地方
+    core_bands = band_config.final_main_bands
+    
+    # 檢查有沒有共振頻帶因為和洩漏頻帶重疊而被排除
+    kept = {str(b["name"]) for b in core_bands}
+    dropped = [str(b["name"]) for b in band_config.resonance_bands if str(b["name"]) not in kept]
+    if dropped:
+        print(f"⚠️ 以下共振頻帶與洩漏頻帶重疊，未納入 core bands：{dropped}")
+        
+    # 檢查 offband 有沒有和 core 頻帶重疊（重疊時同一段頻率會被算兩次，offband 也失去參照意義）
+    def overlap(a, b):
+        return max(a["f_low"], b["f_low"]) < min(a["f_high"], b["f_high"])
+    
+    offband_overlaps = [
+        f"{off['name']} ↔ {core['name']}"
+        for off in band_config.offband_bands
+        for core in core_bands
+        if overlap(off, core)
+    ]
+    if offband_overlaps:
+        raise ValueError(f"offband 不可與 core 頻帶重疊：{offband_overlaps}")
+    
     return RuntimeBandGroups(
-        low_bands=[],     # low_bands固定給空清單(對應你所有腳本裡一直重複出現的「不再另外保留舊版 low band」這個設計決定)
-        core_bands=merge_band_groups(       # core_bands把leak_focused_bands跟resonance_bands合併起來
-            band_config.leak_focused_bands,
-            band_config.resonance_bands,
-        ),
+        low_bands=[],                           # 不再另外保留舊版 low band
+        core_bands=core_bands,
         aux_bands=band_config.offband_bands,    # aux_bands直接對應offband_bands,原封不動搬過去
     )
 
 
 # ============================================================
-# 讀 band 設定檔：config loaders
+# 內容重複檢查（比檔案內容，不比檔名；改過檔名的複本也抓得到）
 # ============================================================
-def load_band_config(
-        band_config_path,
-        *,
-        expected_status=None,
-    ):
-    payload = json.loads(Path(band_config_path).read_text(encoding="utf-8"))
+def check_baseline_duplicates(tdms_paths, other_dirs):
+    """
+    1. 正常資料內部：內容完全相同 → 只保留一支（避免同一段訊號被算兩次）
+    2. 正常資料 vs 其他資料夾（洩漏等）：內容相同 → 直接停止（label 矛盾，不能拿來建 baseline）
+    """
+    hashes = {}        # hashes：記住「指紋 → 第一支出現的正常檔」
+    kept = []          # kept：最後真正要拿去建 baseline 的正常檔
+    dup_within = []    # dup_within：正常資料夾內發現的重複副本，留給報告使用
     
-    # 檢查 payload 內容
-    if payload.get("schema_name") != "band_config":
-        raise ValueError("band config 的 schema_name 必須是 band_config")
-
-    if int(payload.get("schema_version", -1)) != 2:
-        raise ValueError("目前只支援 band_config schema_version=2")
-        
-    # 檢查 schema_status
-    schema_status = payload.get("schema_status")
-
-    if expected_status is not None:
-        if schema_status != expected_status:
-            raise ValueError(f"{band_config_path.name} 的 schema_status 必須是 {expected_status}，目前為 {schema_status}")
-
-    band_config = BandConfig(
-        leak_focused_bands=payload.get("leak_focused_bands", [],),
-        resonance_bands=payload.get("resonance_bands", [],),
-        offband_bands=payload.get("offband_bands", [],),
-        temporal_band_names=payload.get("temporal_band_names", [],),
-    )
-
-    if not band_config.leak_focused_bands:
-        raise ValueError("band config 缺少 leak_focused_bands")
-
-    return band_config    
-
-
-# ============================================================
-# 讀上游特徵設定檔.json：決定「怎麼把 TDMS 原始訊號切成一段一段、算出頻譜」的參數
-# ============================================================
-def load_feature_extraction_config(config_path):
-    # 讀檔＋解析 JSON
-    config_path = Path(config_path)
-    payload = json.loads(config_path.read_text(encoding="utf-8"))
-
-    # 檢查 schema 種類
-    if payload.get("schema_name") != "feature_extraction_config":
+    # 正常資料內去重
+    for p in tdms_paths:
+        h = calculate_file_sha256(p)
+        if h in hashes:
+            dup_within.append((p, hashes[h]))
+        else:
+            hashes[h] = p
+            kept.append(p)
+            
+    if dup_within:
+        print(f"⚠️ 正常資料內部重複 {len(dup_within)} 支，只保留一份，例如：{dup_within[:3]}")
+    # 掃描 leak1 等其他資料夾；若任何檔案內容和保留的正常檔相同，就記為衝突
+    conflicts = []
+    for d in other_dirs:
+      if not Path(d).is_dir():
+          raise FileNotFoundError(f"--check-against 資料夾不存在：{d}")
+          
+      for q in sorted(Path(d).rglob("*.tdms")):
+            if calculate_file_sha256(q) in hashes:
+                conflicts.append(str(q))
+    # 一旦發現「同一內容同時出現在正常與洩漏資料」，就停止 baseline 建立
+    if conflicts:
         raise ValueError(
-            "schema_name 必須是 feature_extraction_config"
+            f"正常資料與其他資料夾有 {len(conflicts)} 支內容完全相同（label 矛盾），"
+            f"請先移出再建 baseline，例如：{conflicts[:3]}"
         )
 
-    # 一次列出「必要欄位清單」，再用 list comprehension 抓出缺了哪些
-    required_keys = [
-        "schema_version",
-        "base_feature_version",
-        "fs",
-        "window_sec",
-        "hop_sec",
-        "nperseg",
-        "max_points",
-        "include_offband_summary",
-    ]
-
-    missing_keys = [key for key in required_keys if key not in payload]
-
-    if missing_keys:
-        raise ValueError(f"feature_extraction_config.json 缺少欄位：{missing_keys}")
-        
-    # 對「已經確定存在」的欄位，逐一檢查數值/型別是否合理
-    if int(payload["schema_version"]) != 1:
-        raise ValueError("目前只支援 feature_extraction_config schema_version=1")
-    # 檢查取樣率 fs
-    if float(payload["fs"]) <= 0:
-        raise ValueError("fs 必須大於 0")
-    # 檢查頻譜點數 nperseg
-    if int(payload["nperseg"]) <= 0:
-        raise ValueError("nperseg 必須大於 0")
-    # 檢查上限點數 max_points
-    if int(payload["max_points"]) <= 0:
-        raise ValueError("max_points 必須大於 0")
-    # 要不要計算 offband 摘要特徵,只要不是「真正的」JSON boolean（true/false），一律擋下來
-    if not isinstance(payload["include_offband_summary"],bool,):
-        raise ValueError("include_offband_summary 必須是 JSON boolean")
-    # 檢查窗長 window_sec
-    if float(payload["window_sec"]) <= 0:
-        raise ValueError("window_sec 必須大於 0")
-    # 檢查窗移 hop_sec
-    if float(payload["hop_sec"]) <= 0:
-        raise ValueError("hop_sec 必須大於 0")
-    # 檢查hop_sec（滑動視窗每次往前移動的秒數）不可以大於 window_sec（每個視窗的長度）
-    if float(payload["hop_sec"]) > float(payload["window_sec"]):
-        raise ValueError("hop_sec 不可大於 window_sec")
-
-    return payload
-
-
-# ============================================================
-# 計算設定檔 hash，避免 band/config 改版後誤讀舊快取
-# ============================================================
-def calculate_file_hash(path):
-    '''
-    計算檔案內容的 SHA-256。
-    頻帶或特徵設定內容改變時，會產生不同的設定指紋。
-    '''
-    # 路徑正規化
-    file_path = Path(path)
-    
-    # 檢查
-    if not file_path.exists():
-        raise FileNotFoundError(f"找不到要計算 hash 的檔案：{file_path}")
-    
-    # 建立一個 SHA-256 的雜湊器
-    digest = hashlib.sha256()
-    # 把整個檔案的「原始位元組」餵給雜湊器
-    digest.update(path.read_bytes())
-
-    return digest.hexdigest()
+    print(f"✅ 內容重複檢查通過：保留 {len(kept)} 支正常資料，"
+          f"與 {len(other_dirs)} 個資料夾沒有內容重複")
+    return kept
 
 
 # ============================================================
@@ -420,6 +367,14 @@ def build_file_specs(tdms_paths):     # tdms_paths：一個 TDMS 路徑清單
                 "record_id": path.stem,   # 檔名主體，不含副檔名
             }
         )
+
+    # 檢查 record_id（檔名主體）是否重複：後續會依 record_id 分組計算 CUSUM、rolling 等跨視窗特徵，重複時兩個檔案會被串成同一條時間序列
+    counts = Counter(s["record_id"] for s in file_specs)
+    duplicated = sorted(r for r, n in counts.items() if n > 1)
+    
+    if duplicated:
+        raise ValueError(f"有 TDMS 檔名重複（record_id 會衝突）：{duplicated[:10]}")
+
     return file_specs
 
 
@@ -427,25 +382,24 @@ def build_file_specs(tdms_paths):     # tdms_paths：一個 TDMS 路徑清單
 # 最底層負責把 TDMS 變成原始 window 特徵表
 # ============================================================
 def extract_base_feature_table(
-    *,                         # 全關鍵字參數（*, 開頭），而且全部都沒有預設值——代表這十個參數呼叫端一個都不能漏
+    *,                         # 全部都是關鍵字參數，而且沒有預設值：呼叫端一個都不能漏
     file_specs,                # 整理好的 TDMS 清單
     cache_dir: Path,           # 快取資料夾
-    split_name: str,           # 這批資料名稱
-    band_config: BandConfig,   # low/core/aux bands 設定
+    split_name: str,           # 這批資料名稱（會成為快取檔名的一部分）
+    band_config: BandConfig,   # 語意版頻帶設定（洩漏 / 共振 / offband）
     n_jobs: int,               # 平行處理數
     window_sec: float,         # 窗長
     hop_sec: float,            # hop 長
     fs: float,                 # 取樣率
     nperseg: int,              # Welch / PSD 相關設定
     max_points: int,           # 最大讀取點數
-    feature_version: str,
+    feature_version: str,      # 特徵公式版本（會成為快取指紋的一部分）
 ):
-    
-    '''從 file_specs 抽出原始 window 特徵表。'''
-    # 把語意版的 BandConfig（leak_focused_bands/resonance_bands/offband_bands）轉成 load_or_compute_features_by_file 實際看得懂的機械版格式（low_bands/core_bands/aux_bands）
+    """從 file_specs 抽出原始 window 特徵表，並排除訊號異常的視窗。"""
+    # 把語意版的 BandConfig 轉成特徵萃取器使用的 low / core / aux 三組頻帶
     band_groups = resolve_runtime_band_groups(band_config)
     
-    # 讀每個 TDMS -> 切成很多 window -> 依照 band_config 的頻帶去算各種基礎特徵 -> 把結果整理成一個 features 清單
+    # 讀每個 TDMS → 切成很多 window → 依頻帶算各種基礎特徵（有快取就直接讀）
     features = load_or_compute_features_by_file(
         cache_dir=cache_dir,
         file_specs=file_specs,             # 每一筆 TDMS 讀進來
@@ -465,93 +419,83 @@ def extract_base_feature_table(
     
     # 轉成 DataFrame
     df = pd.DataFrame(features).reset_index(drop=True)
-    
-    # 處理大量 TDMS 時盡快釋放記憶體
-    del features
+    del features            # 處理大量 TDMS 時盡快釋放記憶體
     gc.collect()
+    
+    # 硬性 QC：排除訊號異常的視窗（門檻與特徵工程的 check_signal_quality() 一致）
+    # 全零訊號的 RMS 為 0，含 NaN 的訊號 RMS 為 NaN，都會在這裡被排除
+    rms_min = SIGNAL_RMS_MIN
+    bad = pd.Series(False, index=df.index)
+    for ch in ("ai0", "ai1"):
+        rms = pd.to_numeric(df[f"{ch}_rms"], errors="coerce")
+        bad |= ~np.isfinite(rms) | (rms < rms_min)
+        
+    if bad.any():
+        bad_files = sorted(df.loc[bad, "record_id"].unique())
+        print(f"⚠️ 訊號 QC：排除 {int(bad.sum())} 個視窗（來自 {len(bad_files)} 個檔案），"
+              f"例如 {bad_files[:5]}")
+        df = df[~bad].reset_index(drop=True)
+        
+    # 檢查
+    if df.empty:
+        raise ValueError("訊號 QC 後沒有任何可用的視窗，請檢查正常資料是否正確")
+
     return df
-
-
-# ============================================================
-# 決定「哪些欄位值得拿來建 baseline」
-# ============================================================
-def select_raw_feature_columns(df: pd.DataFrame):     # df：你前面從正常 TDMS 抽出來的特徵表
-    # 先定義不該算進去的欄位
-    exclude_cols = {
-        "filename",    # 檔名
-        "record_id",   # 資料編號
-        "t_start",     # 窗起始時間
-        "t_ref",       # 窗代表時間
-        "t_end",       # 結束時間
-        "label",
-        "target",
-        "window_idx",
-        "source_index",
-        "fs",
-    }
-
-    # 建立空清單, 等等把篩出來的 raw feature 名稱放進去
-    raw_cols = []
-    # 開始逐欄檢查
-    for c in df.columns:
-        # 如果是排除欄位(filename, record_id, t_start, t_ref)，就跳過
-        if c in exclude_cols:
-            continue
-        # 如果不是數值欄位，也跳過
-        if not pd.api.types.is_numeric_dtype(df[c]):
-            continue
-        # 如果是 rel_、z_、cusum_ 類欄位，也跳過 -> 排除已經是「衍生後」的欄位
-        # 建立場域 baseline 時，應該先針對最底層 raw feature 建 baseline
-        if c.startswith("rel_") or c.startswith("z_") or c.startswith("cusum_"):
-            continue
-        # 如果是 delta_、local_、rolling_ 類欄位，也跳過
-        if c.startswith("delta_") or c.startswith("local_") or c.startswith("rolling_"):
-            continue
-        # 真正的原始特徵欄位, 加進 raw_cols
-        raw_cols.append(c)
-
-    return raw_cols
 
 
 # ============================================================
 # 對所有候選原始特徵建立正常 baseline 統計
 # ============================================================
 def build_site_baseline_stats(df_features: pd.DataFrame,               # 正常資料的特徵表
-                              raw_feature_cols: list[str]              # 剛剛 select_raw_feature_columns() 篩出來的 raw feature 名單
-                              ) -> tuple[dict, list[dict]]:
-    '''對每個 raw feature 算出 baseline 的 mean / std'''
-    # 建立空 dictionary, 存放每個特徵的 baseline 統計量
-    stats = {}
-    invalid_features = []
+                              raw_feature_cols: list[str],             # raw 特徵（select_all_raw_feature_columns()）+ 群組摘要欄位
+                              heavy_tail_ratio: float = 3.0,
+                        ) -> tuple[dict, list[dict], list[dict]]:
+    """
+    這個函式負責 baseline 最核心的工作：對每一個特徵，算出「正常狀態下長什麼樣子」。
+    
+    對每個 raw feature 算出 baseline 的 mean / std（後續 z-score 使用）。
+    另外記錄穩健統計量（中位數、MAD 換算的標準差、1% / 99% 分位數）供診斷，
+    並標出 std 明顯大於穩健標準差的「長尾特徵」——代表 std 可能被少數極端視窗撐大。
+    注意：視窗之間有 75% 重疊，n_valid 會高估實際獨立樣本數。
+    """
+    # 建立三個清單
+    stats = {}                # 成功建立 baseline 的特徵 → 它的統計量
+    invalid_features = []     # 無法建立 baseline 的特徵，以及原因
+    heavy_tailed = []         # 診斷用：分布形狀需要注意的特徵
 
     # 逐欄計算 baseline 統計量
     for col in raw_feature_cols:
         # 先把欄位轉成數值並去掉空值
         x = pd.to_numeric(df_features[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
         
-        # 如果這欄完全沒資料
+        # 檢查１：如果這個特徵所有視窗都是 NaN
         if x.empty:
-            invalid_features.append({
-                "feature_name": col,
-                "reason": "沒有有效數值",
-                "n_valid": 0,
-            })
+            invalid_features.append({"feature_name": col,"reason": "沒有有效數值","n_valid": 0})
             continue
-
-        mean_val = float(x.mean())       # 算平均值
-        std_val = float(x.std(ddof=1))   # 算標準差
-
-        # 如果標準差不合理
-        if not np.isfinite(mean_val):
-            invalid_features.append({
-                "feature_name": col,
-                "reason": "mean 不是有限數值",
-                "n_valid": int(len(x)),
-            })
-            continue
-
-        std_floor = max(abs(mean_val) * 1e-12,np.finfo(np.float64).tiny,)
         
+        # 有效值比例不足：大部分視窗都是 NaN 時，這個特徵的統計量不可靠
+        valid_ratio = len(x) / len(df_features)
+        if valid_ratio < 0.95:
+            invalid_features.append({
+                "feature_name": col,
+                "reason": "有效數值比例不足",
+                "n_valid": int(len(x)),
+                "valid_ratio": round(valid_ratio, 4),
+            })
+            continue
+
+        # 計算平均值跟標準差
+        mean_val = float(x.mean())       
+        std_val = float(x.std(ddof=1))   
+
+        # 檢查2：平均值不是有限數值（例如極端值導致溢位）
+        if not np.isfinite(mean_val):
+            invalid_features.append({"feature_name": col, "reason": "mean 不是有限數值", "n_valid": int(len(x)),})
+            continue
+
+        std_floor = max(abs(mean_val) * 1e-12, np.finfo(np.float64).tiny,)
+        
+        # 檢查3：std 太小或無效，所有視窗的值幾乎一樣
         if (not np.isfinite(std_val) or std_val <= std_floor):
             invalid_features.append({
                 "feature_name": col,
@@ -562,16 +506,44 @@ def build_site_baseline_stats(df_features: pd.DataFrame,               # 正常�
                 "std_floor": std_floor,
             })
             continue
+        
+        # 穩健統計量（只供診斷，不影響後續 z-score），用中位數計算不受極端值影響
+        median_val = float(x.median())
+        robust_std = float(1.4826 * (x - median_val).abs().median())   # MAD 換算成和 std 同尺度
 
-
-        # 把這個特徵的 baseline 統計量存進字典
+        # 算正式的統計量：把這個特徵的 baseline 統計量存進字典
         stats[col] = {
-            "mean": mean_val,
-            "std": std_val,
-            "n_valid": int(len(x)),
+            "mean": mean_val,                      # 後續 z-score 使用
+            "std": std_val,                        # 後續 z-score 使用
+            "n_valid": int(len(x)),                # 用了幾個視窗
+            "median": median_val,                  # 以下僅供診斷
+            "robust_std": robust_std,
+            "p01": float(x.quantile(0.01)),
+            "p99": float(x.quantile(0.99)),
         }
-
-    return stats, invalid_features
+        
+        # 找出需要注意的特徵
+        # std 是穩健標準差的 3 倍以上 → 很可能被少數極端視窗撐大
+        if robust_std > 0 and std_val / robust_std > heavy_tail_ratio:
+            heavy_tailed.append({
+                "feature_name": col,
+                "std_to_robust_std": round(std_val / robust_std, 2),
+            })
+            
+        # 穩健標準差為 0：超過一半的視窗數值相同（常見於計數型特徵），std 完全由少數不同的視窗決定，z-score 分布會很不連續
+        elif robust_std == 0:
+            heavy_tailed.append({
+                "feature_name": col,
+                "std_to_robust_std": None,
+                "note": "超過一半的視窗數值相同",
+            })
+            
+    # 排序並回傳:把需要注意的特徵依比值由大到小排序（None 排最前面），然後回傳三樣東西：正式統計量、無效特徵清單、診斷清單。
+    heavy_tailed.sort(
+        key=lambda d: float("inf") if d["std_to_robust_std"] is None else d["std_to_robust_std"],
+        reverse=True,
+    )
+    return stats, invalid_features, heavy_tailed
 
 
 # ============================================================
@@ -579,37 +551,55 @@ def build_site_baseline_stats(df_features: pd.DataFrame,               # 正常�
 # ============================================================
 def save_site_baseline(
     *,
-    output_path,               # 最後 baseline 檔要存去哪裡
-    baseline_stats,            # 每個 raw feature 算好的 mean / std
-    tdms_paths,                # 這次拿來建 baseline 的正常 TDMS 清單
-    band_config_path,          # 這次用的是哪份 band 設定
-    feature_extraction_config_path,
-    invalid_features,
+    output_path,                       # 最後 baseline 檔要存去哪裡
+    baseline_stats,                    # 每個特徵的 mean / std（及診斷用的穩健統計量）
+    tdms_paths,                        # 這次拿來建 baseline 的正常 TDMS 清單
+    band_config_path,                  # 這次用的是哪份 band 設定
+    feature_extraction_config_path,    # 這次用的特徵萃取設定
+    invalid_features,                  # 無法建立 baseline 的特徵與原因
     band_config_hash,
     feature_extraction_config_hash,
     config_fingerprint,
-    raw_feature_cols,
-    n_windows,
-    window_sec,                # 這次建立 baseline 用的參數
+    raw_feature_cols,                  # 候選欄位（raw + 群組摘要）
+    n_windows,                         # QC 後實際使用的視窗數
+    window_sec,                        # 這次建立 baseline 用的參數
     hop_sec,
     fs,
     nperseg,
     max_points,
-    baseline_environment,      # 目前是實驗室資料
-    baseline_schema_status,
+    baseline_environment,              # 目前是實驗室資料 laboratory / site
+    baseline_schema_status,            # candidate / final
     baseline_scope,
     base_feature_version,
+    heavy_tailed_features              # 診斷用：分布需要注意的特徵
 ):
+    """
+    把 baseline 統計量與建立時的所有設定寫成 JSON。
+    - 先寫暫存檔再替換，避免寫到一半中斷時弄壞原本的 baseline
+    - NaN / Inf 轉成 null，確保輸出是標準 JSON
+    """
+    # 把所有非有限的數值轉成 null
+    def to_json_safe(obj):
+        """把 NaN / Inf 轉成 None（JSON 的 null），讓檔案符合標準 JSON。"""
+        if isinstance(obj, float):
+            return obj if np.isfinite(obj) else None
+        if isinstance(obj, dict):
+            return {k: to_json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [to_json_safe(v) for v in obj]
+        return obj
+    
     # 建立 payload：把所有 metadata（來源檔案、用的 config 路徑、訊號參數）連同算好的 baseline_stats 一起包成一個 payload 寫成 JSON
     payload = {
         "schema_name": "site_baseline",
+        "schema_version": 1,
         "schema_status": baseline_schema_status,
         "environment": baseline_environment,
         "created_at": datetime.now().astimezone().isoformat(),
         "baseline_type": "fixed_normal_baseline",                   # 標記這份檔案的用途:場域正常 baseline
         "baseline_scope": baseline_scope,
         
-        # 上游特徵契約
+        # 上游特徵契約：後續流程會比對這些指紋，不一致就拒絕使用這份 baseline
         "base_feature_version": base_feature_version,              # baseline 版本
         "band_config_path": str(Path(band_config_path)),
         "band_config_sha256":band_config_hash,
@@ -617,7 +607,7 @@ def save_site_baseline(
         "feature_extraction_config_sha256": (feature_extraction_config_hash),
         "config_fingerprint":config_fingerprint,
         
-        # 正常資料來源
+        # 正常資料來源（資料隔離檢查會用到）
         "source_tdms_count": len(tdms_paths),
         "source_tdms_paths": [str(Path(p)) for p in tdms_paths],
         
@@ -627,13 +617,15 @@ def save_site_baseline(
         "fs": fs,
         "nperseg": nperseg,
         "max_points": max_points,
-        "feature_stats": baseline_stats,                            # 每個 raw feature 的：mean, std
         "n_windows": int(n_windows),
                 
-        # baseline 特徵結果
-        "candidate_raw_feature_columns":list(raw_feature_cols),     # 原始候選範圍
+        # baseline 統計特徵結果
+        "feature_stats": baseline_stats,                            # 每個 raw feature 的：mean, std
+        "candidate_raw_feature_columns":list(raw_feature_cols),     # 候選欄位：raw 特徵 + 群組摘要（名稱保留以相容其他程式）
         "baseline_feature_columns":sorted(baseline_stats.keys()),   # 真正具有有效 baseline 統計的欄位              
         "invalid_features": invalid_features,
+        # 診斷用：std 可能被極端視窗撐大的特徵
+        "heavy_tailed_features": heavy_tailed_features,    
         
         }
     
@@ -641,86 +633,203 @@ def save_site_baseline(
     output_path = Path(output_path)
     # 建立輸出資料夾
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    # 把 JSON 寫出去
-    output_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
+    
+    # 先寫到暫存檔，完成後再整個替換，避免寫到一半中斷時把原本的 baseline 弄壞
+    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    tmp_path.write_text(
+        json.dumps(to_json_safe(payload), ensure_ascii=False, indent=2, allow_nan=False),
         encoding="utf-8",
     )
-    print(
-        f"{baseline_scope} baseline 已輸出："
-        f"{output_path}"
+    tmp_path.replace(output_path)
+
+    print(f"{baseline_scope} baseline 已輸出：{output_path}")
+    print(f"  有效特徵 {len(baseline_stats)} 個、無效 {len(invalid_features)} 個、"
+          f"診斷提示 {len(heavy_tailed_features)} 個、視窗 {int(n_windows)} 個")
+
+
+# ============================================================
+# 讀取命令列參數
+# ============================================================
+def parse_args() -> argparse.Namespace:
+    """讀取命令列參數。參數依用途分組，執行 --help 時會分區顯示。"""
+    # 建立命令列解析器
+    parser = argparse.ArgumentParser(description="建立固定正常 baseline（discovery / final）")
+
+    # ---------- 模式 ----------
+    # 選擇頻帶模式，只允許兩種模式:discovery, final
+    mode = parser.add_argument_group("模式")
+    mode.add_argument(
+        "--mode", choices=["discovery", "final"], default="final",
+        help="discovery：完整掃描候選頻帶，供 Step2a；final：使用定案的 band_config_step2.json",
     )
+
+    # ---------- 正常資料 ----------
+    data = parser.add_argument_group("正常資料")
+    data.add_argument(
+        "--normal-dir", type=Path,
+        default=Path("/Users/paul/Desktop/Final/normal_leak_test/leak0"),
+        help="建立 baseline 用的正常 TDMS 資料夾",
+    )
+    
+    # 限制讀取多少支 TDMS 檔
+    data.add_argument(
+        "--tdms-limit", type=int, default=None,
+        help="只用前 N 支 TDMS（測試流程用）；不指定則使用全部",
+    )
+    
+    # 正常資料不可與這些資料夾的檔案內容重複
+    data.add_argument(
+        "--check-against", type=Path, nargs="*",
+        default=[Path("/Users/paul/Desktop/Final/normal_leak_test/leak1")],
+        help="檢查正常資料不可與這些資料夾的檔案內容重複（例如洩漏資料）",
+    )
+        
+    # 標記正常資料來自哪裡：實驗室或現場
+    data.add_argument(
+        "--environment", choices=["laboratory", "site"], default="laboratory",
+        help="資料來源：實驗室或現場",
+    )
+    
+    # 表示這份 Baseline 的狀態
+    # Candidat 候選版本：- 實驗室資料 - 流程測試 - 尚未正式部署
+    # final 正式現場版本。
+    data.add_argument(
+        "--schema-status", choices=["candidate", "final"], default="candidate",
+        help="baseline 狀態；final 只能用於現場資料、且使用全部檔案",
+    )
+
+    # ---------- 路徑與執行 ----------
+    paths = parser.add_argument_group("路徑與執行")     # 指定程式從哪裡讀取設定檔，以及把結果存到哪裡
+    paths.add_argument(
+        "--result-root", type=Path, default=Path("/Users/paul/Desktop/Final/test_result"),
+        help="設定檔與 baseline 輸出的根目錄",
+    )
+    paths.add_argument(
+        "--cache-dir", type=Path, default=Path("/Users/paul/Desktop/runtime_outputs/site_baseline_cache"),
+        help="特徵快取資料夾",
+    )
+    paths.add_argument(
+        "--n-jobs", type=int, default=6,
+        help="平行處理數",
+    )
+    # 解析所有輸入參數
+    args = parser.parse_args()
+    
+    # 防呆：discovery 不能標成 final
+    if args.mode == "discovery" and args.schema_status == "final":
+        parser.error("discovery 模式不可使用 --schema-status final（探索用的 baseline 不是正式版）")
+    
+    # 防呆：final 狀態的 baseline 必須是現場資料，而且用全部檔案
+    if args.schema_status == "final":
+        if args.environment != "site":
+            parser.error("--schema-status final 只能搭配 --environment site")
+        # Final Baseline 不可只用部分檔案
+        if args.tdms_limit is not None:
+            parser.error("--schema-status final 不能搭配 --tdms-limit（必須使用全部檔案）")
+    # tdms-limit 必須是正整數
+    if args.tdms_limit is not None and args.tdms_limit <= 0:
+        parser.error("--tdms-limit 必須大於 0")
+
+    return args
+
+
 
 # ============================================================
 # baseline 建立程式的主流程入口
 # ============================================================
 def main():
-    # 設定資料來源(實驗室)
-    baseline_environment = "laboratory"
-    baseline_schema_status = "candidate"
-    
-    # 設定資料來源(現場)
-    #baseline_environment = "site"
-    #baseline_schema_status = "final"
-    
-    # --  正常資料路徑，並讀取  --
-    # None：正式執行全部資料, 正式建立現場 Baseline 時要改成：BASELINE_TDMS_LIMIT = None
-    # 30：只用前 30 支測試流程
-    BASELINE_TDMS_LIMIT = None
-    normal_data_dir = Path("/Users/paul/Desktop/Final/normal_leak_test/leak0")
-    tdms_paths = sorted(str(p) for p in normal_data_dir.glob("*.tdms"))
-    
-    if BASELINE_TDMS_LIMIT is not None:
-        tdms_paths = tdms_paths[:BASELINE_TDMS_LIMIT]
-    
-    if not tdms_paths:
-        raise ValueError(f"在 {normal_data_dir} 找不到任何 .tdms 檔案")
-    
+    '''
+    ① 設定資料來源（實驗室 / 現場）、找出正常 TDMS
+    ② 依模式決定頻帶設定檔與輸出位置（discovery / final）
+    ③ 讀取特徵萃取設定（窗長、取樣率、nperseg 等）
+    ④ 讀取並驗證頻帶設定
+    ⑤ 準備檔案清單、同步 temporal 頻帶、計算設定指紋
+    ⑥ 算特徵（含訊號 QC）
+    ⑦ 挑出要建 baseline 的欄位（raw ＋ 群組摘要）
+    ⑧ 算 mean / std 與診斷統計
+    ⑨ 存成 JSON
+    '''
     # ============================================================
-    # 依 baseline 模式決定頻帶來源與輸出位置
+    # 讀取執行參數
     # ============================================================
-    # 設定 result_root，這次執行所有輸出/輸入檔案的根目錄
-    result_root = Path("/Users/paul/Desktop/Final/test_result")
-    # 特徵上游設定檔路徑
-    feature_extraction_config_path = (result_root / "feature_extraction_config.json")
+    args = parse_args()
+    # 把常用參數取出來
+    baseline_mode = args.mode
+    baseline_environment = args.environment
+    baseline_schema_status = args.schema_status
+
+    # -- 正常 TDMS 資料 --
+    tdms_paths = sorted(str(p) for p in args.normal_dir.glob("*.tdms"))
+    if not tdms_paths:     # 沒有 TDMS 就停止
+        raise ValueError(f"在 {args.normal_dir} 找不到任何 .tdms 檔案")
+    if args.tdms_limit is not None:     # 測試模式只使用前 N 支
+        tdms_paths = tdms_paths[:args.tdms_limit]
+        print(f"⚠️ 測試模式：只使用前 {len(tdms_paths)} 支 TDMS")
+        
+    # 內容重複檢查：內部重複只留一份；跟洩漏資料重複就停止
+    tdms_paths = check_baseline_duplicates(tdms_paths, other_dirs=args.check_against)
     
-    # 分支 1：對象是 baseline 建立流程,
-    if BASELINE_MODE == "discovery":
-        # 產生候選頻帶
+    # 最低資料量:正式 Baseline 至少要有 10 支 TDMS
+    MIN_FINAL_FILES = 10
+    if baseline_schema_status == "final" and len(tdms_paths) < MIN_FINAL_FILES:
+        raise ValueError(f"正式 baseline 至少需要 {MIN_FINAL_FILES} 支 TDMS，目前只有 {len(tdms_paths)} 支")
+
+    # ============================================================
+    # 設定結果根目錄
+    # ============================================================
+    # -- 依模式決定頻帶來源與輸出位置 --
+    result_root = args.result_root
+    # 組成特徵設定檔路徑
+    feature_extraction_config_path = result_root / "feature_extraction_config.json"
+
+    # ============================================================
+    # 自動建立完整掃描頻帶
+    # ============================================================
+    # Discovery 模式
+    if baseline_mode == "discovery":
         discovery_bands = generate_sliding_bands(
             f_min=DISCOVERY_F_MIN,
             f_max=DISCOVERY_F_MAX,
             band_width=DISCOVERY_BAND_WIDTH,
             stride=DISCOVERY_STRIDE,
         )
-        # 組出 band_config.json 路徑
-        band_config_path = (result_root / "band_config_step2_discovery.json")
-        # 輸出路徑
-        save_discovery_band_config(output_path=band_config_path, discovery_bands=discovery_bands,)
-        output_path = (result_root / "discovery_baseline.json")
-    
+        # 設定 discovery 頻帶檔，並儲存
+        band_config_path = result_root / "band_config_step2_discovery.json"
+        save_discovery_band_config(output_path=band_config_path, discovery_bands=discovery_bands)
+        output_path = result_root / "discovery_baseline.json"
         baseline_scope = "discovery_scan_grid"
-    
-    # 分支 2：不產生新的滑動頻帶,而是直接指向已經存在的正式版 band config（band_config_step2.json
-    elif BASELINE_MODE == "final":
-        # band_config.json 路徑
-        band_config_path = (result_root / "band_config_step2.json")
-        # 輸出路徑
-        output_path = (result_root / "site_baseline.json")    
-        baseline_scope = "finalized_band_config"
-        if not band_config_path.exists():
-            raise FileNotFoundError(f"BASELINE_MODE=final，但找不到正式設定：{band_config_path}")
-    
     else:
-        raise ValueError(f"BASELINE_MODE 只能是 discovery 或 final，目前為：{BASELINE_MODE}")
+        # Final 頻帶模式
+        band_config_path = result_root / "band_config_step2.json"
+        output_path = result_root / "site_baseline.json"
+        baseline_scope = "finalized_band_config"
+        # 正式頻帶檔不存在就停止
+        if not band_config_path.exists():
+            raise FileNotFoundError(f"mode=final，但找不到正式設定：{band_config_path}")
     
+    # ============================================================
+    # 測試模式改用 _test.json
+    # ============================================================
+    # 測試模式輸出到另一個檔名，避免覆蓋正式的 baseline
+    if args.tdms_limit is not None:
+        output_path = output_path.with_name(f"{output_path.stem}_test{output_path.suffix}")
+    
+    # 保護正式版：既有的 site_baseline.json 若是 final，不允許被非 final 的 baseline 覆蓋
+    if baseline_mode == "final" and output_path.exists() and baseline_schema_status != "final":
+        existing_status = json.loads(output_path.read_text(encoding="utf-8")).get("schema_status")
+        if existing_status == "final":
+            output_path = output_path.with_name(f"{output_path.stem}_candidate{output_path.suffix}")
+            print(f"⚠️ 既有的 baseline 是正式版（final），本次 candidate 改輸出到：{output_path.name}")
+    # 顯示本次執行資訊
     print("\n=== Baseline 建立模式 ===")
-    print("mode:", BASELINE_MODE)
+    print("mode:", baseline_mode)
     print("scope:", baseline_scope)
     print("band config:", band_config_path)
     print("output:", output_path)
 
-    # --  載入設定檔  --
+    # ============================================================
+    # 載入特徵設定檔
+    # ============================================================
     extraction_cfg = load_feature_extraction_config(feature_extraction_config_path)
 
     # 定義訊號處理參數（從 feature_extraction_config.json 讀取）
@@ -731,32 +840,16 @@ def main():
     max_points = int(extraction_cfg["max_points"])            # 最多讀多少點
     include_offband_summary = bool(extraction_cfg["include_offband_summary"])    # 是否建立 offband、leak-focused、resonance 群組摘要
     base_feature_version = str(extraction_cfg["base_feature_version"])           # 基礎特徵計算公式版本，用於快取與設定指紋
-    n_jobs = 2               # 平行處理數
+    n_jobs = args.n_jobs               # 平行處理數
       
     # ============================================================
     # 載入並驗證本次模式對應的 band config
     # ============================================================
     # Discovery 模式只能讀取尚未篩選的探索頻帶設定；
     # Final 模式只能讀取已經人工加入 Offband 並定案的正式設定。
-    expected_band_status = ("discovery" if BASELINE_MODE == "discovery" else "final")
-    band_config = load_band_config(band_config_path, expected_status=expected_band_status,)
-    
-    # ============================================================
-    # Final 模式強制要求正式 Offband
-    # ============================================================
-    # 正式流程會使用 Offband 建立：
-    # 1. Offband 原始特徵
-    # 2. Offband 群組摘要
-    # 3. Offband-to-leak ratio
-    # 4. Disturbance Veto 抗干擾規則
-    #
-    # 因此 BASELINE_MODE="final" 時，band_config_step2.json 不允許缺少 Offband。
-    # Discovery 模式尚未進行人工 Offband 定案，所以不執行這項檢查。
-    if ( BASELINE_MODE == "final" and not band_config.offband_bands):
-        raise ValueError(
-            "BASELINE_MODE=final，但 band_config_step2.json 沒有 offband_bands；"
-            "請先在候選 band config 中加入正式 Offband，並將結果定案為 band_config_step2.json。"
-        )
+    expected_band_status = ("discovery" if baseline_mode == "discovery" else "final")
+    # 載入並驗證頻帶
+    band_config = load_band_config(band_config_path, expected_status=expected_band_status,require_offband=(baseline_mode == "final"))
     
     # 顯示本次實際載入的頻帶數量，方便核對設定
     print("\n=== Band config 驗證完成 ===")
@@ -766,28 +859,34 @@ def main():
     print("offband bands:", len(band_config.offband_bands),)
     print("temporal bands:", len(band_config.temporal_band_names),)
     
+    # ============================================================
+    # 準備資料與快取
+    # ============================================================
     # 整理正常 TDMS 檔案清單
     file_specs = build_file_specs(tdms_paths)
     
-    # 把 band config 的 temporal band 名稱同步到
-    # shared_feature_utils 的基礎 window 特徵提取器。
+    # 把 band config 的 temporal band 名稱同步到 shared_feature_utils 的基礎 window 特徵提取器。
     configure_temporal_band_names(band_config.temporal_band_names)
     
-    # --  快取名稱綁定設定檔版本  --
-    band_config_hash = calculate_file_hash(band_config_path)
-    feature_extraction_config_hash = calculate_file_hash(feature_extraction_config_path)
+    # 快取名稱綁定設定檔版本
+    band_config_hash = calculate_file_sha256(band_config_path)
+    feature_extraction_config_hash = calculate_file_sha256(feature_extraction_config_path)
     
+    # 組合本次設定指紋
     fingerprint_source = (
-        f"{BASELINE_MODE} : {baseline_scope} : {band_config_hash} : {feature_extraction_config_hash} : {base_feature_version}")
+        f"{baseline_mode} : {baseline_scope} : {band_config_hash} : {feature_extraction_config_hash} : {base_feature_version}")
     
+    # 再次計算 SHA-256, 把文字轉成雜湊函式可處理的 bytes, 轉成十六進位文字
     config_fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:12]
-    cache_split_name = (f"{BASELINE_MODE}_baseline_build_{config_fingerprint}")
+    cache_split_name = (f"{baseline_mode}_baseline_build_{config_fingerprint}")
 
-    # --  特徵工程  --
+    # ============================================================
+    # 特徵工程:把 TDMS 轉成特徵表
+    # ============================================================
     # 抽出最原始 base features:讀正常 TDMS -> 切窗 -> 依照 band config 算出原始 band 特徵表
     df_features = extract_base_feature_table(
         file_specs=file_specs,
-        cache_dir=Path("/Users/paul/Desktop/runtime_outputs/site_baseline_cache"),
+        cache_dir=args.cache_dir,
         split_name=cache_split_name,
         band_config=band_config,
         n_jobs=n_jobs,
@@ -799,16 +898,28 @@ def main():
         feature_version=base_feature_version,
     )
     
+    # 最低視窗數:正式 Baseline 至少 100 個有效視窗
+    MIN_FINAL_WINDOWS = 100
+    if baseline_schema_status == "final" and len(df_features) < MIN_FINAL_WINDOWS:
+        raise ValueError(
+            f"正式 baseline 至少需要 {MIN_FINAL_WINDOWS} 個有效視窗，目前只有 {len(df_features)} 個"
+        )
+        
+    # ============================================================
+    # 挑出要建 baseline 的欄位
+    # ============================================================
     # 先抓原始 raw base features（這時還沒加 summary）
-    raw_feature_cols = select_raw_feature_columns(df_features)
+    raw_feature_cols = select_all_raw_feature_columns(df_features)
+    print(f"baseline raw 特徵欄位：{len(raw_feature_cols)} 個")
     
     # 再建立 offband / leak_focus / resonance 的 summary base features
-    build_summary_features = (include_offband_summary and BASELINE_MODE == "final")
+    build_summary_features = (include_offband_summary and baseline_mode == "final")
     
+    # 建立頻帶群組摘要
     if build_summary_features:
         df_features = build_offband_summary_features(df_features, band_config,)
         
-    # 加上 6 個摘要欄位（offband/leak_focus/resonance 各自的 mean/max），用 if c in df_features.columns 防呆（避免某個 summary 欄位因為 band_config 沒設某類 band 而沒被算出來，篩選時漏掉會直接 KeyError）
+    # 收集實際存在的摘要欄位
     summary_base_cols = [
         c for c in [
             "offband_E_mean",
@@ -824,13 +935,28 @@ def main():
     # baseline 真正要存的欄位 = 原始 raw features + summary base features
     baseline_feature_cols = sorted(set(raw_feature_cols + summary_base_cols))
     
+    # ============================================================
     # 計算 baseline 統計量
-    baseline_stats, invalid_features = build_site_baseline_stats(df_features, baseline_feature_cols)
+    # ============================================================
+    baseline_stats, invalid_features, heavy_tailed = build_site_baseline_stats(df_features, baseline_feature_cols)
 
     print("baseline 候選特徵數：",len(baseline_feature_cols))
     print("baseline 有效特徵數：",len(baseline_stats))
     print("baseline 無效特徵數：",len(invalid_features))
-
+    
+    # 顯示長尾診斷
+    if heavy_tailed:
+        # 多數視窗值完全相同的特徵。
+        sparse = [d for d in heavy_tailed if d["std_to_robust_std"] is None]
+        
+        # 一般標準差比穩健標準差大很多的長尾特徵
+        long_tail = [d for d in heavy_tailed if d["std_to_robust_std"] is not None]
+        print(f"\n⚠️ 診斷：長尾特徵 {len(long_tail)} 個（std 超過穩健標準差 3 倍）、"
+              f"多數值相同的特徵 {len(sparse)} 個")
+        for item in long_tail[:10]:
+            print(f"  - {item['feature_name']}：std / robust_std = {item['std_to_robust_std']}")
+    
+    # 顯示無效特徵原因
     if invalid_features:
         print("\nbaseline 無效特徵：")
         for item in invalid_features:
@@ -840,8 +966,10 @@ def main():
                 ":",
                 item["reason"],
             )
-
-    # --  存檔  --
+            
+    # ============================================================
+    # 存檔 Baseline
+    # ============================================================
     # 最後把所有東西打包存檔，存成 site_baseline.json
     save_site_baseline(
         output_path=output_path,
@@ -864,10 +992,24 @@ def main():
         baseline_schema_status=baseline_schema_status,
         baseline_scope=baseline_scope,
         base_feature_version=base_feature_version,
+        heavy_tailed_features=heavy_tailed
     )
     
+    # 測試模式不建立歷史備份
+    # 每次建立正式流程用的 baseline，都另存一份帶時間戳記的歷史版本（測試模式不存）
+    if args.tdms_limit is None:
+        history_dir = output_path.parent / "baseline_history"
+        history_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archived = history_dir / f"{output_path.stem}_{baseline_schema_status}_{stamp}{output_path.suffix}"
+        shutil.copy2(output_path, archived)
+        print(f"  歷史版本：{archived}")
+        
 
 
 if __name__ == "__main__":
     main()
     
+    
+    
+        
