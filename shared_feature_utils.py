@@ -61,6 +61,32 @@ TEMPORAL_BAND_NAMES = set()
 
 
 # ======================================
+# 頻帶搜尋網格：baseline 的 discovery 模式、Step2a、共振程式共用
+# ======================================
+GRID_F_MIN = 5_000
+GRID_F_MAX = 500_000
+GRID_WIDTH = 10_000
+GRID_STRIDE = 5_000
+
+
+# ======================================
+# Offband：抗干擾規則用的參照頻帶（人工決定，全流程只在這裡定義一次）
+# 目前是暫定值：換新資料跑完 Step2a 後，依兩個條件檢查，不通過就修改這裡再重跑 Step2a
+#   1. 洩漏不敏感：在 feature_importance_first_pass.csv 排名尾段（|d| < 0.2）
+#   2. 干擾敏感：共振程式頻譜的 tap_vs_bg_dB 明顯為正
+# 用途：
+#   - Step2a 候選設定檔自動帶入，並排除和它重疊的候選洩漏頻帶
+#   - 共振程式用它決定哪些格子固定不納入
+# ======================================
+OFFBAND_BANDS = [
+    {"name": "off_010_020k", "f_low": 10_000, "f_high": 20_000},
+    {"name": "off_050_060k", "f_low": 50_000, "f_high": 60_000},
+    {"name": "off_210_220k", "f_low": 210_000, "f_high": 220_000},
+    {"name": "off_315_325k", "f_low": 315_000, "f_high": 325_000},
+]
+
+
+# ======================================
 # 正式 band config 的 temporal band 名稱同步
 # ======================================
 def configure_temporal_band_names(
@@ -137,6 +163,103 @@ def merge_band_groups(*groups):
             merged.append(dict(band))
 
     return merged
+
+
+# ============================================================
+# 讀 band 設定檔，並檢查每一段頻帶的內容
+# ============================================================
+def load_band_config(
+        band_config_path,
+        *,
+        expected_status=None,
+        require_offband=False,     # 正式流程（final）設 True：offband 不可為空
+    ):
+    """
+    讀取並驗證 band config。
+    除了 schema 之外，也檢查每一段頻帶的欄位、上下界、名稱是否重複，
+    以及 temporal_band_names 是否都對應到實際存在的頻帶。
+    """
+    band_config_path = Path(band_config_path)
+    payload = json.loads(band_config_path.read_text(encoding="utf-8"))
+    
+    # ---- schema 檢查 ----
+    # 檢查 payload 內容
+    if payload.get("schema_name") != "band_config":
+        raise ValueError("band config 的 schema_name 必須是 band_config")
+    if int(payload.get("schema_version", -1)) != 2:
+        raise ValueError("目前只支援 band_config schema_version=2")
+        
+    # 檢查 schema_status
+    schema_status = payload.get("schema_status")
+    if expected_status is not None and schema_status != expected_status:
+        raise ValueError(f"{band_config_path.name} 的 schema_status 必須是 {expected_status}，目前為 {schema_status}")
+            
+    # 設定檔記錄的合併規則，必須和 merge_band_groups() 實際使用的規則一致
+    policy = payload.get("band_merge_policy")
+    if policy != "keep_primary_overlap_drop_secondary_overlap_v1":
+        raise ValueError(f"不支援的 band_merge_policy：{policy}")
+
+    band_config = BandConfig(
+        leak_focused_bands=payload.get("leak_focused_bands", []),
+        resonance_bands=payload.get("resonance_bands", []),
+        offband_bands=payload.get("offband_bands", []),
+        temporal_band_names=payload.get("temporal_band_names", []),
+    )
+
+    if not band_config.leak_focused_bands:
+        raise ValueError("band config 缺少 leak_focused_bands")
+        
+    if require_offband and not band_config.offband_bands:
+        raise ValueError(f"{band_config_path.name} 沒有 offband_bands；請先人工加入 offband 再定案")
+        
+    # ---- 每一段頻帶的內容檢查 ----
+    # 合併所有頻段
+    all_bands = (band_config.leak_focused_bands + band_config.resonance_bands + band_config.offband_bands)
+    
+    problems = []
+    for b in all_bands:
+        name = b.get("name")
+        if not name:
+            problems.append(f"有頻帶缺少 name：{b}")
+            continue
+        try:
+            lo, hi = float(b["f_low"]), float(b["f_high"])
+        except (KeyError, TypeError, ValueError):
+            problems.append(f"{name}：f_low / f_high 缺少或不是數字")
+            continue
+        if not (0 < lo < hi):
+            problems.append(f"{name}：上下界不合理（f_low={lo}, f_high={hi}）")
+
+    names = [str(b.get("name")) for b in all_bands if b.get("name")]
+    # 檢查頻帶名稱是否重複
+    duplicated = sorted({n for n in names if names.count(n) > 1})
+    if duplicated:
+        problems.append(f"頻帶名稱重複：{duplicated}")
+
+    # 基本內容有誤時先停下來（後面的合併需要用到正確的 f_low / f_high）
+    if problems:
+        raise ValueError(f"{band_config_path.name} 的頻帶設定有誤：\n  - " + "\n  - ".join(problems))
+
+    # temporal 特徵只會對 core 頻帶（洩漏 + 共振，合併後）計算；寫了 offband 或被合併排除的共振頻帶，不會報錯但也不會算，所以在這裡擋下來
+    # 從 core 頻帶裡，挑出名字有在 temporal 清單上的
+    core_names = {str(b["name"]) for b in band_config.final_main_bands}
+    invalid_temporal = sorted(set(map(str, band_config.temporal_band_names)) - core_names)
+    if invalid_temporal:
+        raise ValueError(
+            f"{band_config_path.name}：temporal_band_names 只能是 core 頻帶（洩漏或共振，且未被合併排除）；"
+            f"以下名稱不符合：{invalid_temporal}"
+        )
+        
+    # 提醒：目前的設計是 temporal 頻帶(洩漏頻帶需要另外做時間結構的頻帶) = 洩漏頻帶；兩者不一致時印出提示（不擋下）
+    leak_names = {str(b["name"]) for b in band_config.leak_focused_bands}
+    temporal_set = set(map(str, band_config.temporal_band_names))
+    if temporal_set != leak_names:
+        print(f"ℹ️ temporal_band_names 與洩漏頻帶不一致："
+              f"未納入 temporal 的洩漏頻帶 {sorted(leak_names - temporal_set)}，"
+              f"不屬於洩漏頻帶的 temporal {sorted(temporal_set - leak_names)}")
+
+    return band_config
+
 
 
 # ==========================
@@ -298,7 +421,12 @@ def make_feature_cache_hash(
     nperseg=NPERSEG,
     target_levels=None,
     feature_version="v2_global_dc",    
+    max_points=None,              # 單檔最多讀幾點；改變時特徵會不同，必須讓快取失效
+    temporal_band_names=None,     # 需要算 temporal 特徵的頻帶；沒傳入時退回全域設定
 ):
+    if temporal_band_names is None:
+        temporal_band_names = TEMPORAL_BAND_NAMES
+    
     config = {
         # 這次用哪些 band
         "core": core_bands,
@@ -310,10 +438,11 @@ def make_feature_cache_hash(
         # 頻譜計算參數
         "fs": fs,
         "nperseg": nperseg,
+        "max_points": max_points,
         "target_levels": sorted(list(target_levels)) if target_levels is not None else None,
-        "feature_version": feature_version,
         # 這版特徵工程的版本名
-        "temporal_band_names": sorted(list(TEMPORAL_BAND_NAMES)),
+        "feature_version": feature_version,
+        "temporal_band_names": sorted(map(str, temporal_band_names)),
     }
     # 把剛剛那個設定字典轉成字串
     config_str = json.dumps(config, sort_keys=True)
@@ -371,14 +500,15 @@ def make_records_signature(records):
 # by_file cache 不能再用 records/windows 簽章,要改成用檔案清單來簽
 # ============================================================
 def make_file_specs_signature(file_specs):
-    payload = [
-        {
+    payload = []
+    for f in file_specs:
+        stat = Path(f["filepath"]).stat()
+        payload.append({
             "record_id": f["record_id"],
-            "filepath": str(f["filepath"]),
-            "size": Path(f["filepath"]).stat().st_size,   # 其中 size 很重要，因為即使檔名一樣，只要檔案內容被更新，檔案大小通常也會變
-        }
-        for f in file_specs
-    ]
+            "filepath": str(Path(f["filepath"]).resolve()),
+            "size": stat.st_size,   # 其中 size 很重要，因為即使檔名一樣，只要檔案內容被更新，檔案大小通常也會變
+            "mtime_ns": stat.st_mtime_ns,    # 檔案被替換時修改時間會改變，即使大小剛好相同
+        })
     # 先依 record_id 排序，再轉成字串
     s = json.dumps(sorted(payload, key=lambda x: x["record_id"]), sort_keys=True)
     return hashlib.md5(s.encode()).hexdigest()[:12]
@@ -392,7 +522,7 @@ def load_one_tdms_record(
     record_id=None,  # 如果你想手動指定 record 名稱
     label=None,      # 這筆資料的標籤
     max_points_per_file=8_000_000,    # 最多讀多少點
-    fs_target=FS,    # 如果 TDMS 裡抓不到取樣率，就用這個預設值
+    fs_target=FS,    # 設定檔的取樣率；TDMS 有記錄時必須與它一致，之後一律使用這個值
 ):
     # 把路徑轉成 Path，然後讀取 TDMS 檔
     filepath = Path(filepath)
@@ -401,31 +531,31 @@ def load_one_tdms_record(
     group = tdms.groups()[0]
     channels = {ch.name: ch for ch in group.channels()}
     
-    # 如果有明確叫 ai0、ai1 的 channel，就用它們, 否則就退回成「取前兩個 channel」
-    if "ai0" in channels and "ai1" in channels:
-        channel_ai0 = channels["ai0"]
-        channel_ai1 = channels["ai1"]
-    else:
-        ch_list = group.channels()
-        channel_ai0 = ch_list[0]
-        channel_ai1 = ch_list[1]
+    # 必須有 ai0、ai1 兩個聲道；不再退回使用「前兩個聲道」，避免默默用錯感測器
+    if "ai0" not in channels or "ai1" not in channels:
+        raise ValueError(f"{filepath.name} 缺少 ai0 或 ai1，目前聲道：{sorted(channels)}")
+    channel_ai0 = channels["ai0"]
+    channel_ai1 = channels["ai1"]
+        
     # 讀出兩個聲道資料，並轉成 numpy array
     ai0 = np.asarray(channel_ai0[:max_points_per_file], dtype=float)
     ai1 = np.asarray(channel_ai1[:max_points_per_file], dtype=float)
     
-    # 嘗試從 TDMS 的 metadata 裡面讀取取樣率
-    fs = None
-    if hasattr(channel_ai0, "properties"):
-        inc = channel_ai0.properties.get("wf_increment")    # wf_increment 通常是每點的時間間隔
-        if inc:
-            fs = 1.0 / inc
-    if fs is None:     # 如果 TDMS 裡沒有取樣率資訊，就退回用你傳進來的預設值
-        fs = fs_target
+    # 取樣率：TDMS 有記錄就必須和設定一致，避免頻率軸整個錯掉
+    inc = channel_ai0.properties.get("wf_increment") if hasattr(channel_ai0, "properties") else None
+    fs = fs_target
+    if inc:
+        actual_fs = 1.0 / float(inc)
+        if not np.isclose(actual_fs, fs_target, rtol=1e-6):
+            raise ValueError(f"{filepath.name} 取樣率不一致：TDMS={actual_fs:.1f} Hz，設定={fs_target} Hz")
         
     # 用檔名去解析 metadata
     meta = parse_filename(filepath.name)
-    # 保證兩個聲道長度一致，如果兩邊長度不同，就截成相同最短長度
+    
+    # 兩聲道長度應該相同；不同時截成一樣長，並提示（可能是擷取時某個聲道掉資料）
     n = min(len(ai0), len(ai1))
+    if len(ai0) != len(ai1):
+        print(f"⚠️ {filepath.name}：ai0 與 ai1 長度不同（{len(ai0)} / {len(ai1)}），已截成 {n} 點")
     ai0 = ai0[:n]
     ai1 = ai1[:n]
     
@@ -453,6 +583,104 @@ def load_one_tdms_record(
 
 
 # ============================================================
+# 讀取整個資料夾的 TDMS（逐檔呼叫 load_one_tdms_record，讀檔規則全流程一致）
+# ============================================================
+def load_tdms_folder(
+    data_folder,                     # 資料夾（會遞迴搜尋子資料夾）
+    *,
+    file_pattern="*.tdms",
+    max_points_per_file=8_000_000,   # 請傳入 feature_extraction_config 的 max_points
+    fs_target=FS,                    # 請傳入 feature_extraction_config 的 fs
+    stop_flag=None,                  # GUI 用的停止函式（可選）
+):
+    """讀取資料夾內所有 TDMS，回傳 record 清單。
+    - 每個檔案都經過 load_one_tdms_record()：必須有 ai0 / ai1、取樣率必須與設定一致、去 DC、建立 diff
+    - record_id 使用「相對於上一層資料夾的路徑」（例如 leak0/xxx.tdms），避免不同資料夾的同名檔案衝突
+    - 任何檔案讀取失敗時，列出所有失敗的檔案後停止（不會默默略過）
+    """
+    data_folder = Path(data_folder)
+    files = sorted(data_folder.rglob(file_pattern))
+    if not files:
+        raise ValueError(f"在 {data_folder} 找不到 {file_pattern}")
+    print(f"📁 在 {data_folder} 找到 {len(files)} 個檔案")
+
+    records, failed = [], []
+    for idx, file_path in enumerate(files, 1):
+        if stop_flag is not None and stop_flag():
+            print(f"\n⚠️ 使用者中斷，已處理 {idx - 1}/{len(files)} 個檔案")
+            break
+        print(f"\r讀取 [{idx}/{len(files)}]: {file_path.name}", end="")
+        try:
+            records.append(load_one_tdms_record(
+                file_path,
+                record_id=str(file_path.relative_to(data_folder.parent)),
+                max_points_per_file=max_points_per_file,
+                fs_target=fs_target,
+            ))
+        except Exception as e:
+            failed.append(f"{file_path.name}：{e}")
+
+    print(f"\n完成讀檔，共 {len(records)} 個檔案")
+    if failed:
+        raise ValueError(f"{len(failed)} 個檔案讀取失敗：\n  - " + "\n  - ".join(failed[:20]))
+    return records
+
+
+# ============================================================
+# 硬性訊號品質檢查（全流程共用同一套規則與門檻）
+# ============================================================
+SIGNAL_RMS_MIN = 1e-6    #訊號 RMS 最低門檻: RMS 低於此值視為無訊號（感測器未接或斷線）
+
+#  硬性排除：異常資料檢查，normal/leak都可用，檢查：NaN/全零/clipping/RMS 過低/RMS 過高
+def check_signal_quality(
+        records,
+        rms_min=SIGNAL_RMS_MIN,
+        channels=("ai0", "ai1"),
+        ):
+    """
+    硬性品質檢查：NaN / Inf、全零、RMS 過低。
+    不做 clipping（削波）檢查，因為目前沒有硬體量程資訊。
+    回傳 {record_id: 排除原因}；全部通過時回傳空 dict。
+    注意：load_one_tdms_record() 已去直流，所以這裡的 RMS 是交流成分；
+    卡在固定電壓的感測器去直流後會變成全零，因此也會被排除。
+    """
+    # 儲存異常資料：key   = record_id, value = 哪個聲道發生什麼問題
+    abnormal = {}
+
+    # 逐筆檢查 record
+    for r in records:
+        # 逐一檢查必要聲道，預設為 ai0、ai1
+        for ch in channels:
+            # 取出指定聲道的訊號，並轉成浮點數 NumPy 陣列。
+            x = np.asarray(r["signal"][ch], dtype=float)
+            # 1. 訊號陣列是否為空
+            if x.size == 0:
+                reason = "empty"
+
+            # 2. 是否包含 NaN 或正負無限大 Inf
+            elif not np.isfinite(x).all():
+                reason = "nan_or_inf"
+
+            # 3. 是否整段訊號都接近零
+            elif np.allclose(x, 0):
+                reason = "all_zero"
+
+            # 4. 訊號 RMS 是否低於最低門檻
+            # RMS 太低可能代表：感測器未接 / 感測器失效 / 訊號被截斷成近乎零 / 輸入端沒有有效交流訊號
+            elif np.sqrt(np.mean(x ** 2)) < rms_min:
+                reason = "rms_too_low"
+
+            else:    # 本聲道全部檢查通過，繼續檢查下一個聲道。
+                continue
+            
+            # 本聲道發現問題，記錄
+            abnormal[r["record_id"]] = (f"{ch}:{reason}")
+            break
+
+    return abnormal
+
+
+# ============================================================
 # 一次處理一個檔案 -> 讀 TDMS -> 切 windows -> 算這個檔案 window 的特徵
 # ============================================================
 def _process_one_file_worker(args):
@@ -465,6 +693,8 @@ def _process_one_file_worker(args):
         hop_sec,       # 視窗滑動步長
         fs,            # 取樣率
         max_points,    # 單檔最大讀取點數
+        nperseg,                 # Welch PSD 的分段長度（來自 feature_extraction_config）
+        temporal_band_names,     # 需要算 temporal 特徵的頻帶（明確傳入，子行程才看得到）
     ) = args
     # 讀一個 TDMS 檔案，整理成一筆 record
     rec = load_one_tdms_record(
@@ -490,6 +720,8 @@ def _process_one_file_worker(args):
         aux_bands=aux_bands,      # 算 aux_bands(offband_bands_for_model) 的 band 特徵
         low_bands=low_bands,      # 算 low_bands([]) 的 band 特徵
         verbose=False,
+        nperseg=nperseg,
+        temporal_band_names=temporal_band_names,
     )
     return feats
 
@@ -507,6 +739,8 @@ def extract_features_from_files_parallel(
     fs=FS,                   # 取樣率
     max_points=8_000_000,    # 單檔最大讀取點數
     n_jobs=-2,               # 平行工作數
+    nperseg=NPERSEG,
+    temporal_band_names=(),
 ):
     # 每個檔案準備好一包參數
     args_list = [
@@ -519,6 +753,8 @@ def extract_features_from_files_parallel(
             hop_sec,
             fs,
             max_points,
+            nperseg, 
+            list(temporal_band_names)
         )
         for f in file_specs
     ]
@@ -556,6 +792,12 @@ def load_or_compute_features_by_file(
     # 先確保 cache 資料夾存在
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 在主程式取出 temporal 頻帶：
+    # 平行計算時，子行程看不到主程式用 configure_temporal_band_names() 設定的全域變數，
+    # 所以要在這裡取出，明確傳給快取指紋和子行程，兩邊才會用同一份名單。
+    temporal_band_names = sorted(TEMPORAL_BAND_NAMES)
+
 
     # 幫這次特徵設定做一個 hash 把：band 設定 , 視窗設定 , PSD 設定 , target levels , feature version，整理成一個唯一指紋
     cache_hash = make_feature_cache_hash(
@@ -568,6 +810,8 @@ def load_or_compute_features_by_file(
         nperseg=nperseg,
         target_levels=target_levels,
         feature_version=feature_version,
+        max_points=max_points,
+        temporal_band_names=temporal_band_names,
     )
 
     # 幫這批檔案本身做一個 signature(因為就算 band 沒變，只要檔案清單變了，也不應該共用同一份 cache)
@@ -593,6 +837,8 @@ def load_or_compute_features_by_file(
         fs=fs,
         max_points=max_points,
         n_jobs=n_jobs,
+        nperseg=nperseg,
+        temporal_band_names=temporal_band_names,
     )
     # 算完後把結果存成 cache
     with open(cache_path, "wb") as f:
@@ -901,7 +1147,7 @@ def sliding_window_records(records, fs=1_000_000, window_sec=0.2, hop_sec=0.05):
 # ============================================================
 # 特徵工程：核心頻段優先版本
 # ============================================================
-def extract_window_features_core_bands(records, core_bands, aux_bands=None, low_bands=None, verbose=True):
+def extract_window_features_core_bands(records, core_bands, aux_bands=None, low_bands=None, verbose=True, nperseg=NPERSEG, temporal_band_names=None):
     """
     把每一個切好的訊號視窗，轉成一列可丟進機器學習模型的特徵資料。
     而且它不是對所有頻段一視同仁，而是採用你現在的策略：
@@ -910,16 +1156,17 @@ def extract_window_features_core_bands(records, core_bands, aux_bands=None, low_
         - 輔助頻段 aux_bands：只抽少量摘要
     目的就是讓模型優先看你 EDA 已經證明重要的頻段
     """
+    # temporal 頻帶優先使用明確傳入的名稱；沒傳入時才退回全域設定（相容舊的呼叫方式）。
+    # 平行計算時子行程看不到主程式設定的全域變數，所以正式流程一定要明確傳入。
+    temporal_names = (set(map(str, temporal_band_names))
+                      if temporal_band_names is not None else TEMPORAL_BAND_NAMES)
+    temporal_bands = [b for b in core_bands if b["name"] in temporal_names]
+        
     # 避免你沒有傳 aux_bands, low_band 時報錯,如果沒給，就當成空列表。
     if aux_bands is None:
         aux_bands = []
     if low_bands is None:
         low_bands = []
-        
-    temporal_bands = [
-        b for b in core_bands
-        if b["name"] in TEMPORAL_BAND_NAMES
-    ]
 
     feature_list = []   # 建立最終要輸出的特徵表
     # 從切好的視窗拿出 ai0,ai1,diff,fs
@@ -998,8 +1245,16 @@ def extract_window_features_core_bands(records, core_bands, aux_bands=None, low_
         xc = correlate(ai0, ai1, mode="same", method="fft")
         feat["xcorr_peak_ai0_ai1"] = float(np.max(np.abs(xc)) / np.sqrt(E_ai0 * E_ai1))
 
+        # ===== 三個聲道的整段頻譜：每個視窗只算一次，後面各頻帶共用 =====
+        psd_full = {
+            "ai0": compute_psd(ai0, fs, nperseg=nperseg, normalize=False, smooth_sigma=0),
+            "ai1": compute_psd(ai1, fs, nperseg=nperseg, normalize=False, smooth_sigma=0),
+            "diff": compute_psd(diff, fs, nperseg=nperseg, normalize=False, smooth_sigma=0),
+        }
+
         # ===== ai1 全域頻譜重心：代表整段 ai1 頻譜能量偏向哪個頻率 =====
-        f, Pxx1 = compute_psd(ai1, fs, normalize=False, smooth_sigma=0)
+        f, Pxx1 = psd_full["ai1"]
+        
         feat["centroid_ai1_global"] = np.sum(f * Pxx1) / (np.sum(Pxx1) + 1e-12)
         
         
@@ -1007,9 +1262,9 @@ def extract_window_features_core_bands(records, core_bands, aux_bands=None, low_
         for band in low_bands:
             name = band["name"]
         
-            lf_ai0 = extract_band_features_one_channel(ai0, fs, band, f"{name}_ai0", compute_env=False)
-            lf_ai1 = extract_band_features_one_channel(ai1, fs, band, f"{name}_ai1", compute_env=False)
-            lf_diff = extract_band_features_one_channel(diff, fs, band, f"{name}_diff", compute_env=False)
+            lf_ai0 = extract_band_features_one_channel(ai0, fs, band, f"{name}_ai0", compute_env=False, nperseg=nperseg)
+            lf_ai1 = extract_band_features_one_channel(ai1, fs, band, f"{name}_ai1", compute_env=False, nperseg=nperseg)
+            lf_diff = extract_band_features_one_channel(diff, fs, band, f"{name}_diff", compute_env=False, nperseg=nperseg)
                     
             feat[f"{name}_ai1_E"] = lf_ai1[f"{name}_ai1_E"]
             feat[f"{name}_ai1_RMS"] = lf_ai1[f"{name}_ai1_RMS"]
@@ -1027,9 +1282,9 @@ def extract_window_features_core_bands(records, core_bands, aux_bands=None, low_
             name = band["name"]
             # 對每個 core_bands：ai0/ai1/diff抽完整特徵
             # 每個核心 band 都有 E, RMS, Peak, EnvMean, EnvRMS, EnvStd, DomFreq, Centroid, Entropy, Flatness
-            f_ai0  = extract_band_features_one_channel(ai0,  fs, band, f"{name}_ai0")
-            f_ai1  = extract_band_features_one_channel(ai1,  fs, band, f"{name}_ai1")
-            f_diff = extract_band_features_one_channel(diff, fs, band, f"{name}_diff")
+            f_ai0  = extract_band_features_one_channel(ai0,  fs, band, f"{name}_ai0", nperseg=nperseg)
+            f_ai1  = extract_band_features_one_channel(ai1,  fs, band, f"{name}_ai1", nperseg=nperseg)
+            f_diff = extract_band_features_one_channel(diff, fs, band, f"{name}_diff", nperseg=nperseg)
 
             feat.update(f_ai0)
             feat.update(f_ai1)
@@ -1049,13 +1304,15 @@ def extract_window_features_core_bands(records, core_bands, aux_bands=None, low_
             feat[f"{name}_logratio_diff_ai0"] = np.log((feat[f"{name}_diff_E"] + 1e-12) / (feat[f"{name}_ai0_E"] + 1e-12))
 
             # 加上 shape - only PSD
-            shape_ai0 = extract_shape_only_psd_features(ai0, fs, band["f_low"], band["f_high"], f"{name}_ai0")
-            shape_ai1 = extract_shape_only_psd_features(ai1, fs, band["f_low"], band["f_high"], f"{name}_ai1")
-            shape_diff = extract_shape_only_psd_features(diff, fs, band["f_low"], band["f_high"], f"{name}_diff")
+            shape_ai0 = extract_shape_only_psd_features(ai0, fs, band["f_low"], band["f_high"], f"{name}_ai0", nperseg=nperseg, psd=psd_full["ai0"])
+            shape_ai1 = extract_shape_only_psd_features(ai1, fs, band["f_low"], band["f_high"], f"{name}_ai1", nperseg=nperseg, psd=psd_full["ai1"])
+            shape_diff = extract_shape_only_psd_features(diff, fs, band["f_low"], band["f_high"], f"{name}_diff", nperseg=nperseg, psd=psd_full["diff"])
             
-            feat.update(shape_ai0)
-            feat.update(shape_ai1)
-            feat.update(shape_diff)
+            # 不覆蓋已存在的特徵：ShapeCentroid / ShapeSpread 以帶通濾波後的版本為準，和 runtime（extract_required_window_features）的算法一致；
+            # 這裡只補上 ShapeEntropy / ShapeFlatness 兩個新特徵。
+            for shape_feats in (shape_ai0, shape_ai1, shape_diff):
+                for key, value in shape_feats.items():
+                    feat.setdefault(key, value)
             
         # 加上 ai1/diff 在 core bands 的總能量
         total_core_ai1_E = sum(core_ai1_energy_map.values())
@@ -1074,8 +1331,8 @@ def extract_window_features_core_bands(records, core_bands, aux_bands=None, low_
         for band in aux_bands:
             name = band["name"]
 
-            aux_ai0 = extract_band_features_one_channel(ai0, fs, band, f"{name}_ai0", compute_env=False)
-            aux_ai1 = extract_band_features_one_channel(ai1, fs, band, f"{name}_ai1", compute_env=False)
+            aux_ai0 = extract_band_features_one_channel(ai0, fs, band, f"{name}_ai0", compute_env=False, nperseg=nperseg)
+            aux_ai1 = extract_band_features_one_channel(ai1, fs, band, f"{name}_ai1", compute_env=False, nperseg=nperseg)
             
             # 對 aux bands，同時保留ai0,ai1 的 E, RMS, DomFreq, Entropy,以及 ai1/ai0 的 energy ratio。
             feat[f"{name}_ai0_E"] = aux_ai0[f"{name}_ai0_E"]
@@ -1207,7 +1464,7 @@ def extract_basic_time_features(signal, prefix, suffix="", fs=None):
 
 
 # 頻帶內的頻譜形狀：只看某個頻帶裡的頻譜「長相」，不要看它整體有多強
-def extract_shape_only_psd_features(signal, fs, f_low, f_high, prefix):     # f_low、f_high 是「這個頻帶的下限和上限頻率」,是指每個頻帶的屬性
+def extract_shape_only_psd_features(signal, fs, f_low, f_high, prefix, nperseg=NPERSEG, psd=None):     # f_low、f_high 是「這個頻帶的下限和上限頻率」,是指每個頻帶的屬性
     """
     只保留頻譜形狀，不保留絕對能量尺度
     在指定頻帶內把 PSD 正規化成機率分布後，抽 shape features
@@ -1217,7 +1474,11 @@ def extract_shape_only_psd_features(signal, fs, f_low, f_high, prefix):     # f_
     - 頻譜像尖峰還是像平坦雜訊
     """
     # 先算 PSD,先保留原始PSD,不使用平滑
-    f, Pxx = compute_psd(signal, fs, normalize=False, smooth_sigma=0)
+    # 有傳入算好的頻譜就直接用，沒有才自己算
+    if psd is None:
+        f, Pxx = compute_psd(signal, fs, nperseg=nperseg, normalize=False, smooth_sigma=0)
+    else:
+        f, Pxx = psd
 
     # 只取指定頻帶
     mask = (f >= f_low) & (f <= f_high)
@@ -1342,7 +1603,8 @@ def extract_band_features_one_channel(signal,
                                       band, 
                                       prefix, 
                                       compute_env=True, 
-                                      required_metrics=None,):     # 先把訊號濾到指定band,再用Hilbert算包絡
+                                      required_metrics=None,     # 先把訊號濾到指定band,再用Hilbert算包絡
+                                      nperseg=NPERSEG):
     """
     把一段訊號濾到指定頻帶後，算出這個頻帶的特徵，最後回傳成一個 dict
     required_metrics=None：維持原本完整特徵提取行為，供 Step2 與離線研究流程使用。
@@ -1435,7 +1697,7 @@ def extract_band_features_one_channel(signal,
     needed_psd_metrics = (metrics & psd_metrics)
     # 如果需要頻譜特徵，才做 PSD
     if needed_psd_metrics:
-        frequencies, power = compute_psd(x, fs, normalize=False, smooth_sigma=0,)
+        frequencies, power = compute_psd(x, fs, nperseg=nperseg, normalize=False, smooth_sigma=0,)
         # 只取目前 band 內的頻率
         mask = ((frequencies >= band["f_low"]) & (frequencies <= band["f_high"]))
 
@@ -1670,9 +1932,9 @@ def extract_required_window_features(
                         set(),
                     ).add("E")
         
-                    # frac_core 的分母是全部 leak-focused core bands 的能量，
-                    # 所以同一個 channel 的所有 leak-focused band E 都要算。
-                    for core_band in band_config.leak_focused_bands:
+                    # frac_core 的分母是全部 core bands（洩漏 + 共振）的能量，與離線特徵一致，
+                    # 所以同一個 channel 的所有 core band E 都要算。
+                    for core_band in band_config.final_main_bands:
                         core_band_name = str(core_band["name"])
                         requests.setdefault(
                             (core_band_name, channel_name),
@@ -1799,13 +2061,13 @@ def extract_required_window_features(
         # frac_core 特徵
         # --------------------------------------------------------
         # 例如 res_sec_167_187k_diff_frac_core。
-        # 定義：該 band 的 E / 所有 leak-focused core bands 的 E 總和。
+        # 定義：該 band 的 E / 所有 core bands（洩漏 + 共振）的 E 總和，與離線特徵一致。
         core_energy_by_channel = {}
-    
+        
         for channel_name in ("ai0", "ai1", "diff"):
             core_energy_cols = [
                 f"{str(core_band['name'])}_{channel_name}_E"
-                for core_band in band_config.leak_focused_bands
+                for core_band in band_config.final_main_bands
                 if f"{str(core_band['name'])}_{channel_name}_E" in row
             ]
     
@@ -1876,16 +2138,12 @@ def bandpass_filter(signal, fs, lowcut= 200_000, highcut= 450_000, order=4):    
     
     # 避免 window 太短時 sosfiltfilt 不穩或報錯
     if len(signal) < order * 30:
-        return signal
+        raise ValueError(f"bandpass_filter：訊號只有 {len(signal)} 點，太短無法濾波")
     
     # 建立一個指定頻帶的濾波器設定，準備拿來濾你的訊號
     sos = _cached_sos(order, int(lowcut), int(highcut), int(fs))
     
-    # 如果濾波失敗，就回傳原訊號，讓流程不中斷。
-    try:
-        return sosfiltfilt(sos, signal)
-    except Exception:
-        return signal
+    return sosfiltfilt(sos, signal)
 
 
 # ==========================
@@ -1920,27 +2178,19 @@ def compute_band_energy(signal, fs, band):
 # ============================================================
 def build_offband_summary_features(df, band_config):
     """
-    建立 offband / leak-focused band / resonance band 的摘要特徵，方便後續做 disturbance veto 與規則判斷。
-
-    目前 leak-focused 與 resonance 先分開保留：
-    - leak-focused：正式主判斷頻帶
-    - resonance：先保留觀察，之後再決定是否納入主規則
-    
-    offband：拿來看是不是寬頻干擾
+    建立 offband / 洩漏頻帶 / 共振頻帶的能量摘要與比值。
+    三組都只用 ai0、ai1 兩個聲道，比值才公平（offband 沒有 diff）。
     """
     eps = 1e-12    # 做比值時避免分母剛好是 0
     
-    # 從特徵表（df）的欄位裡，找出指定頻段的所有能量特徵欄位（_E 結尾的）
+   # 直接組出欄位名稱，例如 scan_093_465_475k_ai0_E
     def collect_energy_cols(bands):
-        # 取出頻段名稱
-        names = [b["name"] for b in bands]
-        # 搜尋對應的能量欄位
         cols = []
-        for name in names:
-            cols.extend([
-                c for c in df.columns
-                if c.startswith(f"{name}_") and c.endswith("_E")    # 欄位名稱以這個頻段名稱開頭並以 _E 結尾（代表能量特徵）
-            ])
+        for b in bands:
+            for ch in ("ai0", "ai1"):
+                col = f"{b['name']}_{ch}_E"
+                if col in df.columns:
+                    cols.append(col)
         return cols
 
     # 找出 offband 頻帶的能量欄位
@@ -1992,7 +2242,7 @@ def build_offband_summary_features(df, band_config):
 def add_cusum_features(
     df,
     input_feature_cols,
-    k=0.02,          # k=0.0 太容易累積噪聲,k 是容忍值，用來過濾小波動，避免噪聲一直被累積,微小洩漏建議先從 0.02~0.05 試
+    k=0.5,           # 容忍值：約為想偵測的偏移量（z）的一半；正常小波動不會被累積
     decay=0.97,      # 保留前面累積，不要一下子歸零
 ):
     '''
@@ -2024,11 +2274,11 @@ def add_cusum_features(
     
             # 從第 2 個 window 開始算，因為第 1 個 window 沒有前面可累積
             for i in range(1, len(x)):
-                pos_inc = max(0.0, x[i] - k)    # 如果目前值 x[i] 比容忍值 k 還大，就把超過的部分拿來累積
-                neg_inc = max(0.0, -x[i] - k)
-                # 累積更新
-                s_pos[i] = decay * s_pos[i - 1] + pos_inc    # 目前正向累積 = 前一刻累積量 * decay + 這一刻新增正向量
-                s_neg[i] = decay * s_neg[i - 1] + neg_inc
+                # 標準 CUSUM：先累加（含負值），再裁成非負
+                # 正常時 z 有正有負，扣掉 k 後平均為負，累積量會被拉回 0；
+                # 只有持續偏高（或偏低）才會一路累積
+                s_pos[i] = max(0.0, decay * s_pos[i - 1] + x[i] - k)
+                s_neg[i] = max(0.0, decay * s_neg[i - 1] - x[i] - k)
             
             # 把算好的 CUSUM 結果寫回原本資料表對應的位置
             out.loc[idx, f"cusum_pos_{feat}"] = s_pos
@@ -2469,6 +2719,14 @@ def load_fixed_normal_baseline(
     # 換成比對特徵萃取設定檔的指紋
     if (payload.get("feature_extraction_config_sha256") != current_extraction_hash):
         raise ValueError("baseline 與目前 feature_extraction_config 不一致，請重新建立 baseline")
+        
+    # 檢查 baseline 是不是用目前的特徵公式版本建立的
+    extraction_cfg = load_feature_extraction_config(feature_extraction_config_path)
+    if payload.get("base_feature_version") != str(extraction_cfg["base_feature_version"]):
+        raise ValueError(
+            f"baseline 的特徵版本是 {payload.get('base_feature_version')}，"
+            f"目前設定是 {extraction_cfg['base_feature_version']}，請重新建立 baseline"
+        )
 
     return payload
 
@@ -2584,6 +2842,12 @@ def select_all_raw_feature_columns(df):    # 整合好的特徵 DataFrame，裡�
         # manifest / events csv 路徑
         "disturbance_session_manifest",
         "disturbance_event_csv",
+        
+        # 其他非特徵欄位（原本只在 baseline 的 select_raw_feature_columns() 排除）
+        "target",
+        "window_idx",
+        "source_index",
+        "fs",
     }
 
     # 列出所有「衍生特徵」的欄位名稱前綴
@@ -2646,12 +2910,12 @@ def build_baseline_relative_features(
 # ============================================================
 # 把 band 設定整理成一個乾淨物件
 # ============================================================
-@dataclass(frozen=True)         # 這份 band 設定是正式設定，不應該在程式中途被亂改
+@dataclass(frozen=True)               # 這份 band 設定是正式設定，不應該在程式中途被亂改
 class BandConfig:
-    leak_focused_bands: list    # 正式主判斷的洩漏頻帶
-    resonance_bands: list       # Step1 找出來的共振頻帶
-    offband_bands: list         # 額外拿來做 broadband / veto 判斷的頻帶
-    temporal_band_names: set    # 目前先保留給未來 temporal feature gating 用，這支程式尚未實際使用
+    leak_focused_bands: list          # 正式主判斷的洩漏頻帶
+    resonance_bands: list             # 共振程式核准的正式共振頻帶（approved_resonance_bands.json）
+    offband_bands: list               # 額外拿來做 broadband / veto 判斷的頻帶
+    temporal_band_names: list[str]    # 需要建立 temporal 特徵（殘差、CUSUM、burst）的 core 頻帶；正式版為洩漏頻帶
 
     @property
     # 正式主頻帶 = leak-focused bands + resonance bands
