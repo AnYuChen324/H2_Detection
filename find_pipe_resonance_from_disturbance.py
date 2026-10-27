@@ -148,9 +148,12 @@ DEFAULT_VALIDATION_BATCHES = {
 # ============================================================
 # 共振頻帶網格常數（與 build_site_baseline_v2.py 的 DISCOVERY_* 一致）
 # ============================================================
-GRID_F_MIN = 5_000         # 涵蓋的頻率範圍，和 discovery 一樣是 5～500 kHz。
-GRID_F_MAX = 500_000       # 涵蓋的頻率範圍，和 discovery 一樣是 5～500 kHz。
-GRID_WIDTH = 10_000        # 每一格寬 10 kHz，和洩漏頻帶的寬度一致。
+from shared_feature_utils import (
+    GRID_F_MIN, GRID_F_MAX, GRID_WIDTH
+)
+# GRID_F_MIN：涵蓋的頻率範圍，和 discovery 一樣是 5～500 kHz。
+# GRID_F_MAX：涵蓋的頻率範圍，和 discovery 一樣是 5～500 kHz。
+# GRID_WIDTH：每一格寬 10 kHz，和洩漏頻帶的寬度一致。
 RES_GRID_STRIDE = 10_000   # 共振頻帶用「不重疊」的格子，避免特徵數量暴增
 MIN_OVERLAP_HZ = 5_000     # 格子和共振頻帶重疊至少一半才納入
 
