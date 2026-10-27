@@ -72,12 +72,14 @@ except ImportError:
 
 # NI-DAQ
 NIDAQ_IMPORT_ERROR = ""
-NIDAQ_CAPTURE_PATH = str(PROGRAM_DIR / "nidaq_capture.py")
+
+NIDAQ_CAPTURE_PATH = str(PROGRAM_DIR / "nidaq_capture_v2.py")
 try:
-    from nidaq_capture import (
+    from nidaq_capture_v2 import (
         AEsignal_Capture,
         AEsignal_MultiChannelCapture,
         AEsignal_DualChannelContinuousReader,
+        ContinuousChunkRecorder,
         NIDAQMX_IMPORT_ERROR,
     )
     NIDAQ_AVAILABLE = not bool(NIDAQMX_IMPORT_ERROR)
@@ -87,6 +89,7 @@ except Exception as exc:
     AEsignal_Capture = None
     AEsignal_MultiChannelCapture = None
     AEsignal_DualChannelContinuousReader = None
+    ContinuousChunkRecorder = None
     NIDAQMX_IMPORT_ERROR = ""
     NIDAQ_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
     print(f"[WARN] NI-DAQ unavailable ({NIDAQ_IMPORT_ERROR}); using simulation mode")
@@ -5829,7 +5832,7 @@ class DataCollectionGUI:
         }
         return canonical, label_to_key
 
-    def _stage_dual_standard_capture(self, data_dict, rate, points, capture_timing=None):
+    def _stage_dual_standard_capture(self, data_dict, rate, points, capture_timing=None, extra_metadata=None):
         """將 ai0/ai1 同步擷取結果寫入 dual staging。"""
         canonical, source_channels = self._canonical_dual_data(data_dict)
         for channel, data in canonical.items():
@@ -5899,10 +5902,42 @@ class DataCollectionGUI:
 
         metadata.update(self._disturbance_segment_info(start_elapsed, end_elapsed))
 
+        # 連續擷取會帶入：acquisition_mode、first_sample_index、capture_wall_time、毫秒精度的 capture_timestamp
+        if extra_metadata:
+            metadata.update(extra_metadata)
+
         StageIO.save_dual(stage_path, canonical, metadata)
         record = {"path": str(stage_path), "metadata": metadata}
         self.std_staged_records.setdefault("dual", []).append(record)
         return record
+
+    # 連續擷取寫進暫存 metadata 的欄位；輸出 TDMS 與 manifest 時一併帶出
+    CONTINUITY_META_KEYS = (
+        "acquisition_mode",          # "continuous"＝一個 DAQ 任務從頭收到尾；舊版有限取樣沒有這欄
+        "first_sample_index",        # 這支檔案第一個點，是任務啟動後第幾個取樣點
+        "capture_wall_time",         # 第一個點的電腦時間（Unix 秒，含小數）
+        "sample_clock_start_wall",   # 任務啟動（第 0 點）的電腦時間
+    )
+
+    def _continuity_meta(self, metadata):
+        return {k: metadata.get(k, "") for k in self.CONTINUITY_META_KEYS}
+
+    def _output_stamp_time(self, metadata, fallback_time):
+        """
+        輸出檔名用的時間。
+        連續擷取：用「這支檔案第一個取樣點的真實時間」（毫秒精度）。
+        舊資料沒有這個欄位：沿用舊做法（輸出當下時間 + 序號秒數）。
+        注意：舊做法的檔名時間是「按下輸出的時間」，不是錄製時間。
+        """
+        wall = metadata.get("capture_wall_time", "")
+        if wall not in ("", None):
+            return datetime.fromtimestamp(float(wall))
+        return fallback_time
+
+    @staticmethod
+    def _stamp_with_ms(dt):
+        """YYYYMMDD_HHMMSS_mmm：前段格式不變，後面加毫秒，同一秒的兩支檔案才分得開"""
+        return dt.strftime("%Y%m%d_%H%M%S") + f"_{dt.microsecond // 1000:03d}"
 
     def _build_output_base_name(self, signature, timestamp):
         return (
@@ -5933,7 +5968,7 @@ class DataCollectionGUI:
         """雙通道同步輸出：ai0、ai1、dual_2ch 三份同名基底。"""
         candidate = output_time
         for _ in range(3600):
-            stamp = candidate.strftime("%Y%m%d_%H%M%S")
+            stamp = self._stamp_with_ms(candidate)
             base_name = self._build_output_base_name(signature, stamp)
             paths = {
                 "ai0": dirs["ai0"] / f"{base_name}.tdms",
@@ -5942,7 +5977,7 @@ class DataCollectionGUI:
             }
             if not any(path.exists() for path in paths.values()):
                 return stamp, base_name, paths
-            candidate += timedelta(seconds=1)
+            candidate += timedelta(milliseconds=1)
         raise RuntimeError("無法產生不重複的 dual 輸出檔名")
 
     def _write_session_manifest(self, manifest_path, rows):
@@ -5967,6 +6002,7 @@ class DataCollectionGUI:
             "volume_ml", "matched_volume_ml", "pressure_bar", "position",
             "sample_rate", "sample_count",
             "capture_start_elapsed_sec", "capture_end_elapsed_sec", "capture_mid_elapsed_sec",
+            "acquisition_mode", "first_sample_index", "capture_wall_time", "sample_clock_start_wall",
             "ai0_file", "ai1_file",
             "dual_file", "dual_stage", "ai0_physical_channel",
             "ai1_physical_channel", "sync_mode", "pseudo_sync",
@@ -6023,7 +6059,7 @@ class DataCollectionGUI:
     def _unique_transition_dual_output_paths(self, dirs, metadata, output_time):
         candidate = output_time
         for _ in range(3600):
-            stamp = candidate.strftime("%Y%m%d_%H%M%S")
+            stamp = self._stamp_with_ms(candidate)
             base_name = self._build_transition_output_base_name(metadata, stamp)
             paths = {
                 "ai0": dirs["ai0"] / f"{base_name}.tdms",
@@ -6032,7 +6068,7 @@ class DataCollectionGUI:
             }
             if not any(path.exists() for path in paths.values()):
                 return stamp, base_name, paths
-            candidate += timedelta(seconds=1)
+            candidate += timedelta(milliseconds=1)
         raise RuntimeError("無法產生不衝突的 transition dual 輸出檔名")
 
     def _write_transition_events(self, path, output_time):
@@ -6098,6 +6134,7 @@ class DataCollectionGUI:
             "session_id", "output_index", "stage_index", "condition_folder",
             "state_label", "file_label", "segment_type", "capture_start_elapsed_sec",
             "capture_end_elapsed_sec", "capture_mid_elapsed_sec", "nearest_event_offset_sec",
+            "acquisition_mode", "first_sample_index", "capture_wall_time", "sample_clock_start_wall",
             "disturbance_present", "disturbance_event_count", "disturbance_overlap_sec",
             "disturbance_overlap_ratio", "disturbance_primary_type", "disturbance_primary_strength",
             "leak_status", "volume_ml", "matched_volume_ml", "pressure_bar", "position",
@@ -6159,7 +6196,7 @@ class DataCollectionGUI:
                 stamp, base_name, paths = self._unique_transition_dual_output_paths(
                     transition_dirs,
                     name_meta,
-                    output_time + timedelta(seconds=idx - 1),
+                    self._output_stamp_time(metadata, output_time + timedelta(seconds=idx - 1)),
                 )
 
                 ai0_physical = self._tdms_channel_label(metadata.get("ai0_physical_channel", "ai0"))
@@ -6234,6 +6271,7 @@ class DataCollectionGUI:
                     "capture_start_elapsed_sec": metadata.get("capture_start_elapsed_sec", ""),
                     "capture_end_elapsed_sec": metadata.get("capture_end_elapsed_sec", ""),
                     "capture_mid_elapsed_sec": metadata.get("capture_mid_elapsed_sec", ""),
+                    **self._continuity_meta(metadata),
                     "nearest_event_offset_sec": metadata.get("nearest_event_offset_sec", ""),
                     
                     "disturbance_present": metadata.get("disturbance_present", 0),
@@ -6441,7 +6479,7 @@ class DataCollectionGUI:
                 stamp, base_name, paths = self._unique_dual_output_paths(
                     dirs,
                     signature,
-                    output_time + timedelta(seconds=idx - 1),
+                    self._output_stamp_time(metadata, output_time + timedelta(seconds=idx - 1)),
                 )
                 common_meta = dict(signature)
                 common_meta.update({
@@ -6457,6 +6495,7 @@ class DataCollectionGUI:
                     "condition_folder": Path(self.std_folder.get()).name,
                     "source_dual_stage": record["path"],
                 })
+                common_meta.update(self._continuity_meta(metadata))
 
                 ai0_physical = metadata.get("ai0_physical_channel", "ai0")
                 ai1_physical = metadata.get("ai1_physical_channel", "ai1")
@@ -6510,6 +6549,7 @@ class DataCollectionGUI:
                     "capture_start_elapsed_sec": metadata.get("capture_start_elapsed_sec", ""),
                     "capture_end_elapsed_sec": metadata.get("capture_end_elapsed_sec", ""),
                     "capture_mid_elapsed_sec": metadata.get("capture_mid_elapsed_sec", ""),
+                    **self._continuity_meta(metadata),
                     "ai0_file": str(paths["ai0"]),
                     "ai1_file": str(paths["ai1"]),
                     "dual_file": str(paths["dual"]),
@@ -6897,6 +6937,13 @@ class DataCollectionGUI:
                 duration, interval, rate, points
             )
             
+            
+            # 雙通道 + 間隔 0 → 連續擷取：一個 DAQ 任務從頭收到尾，檔案之間不漏資料
+            # 間隔 > 0 → 沿用舊的「收一筆、等一下、再收一筆」（本來就是要間歇取樣）
+            use_continuous = self._is_dual_standard_mode() and interval == 0
+            if use_continuous:
+                n_files = int(duration // (points / rate))
+            
             # 參數驗證
             valid, msg = ErrorHandler.validate_params(rate, points, points/rate)
             if not valid:
@@ -6958,6 +7005,11 @@ class DataCollectionGUI:
             
             # 開始收集
             def collect_loop():
+                if use_continuous:
+                    self._std_continuous_collect(rate, points, n_files, show_last)
+                    self.root.after(0, self._std_long_complete)
+                    return
+            
                 start_time = time.time()
                 
                 for run_index in range(n_files):
@@ -7058,6 +7110,108 @@ class DataCollectionGUI:
         except Exception as e:
             ErrorHandler.log_error(e, "啟動長時間收集")
             self.std_status.config(text=f"啟動失敗: {str(e)[:30]}", foreground="red")
+    
+    def _std_continuous_collect(self, rate, points, n_files, show_last):
+        """
+        連續擷取 n_files 支、每支 points 點（雙通道）。在背景執行緒中呼叫。
+    
+        和舊版的差別：
+          - 舊版每支檔案都「開一個新 DAQ 任務 → 收 0.5 秒 → 關掉 → 存檔」，
+            開關任務與存檔期間沒有在收，檔案之間會漏 0.6～0.7 秒。
+          - 新版只開一次任務、連續取樣，讀取和存檔分開兩個執行緒，檔案首尾相接。
+          - 每支檔案的開始時間 = 任務啟動時間 + 取樣序號 / 取樣率，
+            不再用「呼叫擷取前的電腦時間」，所以不會受存檔、畫面更新影響。
+    
+        量程、耦合、端子設定和舊版有限取樣相同（±10 V、DAQmx 預設），
+        確保新舊資料的訊號條件一致。
+        """
+        if AEsignal_DualChannelContinuousReader is None or ContinuousChunkRecorder is None:
+            raise RuntimeError(f"nidaq_capture 連續讀取器無法使用：{NIDAQ_IMPORT_ERROR}")
+    
+        device_name = self.std_device_name.get().strip()
+        simulation_mode = bool(self.std_simulation_mode.get())
+    
+        # 讀取器把第 1 個通道回傳成 "ai0"、第 2 個回傳成 "ai1"，所以先依 ai0、ai1 排好
+        channel_ids = sorted(
+            (ch["id"] for ch in self._get_single_standard_channel()),
+            key=self._tdms_channel_label,
+        )
+        full_names = [cid if "/" in cid else f"{device_name}/{cid}" for cid in channel_ids]
+    
+        reader = AEsignal_DualChannelContinuousReader(
+            samplerate=rate,
+            channelnames=full_names,
+            chunk_size=points,             # 每次讀一整支檔案的點數（0.5 秒）
+            simulation=simulation_mode,
+            daq_buffer_seconds=10.0,       # DAQ 緩衝 10 秒：存檔偶爾卡一下也不會溢位
+            min_val=-10.0,
+            max_val=10.0,
+            coupling=None,
+            terminal_config=None,
+        )
+        chunk_sec = points / float(rate)
+
+        def on_chunk(chunk_number, first_sample_index, chunk):
+            # 這支檔案第一個點的真實時間，以及在 session 時間軸上的位置
+            start_wall = reader.start_wall_time + first_sample_index / float(rate)
+            start_elapsed = start_wall - self.std_session_start_time
+            end_elapsed = start_elapsed + chunk_sec
+    
+            data = {full_names[0]: chunk["ai0"], full_names[1]: chunk["ai1"]}
+            extra = {
+                "acquisition_mode": "continuous",
+                "first_sample_index": int(first_sample_index),
+                "capture_wall_time": float(start_wall),
+                "sample_clock_start_wall": float(reader.start_wall_time),
+                "capture_timestamp": datetime.fromtimestamp(start_wall).isoformat(timespec="milliseconds"),
+            }
+            staged = self._stage_dual_standard_capture(
+                data, rate, points,
+                capture_timing=(start_elapsed, end_elapsed),
+                extra_metadata=extra,
+            )
+            self.collection_count += 1
+    
+            # 每 2 秒才更新一次波形，避免畫圖拖慢存檔
+            if show_last and chunk_number % max(1, int(round(2.0 / chunk_sec))) == 0:
+                self.current_data = data
+                self.root.after(0, lambda d=data: self.waveform_viewer.plot_waveforms(d, rate))
+    
+            stage_path = Path(staged["path"])
+            size_mb = stage_path.stat().st_size / 1024 / 1024 if stage_path.exists() else 0
+            self.root.after(
+                0,
+                lambda count=self.collection_count, name=stage_path.name, size=size_mb:
+                    self.progress_tracker.update(count, name, True, size)
+            )
+            self.root.after(0, self._update_standard_session_status)
+            self.root.after(0, self._update_transition_status)
+            self.root.after(
+                0,
+                lambda count=self.collection_count: self.std_status.config(
+                    text=f"連續擷取中 {count}/{n_files} 支（{count * chunk_sec:.1f} 秒，無空檔）",
+                    foreground="blue",
+                )
+            )
+    
+        self.root.after(0, lambda: self.progress_tracker.set_current_status("連續擷取中（單一 DAQ 任務）..."))
+        summary = ContinuousChunkRecorder(
+            reader,
+            n_chunks=n_files,
+            on_chunk=on_chunk,
+            should_continue=lambda: self.is_collecting,
+        ).run()
+    
+        if summary["error"] is not None:
+            err = summary["error"]
+            ErrorHandler.log_error(err, "連續擷取")
+            self.root.after(
+                0,
+                lambda e=err, n=summary["n_written"]: self.std_status.config(
+                    text=f"連續擷取中斷（已存 {n} 支，之後沒有資料）：{str(e)[:60]}",
+                    foreground="red",
+                )
+            )
     
     def _std_long_stop(self):
         """停止長時間收集"""
