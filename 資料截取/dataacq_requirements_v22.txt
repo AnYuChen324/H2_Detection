@@ -1,0 +1,17 @@
+# data_collection_system_v21.py 相依套件
+# 安裝：pip install -r requirements.txt
+# tkinter 為 Python 內建，不需安裝
+
+# 核心（必要）
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.6
+
+# TDMS 讀寫（未安裝時會退回存 .npz，TDMS 離線辨識頁無法使用）
+npTDMS>=1.7
+
+# NI-DAQ 硬體擷取（由 nidaq_capture.py 使用；另需安裝 NI-DAQmx 驅動程式）
+nidaqmx>=0.9
+
+# 小波去噪（選配；未安裝時自動停用該選項）
+PyWavelets>=1.4
