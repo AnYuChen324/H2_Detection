@@ -1325,7 +1325,7 @@ if __name__ == "__main__":
         band_config_path=BAND_CONFIG_JSON,feature_extraction_config_path=(FEATURE_EXTRACTION_CONFIG_JSON),
         baseline_json_path=BASELINE_JSON,
         save_base_path=SAVE_BASE_PATH,
-        save_suffix="_transition_disturbance_final",
+        save_suffix="_cusum_v2",
         description_text=(
             "Fixed normal baseline; "
             "transition + disturbance training; "
