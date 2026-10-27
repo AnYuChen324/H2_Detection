@@ -208,7 +208,6 @@ import gc
 import pandas as pd
 import numpy as np
 import json
-from dataclasses import dataclass
 import warnings
 
 warnings.simplefilter("ignore", pd.errors.PerformanceWarning)
@@ -238,6 +237,8 @@ from shared_feature_utils import (
     validate_feature_stage_requirements,
     configure_temporal_band_names,
     validate_baseline_source_isolation,
+    load_band_config,
+    SIGNAL_RMS_MIN,
 )
 
 
@@ -245,58 +246,71 @@ from shared_feature_utils import (
 # Baseline 資料隔離設定
 # ============================================================
 # Disturbance 不應與建立固定 Baseline 的正常 TDMS 重複。
-# True：發現相同 TDMS 路徑或 record_id 時直接停止。
+# True：發現相同 TDMS 路徑、record_id 或檔案內容時直接停止
 # False：只顯示警告，僅供舊資料流程測試。
 STRICT_BASELINE_ISOLATION = True
 
 
 # ============================================================
-# 讀取並驗證正式 Band Config
+# 已知有問題、暫時排除的單支 TDMS（寫清楚原因；確認資料後再移除）
 # ============================================================
-def load_band_config(band_config_json):
+EXCLUDED_FILES = {
+    "leak0_0ml_4bar_straight0cm_20260624_153744_dual_2ch":  "adjacent_vibration/detection01：manifest 位置錯置（檔名早於 session 開始）",
+    "leak0_0ml_4bar_left90cm_20260624_162214_dual_2ch":     "adjacent_vibration/detection08：manifest 位置錯置（檔名早於 session 開始）",
+    "leak0_0ml_4bar_straight50cm_20260702_113640_dual_2ch": "adjacent_vibration/detection11：manifest 位置錯置（檔名早於 session 開始）",
+    "leak0_0ml_4bar_straight50cm_20260702_113937_dual_2ch": "adjacent_vibration/detection14：manifest 位置錯置（檔名早於 session 開始）",
+    "leak0_0ml_4bar_straight0cm_20260707_162817_dual_2ch":  "adjacent_vibration/detection25：manifest 位置錯置（檔名早於 session 開始）",
+    "leak0_0ml_4bar_straight0cm_20260707_162931_dual_2ch":  "adjacent_vibration/detection26：manifest 位置錯置（檔名早於 session 開始）",
+    "leak0_0ml_4bar_left90cm_20260624_161924_dual_2ch":     "cable_pull/detection08：manifest 位置錯置（檔名早於 session 開始）",
+    "leak0_0ml_4bar_straight50cm_20260624_160109_dual_2ch": "tap_pipe/detection06：manifest 位置錯置（檔名早於 session 開始）",
+    "leak0_0ml_4bar_straight0cm_20260707_152721_dual_2ch":  "tap_pipe/detection24：manifest 位置錯置（檔名早於 session 開始）",
+    "leak0_0ml_4bar_straight50cm_20260702_104904_dual_2ch": "touch_pipe/detection10：manifest 位置錯置（檔名早於 session 開始）",
+    "leak0_0ml_4bar_straight50cm_20260702_105352_dual_2ch": "touch_pipe/detection15：manifest 位置錯置（檔名早於 session 開始）",
+}
+
+
+# ============================================================
+# 內容重複檢查（比檔案內容，不比檔名；改過檔名的複本也抓得到）
+# ============================================================
+def check_content_duplicates(file_specs, baseline_paths, strict=True):
     """
-    讀取正式 band_config_step2.json。
-
-    Disturbance 正式特徵工程只接受：
-    1. schema_name = band_config
-    2. schema_version = 2
-    3. schema_status = final
-    4. leak_focused_bands 不可為空
-    5. offband_bands 不可為空
+    1. Disturbance 檔案彼此內容相同 → 同一段訊號被算兩次
+    2. Disturbance 跟建立 baseline 的正常檔內容相同 → baseline 資料洩漏
+    同一 session 的多支 TDMS 共用 record_id，所以回報時用檔名。
     """
-    # 轉成 Path 物件
-    band_config_json = Path(band_config_json)
-    # 讀取 band 資料
-    payload = json.loads(band_config_json.read_text(encoding="utf-8"))
+    seen = {}             # 指紋 → 第一支出現的檔名
+    dup_pairs = []        # disturbance 內部重複
+    baseline_hits = []    # 和 baseline 來源檔內容相同
 
-    # 檢查
-    if payload.get("schema_name") != "band_config":
-        raise ValueError(f"band_config 的 schema_name 必須是 band_config，目前檔案：{band_config_json}")
+    for spec in file_specs:
+        name = Path(spec["filepath"]).stem
+        h = calculate_file_sha256(spec["filepath"])
+        if h in seen:
+            dup_pairs.append((seen[h], name))
+        else:
+            seen[h] = name
 
-    if payload.get("schema_version") != 2:
-        raise ValueError(f"band_config 的 schema_version 必須是 2，目前值：{payload.get('schema_version')}")
+    missing_baseline = 0
+    for bp in baseline_paths:
+        if not Path(bp).exists():
+            missing_baseline += 1
+            continue
+        h = calculate_file_sha256(bp)
+        if h in seen:
+            baseline_hits.append((Path(bp).stem, seen[h]))
 
-    if payload.get("schema_status") != "final":
-        raise ValueError(f"Disturbance 正式特徵工程只能讀取 schema_status=final 的 band config，目前值：{payload.get('schema_status')}")
-    
-    # 四種頻段：如果 JSON 裡有這個欄位，就讀它, 如果沒有，就先給空清單，避免直接報錯
-    leak_focused_bands = payload.get("leak_focused_bands",[],)
-    resonance_bands = payload.get("resonance_bands",[],)
-    offband_bands = payload.get("offband_bands",[],)
-    temporal_band_names = payload.get("temporal_band_names",[],)
-    
-    if not leak_focused_bands:
-        raise ValueError("正式 band config 的 leak_focused_bands 不可為空")
+    if missing_baseline:
+        print(f"⚠️ baseline 來源檔有 {missing_baseline} 支找不到，這些無法比對內容")
 
-    if not offband_bands:
-        raise ValueError("Disturbance 抗干擾規則需要 Offband，正式 band config 的 offband_bands 不可為空")
-        
-    return BandConfig(
-            leak_focused_bands=leak_focused_bands,
-            resonance_bands=resonance_bands,
-            offband_bands=offband_bands,
-            temporal_band_names=set(temporal_band_names),
-        )
+    if not dup_pairs and not baseline_hits:
+        print(f"✅ 內容重複檢查通過：{len(seen)} 支 disturbance 彼此不重複，也沒有跟 baseline 檔內容相同")
+        return
+
+    msg = (f"Disturbance 內容重複 {len(dup_pairs)} 組：{dup_pairs[:5]}；"
+           f"與 baseline 內容相同 {len(baseline_hits)} 組：{baseline_hits[:5]}")
+    if strict:
+        raise ValueError(msg)
+    print("⚠️ " + msg)
 
 
 # ============================================================
@@ -317,7 +331,7 @@ def normalize_filename_stem(x):
     '''
     if pd.isna(x):
         return ""
-    return Path(str(x)).stem
+    return PureWindowsPath(str(x)).stem
 
 
 # 計算算兩個時間區間到底重疊了幾秒
@@ -331,8 +345,6 @@ def overlap_seconds(a_start, a_end, b_start, b_end):
     return max(0.0, min(a_end, b_end) - max(a_start, b_start))
 
 
-
-
 # ============================================================
 # 掃描 disturbance 資料夾
 # 結構範例：
@@ -344,139 +356,278 @@ def overlap_seconds(a_start, a_end, b_start, b_end):
 #       disturbance_events_*.csv
 # ============================================================
 def collect_disturbance_sessions(root_dir: Path):
+    """
+    掃描每個 disturbance session，配對 TDMS、manifest、event。
+    所有問題先收集起來，最後一次列出並停止（人工下載漏檔通常不只一個，方便一次補齊）。
+    """
     file_specs = []       # 後面萃取特徵時要處理哪些 TDMS 檔
     manifest_rows = []    # 每個 TDMS 對應的時間資訊與 metadata
     event_rows = []       # 每個干擾事件的標註資訊
+    problems = []         # 收集所有問題，最後一次報錯
+    session_dirs = {}     # session_id → 第一次出現的資料夾，用來檢查跨資料夾重複
+    gap_info = []         # 每個 session 檔案之間的時間間隙，只供參考
+    excluded = []         # 依 EXCLUDED_FILES 排除的檔案
 
-    root_dir = Path(root_dir)    # root_dir 轉成 Path
+    # 路徑統一轉成 Path 物件，並確認資料夾真的存在
+    root_dir = Path(root_dir)
+    if not root_dir.is_dir():
+        raise FileNotFoundError(f"找不到 disturbance 根目錄：{root_dir}")
 
-    # 第一層迴圈：掃干擾種類資料夾 -> adjacent_vibration / cable_pull / tap_pipe / touch_pipe
-    for disturbance_group_dir in sorted([p for p in root_dir.iterdir() if p.is_dir()]):
+    # 定義 manifest 與 event 必要欄位
+    manifest_need = ["session_id", "capture_start_elapsed_sec", "capture_end_elapsed_sec", "capture_mid_elapsed_sec"]
+    # 每個干擾事件必須知道：幾秒開始、幾秒結束、干擾類型(敲擊、震動、拉扯)、干擾強度
+    event_need = ["start_elapsed_sec", "end_elapsed_sec", "disturbance_type", "disturbance_strength"]
+
+    # 第一層：干擾種類資料夾 -> adjacent_vibration / cable_pull / tap_pipe / touch_pipe
+    for disturbance_group_dir in sorted(p for p in root_dir.iterdir() if p.is_dir()):
+        # 取得該類別的名稱
         disturbance_group = disturbance_group_dir.name
-        
-        # 第二層迴圈：掃每次收集的子資料夾 -> disturbance01 / disturbance02 / disturbance03
-        for disturbance_dir in sorted([p for p in disturbance_group_dir.iterdir() if p.is_dir()]):
+
+        # 第二層：每次收集的子資料夾 -> disturbance01 / disturbance02 ...
+        for disturbance_dir in sorted(p for p in disturbance_group_dir.iterdir() if p.is_dir()):
             disturbance_id = disturbance_dir.name
-            
-            # 找這個 disturbance session 對應的兩份標註檔：
-            # 1. dual_session_manifest：每筆 TDMS 在整個 session 裡的時間位置
-            # 2. disturbance_events：session 裡每段干擾事件的開始/結束時間
-            manifest_files = sorted(                                            # 記每個 TDMS 的時間區間
+            where = f"{disturbance_group}/{disturbance_id}"
+
+            # ---- 尋找 manifest / event 檔：每個 session 必須剛好各 1 份 ----
+            manifest_files = sorted(
                 list(disturbance_dir.glob("dual_session_manifest_*.csv")) +
                 list(disturbance_dir.glob("transition_dual_manifest_*.csv"))
             )
-            
-            event_files = sorted(                                               # 記每次干擾開始/結束時間
+            event_files = sorted(
                 list(disturbance_dir.glob("disturbance_events_*.csv")) +
                 list(disturbance_dir.glob("transition_dual_disturbance_events_*.csv"))
             )
-
-            # 如果找不到，就跳過
-            if not manifest_files:
-                print(f"[skip] 找不到 dual_session_manifest: {disturbance_dir}")
+            
+            # manifest, event CSV 必須剛好一份
+            if len(manifest_files) != 1:
+                problems.append(f"{where}：manifest 應該剛好 1 份，目前 {len(manifest_files)} 份 {[p.name for p in manifest_files]}")
                 continue
-            if not event_files:
-                print(f"[skip] 找不到 disturbance_events: {disturbance_dir}")
+            if len(event_files) != 1:
+                problems.append(f"{where}：event 檔應該剛好 1 份，目前 {len(event_files)} 份 {[p.name for p in event_files]}")
                 continue
-
-            # 取第一個 manifest 和 event 檔(通常一個 session 裡應該只有一份對應的 manifest 跟 event csv)
+            
+            # 讀取兩份 CSV 成 DataFrame
             manifest_path = manifest_files[0]
             event_path = event_files[0]
-
             df_manifest = pd.read_csv(manifest_path)
             df_events = pd.read_csv(event_path)
 
-            # 如果 manifest 是空的，就跳過
+            # ---- 檢查 manifest 結構 ----
             if df_manifest.empty:
-                print(f"[skip] manifest 為空: {manifest_path}")
+                problems.append(f"{where}：manifest 是空的")
                 continue
-            # 取得 session_id
-            session_id = str(df_manifest["session_id"].iloc[0])
+            # 檢查必要欄位是否缺失
+            miss = [c for c in manifest_need if c not in df_manifest.columns]
+            if miss:
+                problems.append(f"{where}：manifest 缺少欄位 {miss}")
+                continue
+            # 從多種可能欄位名稱中，找出哪一欄存有 TDMS 檔名
+            file_col = next((c for c in ["dual_file", "merged_file", "tdms_file", "filename"] if c in df_manifest.columns), None)
+            if file_col is None:
+                problems.append(f"{where}：manifest 缺少檔名欄位，現有欄位 {df_manifest.columns.tolist()}")
+                continue
+            
+            # 排除已知有問題的單支檔：同時從 manifest 拿掉，後面的時間檢查才不會再算到它
+            row_stems = df_manifest[file_col].map(lambda x: PureWindowsPath(str(x)).stem)
+            drop_mask = row_stems.isin(EXCLUDED_FILES)
+            for s in row_stems[drop_mask]:
+                excluded.append((where, s, EXCLUDED_FILES[s]))
+            df_manifest = df_manifest.loc[~drop_mask].reset_index(drop=True)
+            if df_manifest.empty:
+                problems.append(f"{where}：排除檔案後 manifest 沒有任何資料")
+                continue
 
-            # 決定 baseline_end_sec
-            # 如果有干擾事件，就把第一個干擾開始時間當成 baseline 結束點
-            # 如果沒有干擾事件，就退而求其次，把整段資料的最後時間當 baseline_end_sec
+            # 驗證 session ID 唯一性：manifest 內只能有一個，而且不能和別的資料夾重複
+            sids = df_manifest["session_id"].astype(str).str.strip().unique()
+            if len(sids) != 1:
+                problems.append(f"{where}：manifest 裡有 {len(sids)} 個不同的 session_id {list(sids)[:5]}")
+                continue
+            # 取得這次實驗的唯一 ID
+            session_id = sids[0]
+            # 若這個 ID 已在其他資料夾出現，代表兩個不同資料夾會被後續程式串成同一條時間序列，所以必須停止。
+            if session_id in session_dirs:
+                problems.append(f"session_id「{session_id}」重複出現在 {session_dirs[session_id]} 和 {where}，會被串成同一條時間序列")
+                continue
+            session_dirs[session_id] = where
+
+            # 檢查 TDMS 的全域時間範圍:manifest 時間必須是數字，而且結束 > 開始
+            cap_start = pd.to_numeric(df_manifest["capture_start_elapsed_sec"], errors="coerce")
+            cap_end = pd.to_numeric(df_manifest["capture_end_elapsed_sec"], errors="coerce")
+            cap_mid = pd.to_numeric(df_manifest["capture_mid_elapsed_sec"], errors="coerce")
+            # 標示不合法的資料列：時間是空值；時間是文字；結束時間小於或等於開始時間。
+            bad_time = cap_start.isna() | cap_end.isna() | cap_mid.isna() | (cap_end <= cap_start)
+            # 只要有任何一列不合法，整個 session 不採用
+            if bad_time.any():
+                problems.append(f"{where}：manifest 有 {int(bad_time.sum())} 列時間是空值、非數字，或結束 ≤ 開始")
+                continue
+
+            # 確認 TDMS 檔案沒有時間重疊:同一 session 內的檔案時間不可互相重疊（重疊會讓全域時間重複、排序錯亂）
+            order = cap_start.sort_values().index                   # 依每支檔案的開始時間排序，取得原始列索引順序
+            # 依排序後順序取出開始、結束時間，轉成 NumPy 陣列
+            s_sorted = cap_start.loc[order].to_numpy()
+            e_sorted = cap_end.loc[order].to_numpy()
+            # 比較相鄰檔案：若後一支在前一支結束前就開始，代表時間重疊。
+            overlap = s_sorted[1:] < e_sorted[:-1] - 1e-3
+            if overlap.any():
+                problems.append(f"{where}：有 {int(overlap.sum())} 處檔案時間互相重疊")
+                continue
+            # 記錄檔案間的時間缺口：計算相鄰 TDMS 中間是否有空白時間
+            gaps = s_sorted[1:] - e_sorted[:-1]
+            n_gap = int((gaps > 1e-3).sum())
+            # 有缺口不立刻停止，只記錄：哪一個 session；有幾個缺口；最大缺口多少秒。
+            if n_gap:
+                gap_info.append((session_id, n_gap, float(gaps.max())))
+
+            # ---- 檢查 event CSV（event 檔存在但沒有內容 = 這次沒有干擾，合法） ----
+            miss = [c for c in event_need if c not in df_events.columns]
+            if miss:      # 即使沒有干擾事件，event CSV 也應保有欄位標題
+                problems.append(f"{where}：event 檔缺少欄位 {miss}")
+                continue
+            df_events = df_events.copy()
+            # event CSV 沒有資料列是合法的，代表這次 session 沒有任何干擾事件，可視為乾淨的無洩漏正常資料
+            if df_events.empty:
+                print(f"ℹ️ {where}：event 檔沒有任何干擾事件，整段視為 clean_normal")
+            else:
+                # 若有干擾事件，就檢查它們的開始／結束時間是否合法。
+                ev_start = pd.to_numeric(df_events["start_elapsed_sec"], errors="coerce")
+                ev_end = pd.to_numeric(df_events["end_elapsed_sec"], errors="coerce")
+                bad_ev = ev_start.isna() | ev_end.isna() | (ev_end <= ev_start)
+                if bad_ev.any():
+                    problems.append(f"{where}：event 有 {int(bad_ev.sum())} 筆時間是空值、非數字，或結束 ≤ 開始")
+                    continue
+                # 將驗證後的數值時間寫回 DataFrame，確保後續使用的是數字型別
+                df_events["start_elapsed_sec"] = ev_start
+                df_events["end_elapsed_sec"] = ev_end
+
+            # ---- TDMS 配對：manifest 列的每支都要找到；資料夾裡多出來的也要列出 ----
+            row_paths = []         # manifest 每一列對到的檔案路徑
+            listed_stems = []      # 成功配對的檔名主體
+            missing_tdms = []      # 找不到的檔案名稱
+            # 逐一讀取 manifest 中記載的 TDMS 名稱
+            for name in df_manifest[file_col]:
+                # 取出檔名
+                dual_file_name = PureWindowsPath(str(name)).name
+                # 在目前 session 資料夾尋找該檔案
+                tdms_path = disturbance_dir / dual_file_name
+                # 若 manifest 裡副檔名格式不一致，再嘗試以檔名主體加 .tdms 尋找
+                if not tdms_path.exists():
+                    alt = disturbance_dir / f"{Path(dual_file_name).stem}.tdms"
+                    # 替代檔也不存在，就標成找不到
+                    tdms_path = alt if alt.exists() else None
+                    
+                # 每一列最後都保留一個位置；若找不到就是 None，最後再統一報錯
+                if tdms_path is None:
+                    missing_tdms.append(dual_file_name)
+                else:
+                    listed_stems.append(tdms_path.stem)
+                row_paths.append(tdms_path)
+
+            # 檢查 manifest 和資料夾檔案是否一一對應
+            if missing_tdms:
+                problems.append(f"{where}：manifest 列了但找不到 {len(missing_tdms)} 支 TDMS {missing_tdms[:5]}")
+                continue
+            # 找出 manifest 是否重複列同一支 TDMS
+            dup_stems = sorted({s for s in listed_stems if listed_stems.count(s) > 1})
+            # 同一檔案若被列兩次，會讓訊號被重複算進特徵工程
+            if dup_stems:
+                problems.append(f"{where}：manifest 同一支 TDMS 列了不只一次 {dup_stems[:5]}")
+                continue
+            # 找出資料夾中存在、但 manifest 沒有列出的 TDMS(資料夾裡被排除的那支 TDMS 不能被當成「多出來的檔案」。)
+            extra_tdms = sorted({p.stem for p in disturbance_dir.glob("*.tdms")} - set(listed_stems) - set(EXCLUDED_FILES))
+            # 不允許來源不明的 TDMS 被忽略或偷偷進入分析
+            if extra_tdms:
+                problems.append(f"{where}：資料夾有 {len(extra_tdms)} 支 TDMS 不在 manifest 裡 {extra_tdms[:5]}")
+                continue
+            
+            # 檔名裡的錄製時間，依 manifest 時間排序後必須是遞增的（抓「放錯位置但剛好沒重疊」的檔案）
+            ts = pd.to_datetime(
+                pd.Series(listed_stems).str.extract(r"_(\d{8}_\d{6})_")[0],
+                format="%Y%m%d_%H%M%S", errors="coerce",
+            )
+            if ts.notna().all():
+                ts_sorted = ts.iloc[cap_start.argsort().to_numpy()].reset_index(drop=True)
+                n_back = int((ts_sorted.diff().dt.total_seconds() < 0).sum())
+                if n_back:
+                    problems.append(f"{where}：有 {n_back} 支檔的檔名時間比前一支還早，manifest 位置可能錯置")
+                    continue
+            else:
+                print(f"ℹ️ {where}：有檔名解析不出錄製時間，跳過時間順序檢查")
+
+            # ---- 全部檢查通過，才收進結果，找出第一個干擾發生前的位置 ----
+            # baseline_end_sec：有干擾事件就用第一個事件開始時間；沒有就用整段最後時間（只當 metadata，不參與 baseline 計算）
             if not df_events.empty:
                 baseline_end_sec = float(df_events["start_elapsed_sec"].min())
             else:
-                baseline_end_sec = float(df_manifest["capture_end_elapsed_sec"].max())
+                baseline_end_sec = float(cap_end.max())
 
-            # 收集 events 資料原本事件表只有事件本身資訊，這裡把它補成「知道自己屬於哪個 session、哪種干擾、哪一次收集」。
-            df_events = df_events.copy()
+            # 補上 session 與干擾條件資訊:屬於哪個 session；干擾大類；第幾次實驗。
             df_events["session_id"] = session_id
             df_events["disturbance_group"] = disturbance_group
             df_events["disturbance_id"] = disturbance_id
             event_rows.append(df_events)
 
-            # 根據 dual_session_manifest 的每一列，整理每筆 TDMS 的 metadata
-            # 先決定 manifest 裡哪個欄位存的是 TDMS 檔名
-            file_col = None
-            for candidate in ["dual_file", "merged_file", "tdms_file", "filename"]:
-                if candidate in df_manifest.columns:
-                    file_col = candidate
-                    break
-            
-            if file_col is None:
-                raise ValueError(f"manifest 缺少可用的檔名欄位，現有欄位: {df_manifest.columns.tolist()}")
-            
-            # 根據 dual_session_manifest 的每一列，整理每筆 TDMS 的 metadata
-            for row in df_manifest.itertuples(index=False):
-                dual_file_name = PureWindowsPath(str(getattr(row, file_col))).name
-                tdms_path = disturbance_dir / dual_file_name
-                            
-                # 如果組出來的檔案不存在，就再試一次備案
-                if not tdms_path.exists():
-                    alt = disturbance_dir / f"{Path(dual_file_name).stem}.tdms"
-                    if alt.exists():
-                        tdms_path = alt
-                    else:
-                        print(f"[skip] 找不到 TDMS: {dual_file_name} @ {disturbance_dir}")
-                        continue
-
-                # 建立 file_specs
+            # 建立後續特徵工程需要的檔案清單
+            for i, tdms_path in enumerate(row_paths):
+                # 將檔案路徑與 record_id 放進特徵工程清單
                 file_specs.append({
                     "filepath": str(tdms_path),
-                    # 整個 disturbance session 共用同一個 record_id，讓 CUSUM 與 temporal 特徵沿完整 session 時間軸計算。
-                    # rel/z 使用固定 site baseline，不依賴 session 前段。
                     "record_id": session_id,
                 })
-
-                # 建立 manifest_rows:把每筆 TDMS 需要的 metadata 整理成一列表格
+                # 將每支 TDMS 的完整資訊加入 manifest 總表。
                 manifest_rows.append({
-                    "session_id": session_id,                                              # 這筆 TDMS 屬於哪一個收集 session
-                    "record_id": session_id,                                               # 同一個 session 內所有 TDMS 共用同一個 record_id，後面 rel_/z_/cusum 才會沿同一條時間序列建立
-                    "disturbance_group": disturbance_group,                                # 這筆 TDMS 屬於哪一種干擾大類
-                    "disturbance_id": disturbance_id,                                      # 這筆 TDMS 屬於哪一次干擾 session
-                    "filename_stem": tdms_path.stem,                                       # TDMS 檔名去掉副檔名後的主體
-                    "tdms_file": str(tdms_path),                                           # 這筆 TDMS 的完整路徑字串
-                    "capture_start_elapsed_sec": float(row.capture_start_elapsed_sec),     # 這筆 TDMS 在整個 session 時間軸上的開始時間
-                    "capture_end_elapsed_sec": float(row.capture_end_elapsed_sec),         # 這筆 TDMS 在整個 session 時間軸上的結束時間
-                    "capture_mid_elapsed_sec": float(row.capture_mid_elapsed_sec),         # 這筆 TDMS 在整個 session 時間軸上的中間時間
-                    "baseline_end_sec": baseline_end_sec,                                  # baseline 區段到哪一秒為止(baseline以第一段為主)
-                    "label": 0,                                                            # 這筆資料的真實 leak label
-                    "leak_status": "leak0",                                                # 這筆資料的洩漏狀態是正常、無洩漏
-                    "disturbance_session_manifest": str(manifest_path),                    # 這筆 TDMS 是從哪一份 dual_session_manifest.csv 來的
-                    "disturbance_event_csv": str(event_path),                              # 這筆 TDMS 對應的是哪一份 disturbance_events.csv
+                    "session_id": session_id,                                      # 屬於哪一個收集 session
+                    "record_id": session_id,                                       # 同一 session 共用 record_id
+                    "disturbance_group": disturbance_group,                        # 干擾大類
+                    "disturbance_id": disturbance_id,                              # 哪一次干擾收集
+                    "filename_stem": tdms_path.stem,                               # TDMS 檔名主體
+                    "tdms_file": str(tdms_path),                                   # TDMS 完整路徑
+                    # 全域時間位置
+                    "capture_start_elapsed_sec": float(cap_start.iloc[i]),         # 在 session 時間軸上的開始時間
+                    "capture_end_elapsed_sec": float(cap_end.iloc[i]),             # 在 session 時間軸上的結束時間
+                    "capture_mid_elapsed_sec": float(cap_mid.iloc[i]),             # 在 session 時間軸上的中間時間
+                    "baseline_end_sec": baseline_end_sec,                          # 第一個干擾開始前的時間點（只當 metadata）
+                    "label": 0,                                                    # 真實 leak label：全部是無洩漏
+                    "leak_status": "leak0",
+                    "disturbance_session_manifest": str(manifest_path),
+                    "disturbance_event_csv": str(event_path),
                 })
-    # 最後檢查是不是完全沒找到任何 TDMS
+                
+    matched = {s for _, s, _ in excluded}
+    not_found = sorted(set(EXCLUDED_FILES) - matched)
+    if not_found:
+        print(f"⚠️ EXCLUDED_FILES 有 {len(not_found)} 支在 manifest 裡找不到（檔名可能打錯）：{not_found}")
+
+    if excluded:
+        print(f"⚠️ 依 EXCLUDED_FILES 排除 {len(excluded)} 支 TDMS：")
+        for w, s, reason in excluded:
+            print(f"   - {w}：{s}")
+            
+    # ---- 一次列出所有問題 ----
+    if problems:
+        raise ValueError(
+            f"Disturbance 資料有 {len(problems)} 個問題，請先修正：\n  - " + "\n  - ".join(problems)
+        )
+    # 如果最後完全沒有可用 TDMS，就停止
     if not file_specs:
         raise ValueError("找不到任何可處理的 disturbance TDMS")
+    # 檔案之間有時間間隙：CUSUM/temporal 會把間隙前後的窗當成相鄰，只提示不停止
+    if gap_info:
+        worst = max(gap_info, key=lambda x: x[2])
+        print(f"ℹ️ {len(gap_info)} 個 session 的檔案之間有時間間隙；最大間隙 {worst[2]:.3f} 秒（{worst[0]}）")
+    # 把每支 TDMS 的 manifest 資訊整理成 DataFrame
+    df_manifest_all = pd.DataFrame(manifest_rows)
+    # 把所有 session 的事件資料合併成一張表；若所有 session 都沒有事件，則回傳空表
+    df_events_all = pd.concat(event_rows, ignore_index=True) if event_rows else pd.DataFrame()
 
-    # 最後把資料整理成 DataFrame
-    df_manifest_all = pd.DataFrame(manifest_rows)    # 每筆 TDMS 一列
-    df_events_all = pd.concat(event_rows, ignore_index=True) if event_rows else pd.DataFrame()    # 每個干擾事件一列
-
-    # file_specs:給特徵萃取函式用,告訴它要處理哪些 TDMS 檔
-    # df_manifest_all:給後面 merge 用,把每筆 TDMS 的 session 時間資訊帶進 features
-    # df_events_all:給後面標註用,判斷每個 window 有沒有落在干擾區間內
+    print(f"✅ Disturbance session 檢查通過：{len(session_dirs)} 個 session、{len(file_specs)} 支 TDMS")
     return file_specs, df_manifest_all, df_events_all
 
 
 # ============================================================
 # 依據 window 與干擾事件時間區間的重疊關係，把每個 window 標成 clean_normal 或 disturbance_negative
-# 這裡假設：
-# - features 的 t_start / t_ref 是「檔內局部時間」
-# - manifest 的 capture_*_elapsed_sec 是「整個 session 的全域時間」
+# 注意：呼叫前 t_start 必須已經換成 session 全域時間
+# （t_start = capture_start_elapsed_sec + 檔內局部時間），
+# 才能和 event 的 start/end_elapsed_sec 放在同一條時間軸比較。
 # ============================================================
 def attach_window_labels_from_disturbance_meta(
     df_windows: pd.DataFrame,    # 特徵表，每一列代表一個 window, 裡面至少要有：session_id,t_start
@@ -489,19 +640,24 @@ def attach_window_labels_from_disturbance_meta(
      - 如果沒有，就標成：clean_normal
     '''
     df = df_windows.copy()
-
-    disturbance_flag = []
-    disturbance_type = []
-    disturbance_strength = []
-    overlap_sec_list = []
-    overlap_ratio_list = []
-    eval_class = []
+    
+    # 建立輸出欄位的暫存清單
+    disturbance_flag = []         # 是否碰到干擾，1 是、0 否
+    disturbance_type = []         # 重疊最多的干擾類型
+    disturbance_strength = []     # 重疊最多事件的強度
+    overlap_sec_list = []         # 與事件重疊幾秒
+    overlap_ratio_list = []       # 重疊秒數除以 window 長度
+    eval_class = []               # clean_normal 或 disturbance_negative
 
     # 先把 event 依 session 分組:把所有干擾事件依 session_id 分好
-    event_map = {
-        sid: sub.sort_values("start_elapsed_sec").copy()
-        for sid, sub in df_events.groupby("session_id")
-    }
+    if df_events.empty or "session_id" not in df_events.columns:
+        event_map = {}    # 完全沒有干擾事件：所有窗都是 clean_normal
+    else:
+        # 將事件依 session 分組
+        event_map = {
+            sid: sub.sort_values("start_elapsed_sec").copy()
+            for sid, sub in df_events.groupby("session_id")
+        }
     
     # 開始逐個 window 處理
     for row in df.itertuples(index=False):
@@ -519,11 +675,13 @@ def attach_window_labels_from_disturbance_meta(
         session_events = event_map.get(sid, None)    # 從剛剛那個 event_map 裡，取出這個 window 所屬 session 的所有干擾事件。
         # 如果這個 session 有事件，就逐一比較
         if session_events is not None and not session_events.empty:
+            # 逐一檢查每個事件
             for ev in session_events.itertuples(index=False):
                 # 計算這個 window 和某個事件重疊多少秒
                 ov = overlap_seconds(
                     w_start, w_end,
-                    float(ev.start_elapsed_sec), float(ev.end_elapsed_sec),
+                    float(ev.start_elapsed_sec), 
+                    float(ev.end_elapsed_sec),
                 )
                 # 只保留重疊最多的那個事件,這個 window 會被歸到「與它重疊最多的那個干擾事件」
                 if ov > best_overlap:
@@ -531,7 +689,7 @@ def attach_window_labels_from_disturbance_meta(
                     best_type = str(ev.disturbance_type)
                     best_strength = str(ev.disturbance_strength)
 
-        # 判斷這個 window 有沒有被視為干擾窗,只要有任何重疊，就算干擾窗
+        # 將 window 判定為干擾或乾淨正常:判斷這個 window 有沒有被視為干擾窗,只要有任何重疊，就算干擾窗
         flag = 1 if best_overlap > 0 else 0
         ratio = best_overlap / window_sec if window_sec > 0 else 0.0     # 算重疊比例
 
@@ -541,7 +699,8 @@ def attach_window_labels_from_disturbance_meta(
         disturbance_strength.append(best_strength if flag else "")
         overlap_sec_list.append(best_overlap)
         overlap_ratio_list.append(ratio)
-        eval_class.append("disturbance_negative" if flag else "clean_normal")    # 產生最終分類:disturbance_negative -> 有干擾，但不是 leak，仍屬負樣本, clean_normal -> 完全正常、沒有干擾的負樣本
+        # 產生最終分類:disturbance_negative -> 有干擾，但不是 leak，仍屬負樣本, clean_normal -> 完全正常、沒有干擾的負樣本
+        eval_class.append("disturbance_negative" if flag else "clean_normal")    
     
     # 最後把結果寫回 DataFrame
     df["label"] = 0                                      # 這整批資料在 leak / non-leak 的真實標籤上都屬於正常(label=0)；干擾資訊另外放在 disturbance_flag / eval_class
@@ -556,80 +715,23 @@ def attach_window_labels_from_disturbance_meta(
 
 
 # ============================================================
-# 從整合好的資料中挑出 raw 特徵
-# ============================================================
-def select_all_raw_feature_columns(df):    # 整合好的特徵 DataFrame，裡面同時混著 metadata 欄位、原始特徵欄位、以及後面衍生出來的 rel_/z_/cusum_ 等欄位）
-    # 建立要排除的欄位    
-    exclude_cols = {
-        # 識別欄位
-        "filename",
-        "filename_stem",
-        "record_id",
-        "session_id",
-        "disturbance_group",
-        "disturbance_id",
-        "tdms_file",
-        # 時間欄位
-        "t_start_local",
-        "t_ref_local",
-        "t_start",
-        "t_ref",
-        "capture_start_elapsed_sec",
-        "capture_end_elapsed_sec",
-        "capture_mid_elapsed_sec",
-        "baseline_end_sec",
-        # 標註/標籤欄位
-        "label",
-        "disturbance_flag",
-        "disturbance_type",
-        "disturbance_strength",
-        "overlap_sec",
-        "overlap_ratio",
-        "eval_class",
-        "leak_status",
-        # manifest / events csv 路徑
-        "disturbance_session_manifest",
-        "disturbance_event_csv",
-    }
-
-    # 列出所有「衍生特徵」的欄位名稱前綴
-    derived_prefixes = (
-        "rel_",        # 相對 baseline 的偏移量
-        "z_",          # 標準化後的偏移量
-        "cusum_",      # 累積和
-        "delta_",      # 差分
-        "local_",      # 局部 rolling 相關
-        "rolling_"     # rolling 統計量
-    )
-
-    # 逐一掃過 df.columns 所有欄位名稱, 同時要滿足三個條件才會被留下來
-    raw_cols = [
-        c for c in df.columns
-        if (
-            c not in exclude_cols      # 這個欄位不在剛剛定義的排除單裡
-            and pd.api.types.is_numeric_dtype(df[c])    # 資料型態是數值型
-            and not c.startswith(derived_prefixes)    # 欄位名稱不是以 rel_、z_、cusum_、delta_、local_、rolling_ 這六種前綴開頭的(排除掉所有衍生特徵)
-        )
-    ]
-    return raw_cols
-
-
-# ============================================================
 # 主流程
 # ============================================================
 def build_disturbance_inference_feature_csv(
     root_dir,                         # 干擾資料的根目錄
-    band_config_json,                 # Step2 產生的頻段設定檔
-    feature_extraction_config_path,
-    baseline_json,
-    feature_config_json,              # Step2 產生的特徵設定檔
+    band_config_json,                 # Step2 定案的主頻帶、共振頻帶、offband 設定
+    feature_extraction_config_path,   # 切窗、取樣率、PSD 等特徵抽取規則
+    baseline_json,                    # 固定正常 baseline，保存正常特徵的 mean / std 與來源資訊
+    feature_config_json,              # Step2 選出的模型特徵與 Feature Execution Plan
     output_csv,                       # 輸出的推論特徵表路徑
-    cache_dir,                        # 特徵計算的快取資料夾路徑
-    split_name="disturbance_infer",   # 這批資料的識別名稱
+    cache_dir,                        # TDMS 特徵計算結果的快取位置
+    split_name="disturbance_infer",   # 快取與輸出識別名稱
     n_jobs=2,                         # 平行處理的工作數
-    require_final_baseline=False,
+    require_final_baseline=False,     # 是否強制 baseline 必須標記為 final
 ):
-    '''把 disturbance 資料夾裡的很多 TDMS + 干擾標註 csv，整理成一份可以拿去模型推論的特徵表'''
+    """將 disturbance TDMS、session manifest 與干擾事件標註，
+        依 Step2 已定案的頻帶、固定 baseline 與特徵計畫，
+        轉成可供模型與抗干擾規則評估的逐窗特徵表。"""
     # 把路徑轉成 Path
     root_dir = Path(root_dir)
     band_config_json = Path(band_config_json)
@@ -639,11 +741,15 @@ def build_disturbance_inference_feature_csv(
     feature_extraction_config_path = Path(feature_extraction_config_path)
     baseline_json = Path(baseline_json)
 
-    # 讀 Step2 輸出的設定檔
-    band_config = load_band_config(band_config_json)     # band_config 是一個 BandConfig dataclass，裡面裝著洩漏頻帶、共振頻帶、offband 頻帶
+    # 讀進 Step2 輸出的設定檔
+    # 讀取正式頻帶設定，並強制兩件事：頻帶設定必須是 final + 必須有 offband
+    band_config = load_band_config(band_config_json, expected_status="final", require_offband=True)     # 正式頻帶：必須是 final，而且要有 offband
+    # 讀取共同的特徵抽取規則，例如：取樣率,視窗長度,Welch／PSD 的 nperseg,特徵版本。
     extraction_config = (load_feature_extraction_config(feature_extraction_config_path))
+    # 讀取 Step2 選定的最終特徵，以及 Feature Execution Plan
     feature_config = load_feature_config(feature_config_json)
     
+    # 讀取固定 normal baseline, 這個 baseline 會在後續將原始頻帶特徵轉成：rel_特徵, z_特徵
     fixed_baseline = load_fixed_normal_baseline(
         baseline_json,
         band_config_path=band_config_json,
@@ -653,97 +759,105 @@ def build_disturbance_inference_feature_csv(
         require_final=require_final_baseline,
     )
     
-    # 驗證 Step 2 契約
+    # 驗證 Step 2 契約, 替目前使用的設定檔計算 SHA-256 指紋
     current_band_hash = calculate_file_sha256(band_config_json)
     current_extraction_hash = calculate_file_sha256(feature_extraction_config_path)
     
+    # 檢查
+    # 確認目前的頻帶設定，和 Step2 當初選特徵時用的頻帶設定完全一致
     if (feature_config.get("band_config_sha256") != current_band_hash):
         raise ValueError("feature_config_micro.json 與目前 band_config_step2.json 不一致")
-    
+    # 確認目前的切窗、取樣率、PSD 等規則，也和 Step2 當初選特徵時一致。
     if (feature_config.get("feature_extraction_config_sha256") != current_extraction_hash):
         raise ValueError("feature_config_micro.json 與目前 feature_extraction_config 不一致")
     
-    if (feature_config.get("baseline_config_fingerprint") != fixed_baseline.get("config_fingerprint")):
-        raise ValueError("feature_config_micro.json 與目前 固定 baseline 不一致")
+    # 取出：fp_cfg：Step2 特徵設定所記錄的 baseline 指紋, fp_base：現在實際載入的 baseline 指紋。
+    fp_cfg = feature_config.get("baseline_config_fingerprint")
+    fp_base = fixed_baseline.get("config_fingerprint")
+    if not fp_cfg or not fp_base or fp_cfg != fp_base:
+        raise ValueError(f"feature_config_micro.json 與目前固定 baseline 不一致：{fp_cfg} vs {fp_base}")
     
     # 把 band config 的 temporal band 名稱,同步給 shared_feature_utils 的 raw feature extractor。
     configure_temporal_band_names(band_config.temporal_band_names)
     
-    
-    # 讀取 execution plan
+    # 載入 Step2 已定案的特徵清單
     selected_feature_names = feature_config.get("selected_feature_names", [],)
-    
+    # 若沒有這份清單，程式不知道最後要輸出哪些欄位給模型，因此停止。
     if not selected_feature_names:
         raise ValueError("feature_config_micro.json 缺少 selected_feature_names")
     
+    # 建立正式保留的模型特徵欄位與順序
     final_keep_features = list(selected_feature_names)
-    
+    # 載入 Feature Execution Plan
     execution_plan = feature_config.get("feature_execution_plan")
-    
+    # 檢查
     if not isinstance(execution_plan, dict):
         raise ValueError("feature_config_micro.json 缺少 feature_execution_plan")
     
+    # 強制 execution plan 必須包含四個區塊
     required_plan_keys = [
-        "baseline_features", "cusum_input_features",
-        "temporal_base_features", "final_keep_features",
+        "baseline_features",          # 要套用 baseline、計算 rel／z 的原始特徵
+        "cusum_input_features",       # 要建立 CUSUM 的輸入欄位，通常是 z 特徵
+        "temporal_base_features",     # 要建立 delta、rolling 等時間特徵的欄位
+        "final_keep_features",        # 最終模型真正使用的特徵及順序
     ]
-    
+    # 檢查
     missing_plan_keys = [key for key in required_plan_keys if key not in execution_plan]
-    
     if missing_plan_keys:
         raise ValueError(f"feature_execution_plan 缺少欄位：{missing_plan_keys}")
     
+    # 確認每一個區塊都是清單，不會讀到格式錯誤的 JSON。＃
     for key in required_plan_keys:
         if not isinstance(execution_plan[key], list):
             raise ValueError(f"feature_execution_plan.{key} 必須是 list")
     
+    # 去除重複特徵+保留原本特徵順序。
     baseline_feature_names = list(dict.fromkeys(execution_plan["baseline_features"]))
-    
-    cusum_input_feature_names = list(dict.fromkeys(execution_plan["cusum_input_features"]))
-    
-    temporal_base_feature_names = list(dict.fromkeys(execution_plan["temporal_base_features"]))
-    
+    cusum_input_feature_names = list(dict.fromkeys(execution_plan["cusum_input_features"]))   
+    temporal_base_feature_names = list(dict.fromkeys(execution_plan["temporal_base_features"]))   
     planned_final_features = list(dict.fromkeys(execution_plan["final_keep_features"]))
     
+    # 確認 execution plan 裡的最終特徵，和 selected_feature_names 完全一致，連欄位順序也一致。
     if planned_final_features != final_keep_features:
         raise ValueError("feature_execution_plan.final_keep_features 與 selected_feature_names 不一致")
     
-    print("固定 baseline 模型特徵數量:",len(baseline_feature_names),)
-    
-    print("CUSUM 輸入特徵數量:", len(cusum_input_feature_names),)
-    
-    print("temporal base 特徵數量:", len(temporal_base_feature_names),)
-    
-    print("final selected features 數量:", len(final_keep_features),)
-    
-    print("需要的 final selected features 數量:", len(final_keep_features))
-    
-    # 從 feature_config 裡取出一串跟訊號處理有關的超參數
-    window_sec = float(extraction_config["window_sec"])     # 決定每個 window 多長
-    hop_sec = float(extraction_config["hop_sec"])          # window 之間跳多少
-    fs = float(extraction_config["fs"])               # 取樣率
-    nperseg = int(extraction_config["nperseg"])          # 頻譜分析（像 STFT/Welch）時每段的長度
-    max_points = int(extraction_config["max_points"])  # 安全上限，避免單一檔案點數過多
-    base_feature_version = str(extraction_config["base_feature_version"])
+    # 顯示這次要做多少特徵
+    print("固定 baseline 輸入特徵數量:", len(baseline_feature_names))
+    print("CUSUM 輸入特徵數量:", len(cusum_input_feature_names))
+    print("temporal base 特徵數量:", len(temporal_base_feature_names))
+    print("final selected features 數量:", len(final_keep_features))
+
+    # 從特徵設定讀取切窗與頻譜參數
+    window_sec = float(extraction_config["window_sec"])                             # 決定每個 window 多長
+    hop_sec = float(extraction_config["hop_sec"])                                   # window 之間跳多少
+    fs = float(extraction_config["fs"])                                             # 取樣率
+    nperseg = int(extraction_config["nperseg"])                                     # 頻譜分析（像 STFT/Welch）時每段的長度
+    max_points = int(extraction_config["max_points"])                               # 安全上限，避免單一檔案點數過多
+    base_feature_version = str(extraction_config["base_feature_version"])           # 用特徵版本控制快取；若特徵計算邏輯改版，舊 cache 不應被誤用
     include_offband_summary = bool(extraction_config["include_offband_summary"])    # 決定要不要額外算 offband 摘要特徵
     
+    # Disturbance 流程強制需要 offband
     if not include_offband_summary:
         raise ValueError("disturbance 規則比較需要 offband summary；請將 feature_extraction_config.json 的 include_offband_summary 設為 true")
     if "cusum_k" not in feature_config:
         raise ValueError("feature_config_micro.json 缺少 cusum_k")
     if "cusum_decay" not in feature_config:
         raise ValueError("feature_config_micro.json 缺少 cusum_decay")
-    cusum_k = float(feature_config["cusum_k"])             # CUSUM 累積
-    cusum_decay = float(feature_config["cusum_decay"])     # 演算法的參數
-
-
+    cusum_k = float(feature_config["cusum_k"])             # CUSUM 容忍值（0.5）
+    cusum_decay = float(feature_config["cusum_decay"])     # CUSUM 衰減（0.97）
+    
+    # 檢查 CUSUM 範圍
+    if not (cusum_k > 0):              # cusum_k：小偏移容忍區；小於此程度的波動不容易持續累積。
+        raise ValueError(f"cusum_k 必須 > 0，目前 {cusum_k}")
+    if not (0 < cusum_decay <= 1):     # cusum_decay：舊偏移淡化速度。
+        raise ValueError(f"cusum_decay 必須在 (0, 1]，目前 {cusum_decay}")
+    print(f"CUSUM 參數：k = {cusum_k}，decay = {cusum_decay}")
 
     # 掃描 disturbance 資料夾，整理出三份資料：
     # 1. file_specs：後面萃特徵要處理哪些 TDMS 檔
     # 2. df_manifest：每個 TDMS 在整個 session 裡的時間位置
     # 3. df_events：每個 session 裡的干擾段落資訊
     file_specs, df_manifest, df_events = collect_disturbance_sessions(root_dir)
-
     print("TDMS 檔數量:", len(file_specs))
     print("manifest rows:", len(df_manifest))
     print("event rows:", len(df_events))
@@ -752,16 +866,20 @@ def build_disturbance_inference_feature_csv(
     # ============================================================
     # Disturbance 與固定 Baseline 資料隔離檢查
     # ============================================================
-    # file_specs 包含本次真正會進入 Disturbance特徵工程的所有 TDMS。
-    # Disturbance 資料可能用於：
-    # 1. 模型負樣本訓練
-    # 2. Disturbance holdout
-    # 3. 告警／Veto 候選規則比較
-    # 因此不得與建立 site_baseline.json 的正常 calibration TDMS 使用相同檔案或 record_id。
+    # file_specs 包含本次真正會進入 Disturbance 特徵工程的所有 TDMS。
+    # Disturbance 資料可能用於：模型負樣本訓練、Disturbance holdout、告警／Veto 候選規則比較，
+    # 因此不得與建立 site_baseline.json 的正常 calibration TDMS 使用相同檔案、record_id 或內容。
     validate_baseline_source_isolation(
         baseline_payload=fixed_baseline,
         analysis_records=file_specs,
         context="Disturbance feature engineering",
+        strict=STRICT_BASELINE_ISOLATION,
+    )
+
+    # 內容層級的重複與洩漏檢查：比檔案內容的 SHA-256，改過檔名的複本也抓得到
+    check_content_duplicates(
+        file_specs,
+        fixed_baseline.get("source_tdms_paths", []),
         strict=STRICT_BASELINE_ISOLATION,
     )
     
@@ -769,7 +887,7 @@ def build_disturbance_inference_feature_csv(
     # ========================================================
     # 1. 萃取特徵
     # ========================================================
-    #    每個 TDMS 檔案，依 window_sec/hop_sec 切成很多小段，對每段訊號在 core_bands（洩漏頻帶+共振頻帶合併後的正式主頻帶）跟 aux_bands（offband 參照頻帶）上算能量之類的特徵
+    # 每個 TDMS 依 window_sec / hop_sec 切窗，在 core_bands（洩漏＋共振）和 aux_bands（offband）上算特徵
     features = load_or_compute_features_by_file(
         cache_dir=cache_dir,
         file_specs=file_specs,
@@ -786,47 +904,79 @@ def build_disturbance_inference_feature_csv(
         feature_version=base_feature_version,
         max_points=max_points,
     )
-    
-    # 轉成 DataFrame 格式
+
     df = pd.DataFrame(features).reset_index(drop=True)
     del features
     gc.collect()
-    
-    # 檢查 raw band 欄位有沒有真的抽出來
-    audit_band_feature_coverage(df, band_config)
 
-    # 檢查有沒有 filename
+    # 檢查有沒有 filename（同一 session 共用 record_id，只能靠檔名對回 manifest）
     if "filename" not in df.columns:
         raise ValueError("特徵表缺少 filename 欄位，無法對齊 manifest")
+    df["filename_stem"] = df["filename"].map(normalize_filename_stem)
+
+    # 檢查：每支 TDMS 都有算出窗（用檔名判斷，不能用 record_id）
+    expected_stems = {Path(s["filepath"]).stem for s in file_specs}
+    lost_stems = sorted(expected_stems - set(df["filename_stem"]))
+    if lost_stems:
+        raise ValueError(f"有 {len(lost_stems)} 支 TDMS 沒有算出任何窗：{lost_stems[:10]}")
+
+    # 檢查：訊號品質（門檻和 baseline 程式相同）
+    # disturbance 一支檔只有 0.5 秒、session 內檔案之間本來就有間隙，所以排除「整支檔」，不排除整個 session
+    bad = pd.Series(False, index=df.index)
+    for ch in ("ai0", "ai1"):
+        rms = pd.to_numeric(df[f"{ch}_rms"], errors="coerce")
+        bad |= ~np.isfinite(rms) | (rms < SIGNAL_RMS_MIN)
+    if bad.any():
+        bad_stems = sorted(df.loc[bad, "filename_stem"].unique())
+        print(f"⚠️ 訊號 QC：{len(bad_stems)} 支 TDMS 有壞窗（共 {int(bad.sum())} 窗），整支排除：{bad_stems[:10]}")
+        df = df[~df["filename_stem"].isin(bad_stems)].reset_index(drop=True)
+        if df.empty:
+            raise ValueError("訊號 QC 後沒有任何可用的 TDMS")
+
+    # 檢查 raw band 欄位有沒有真的抽出來
+    missing_raw = audit_band_feature_coverage(df, band_config)
+    if missing_raw:
+        raise ValueError(f"Disturbance 缺少原始 band 特徵：{missing_raw[:20]}")
+
 
     # ========================================================
     # 2. 把 manifest 合進 features
     # ========================================================
-    #    先把特徵表裡的檔名去副檔名，變成 filename_stem
-    df["filename_stem"] = df["filename"].map(normalize_filename_stem)
+    # 抽取器會從檔名解析出 label；disturbance 的 label 以 meta 為準（全部是 0），後面貼標時會統一設定，所以先拿掉抽取器的版本，避免 merge 撞名
+    df = df.drop(columns=["label"], errors="ignore")
+    
+    # 特徵表裡不應該已經有 manifest 欄位，否則 merge 會變成 _x / _y
+    merge_keys = ["record_id", "filename_stem"]
+    clash = [c for c in df_manifest.columns if c not in merge_keys and c in df.columns]
+    if clash:
+        raise ValueError(f"特徵表已經有這些欄位，merge 會撞名：{clash}")
 
-    #    用 record_id + filename_stem 去 merge:特徵表裡每個 window,對應回它原本屬於哪個 TDMS
-    df = df.merge(df_manifest, on=["record_id", "filename_stem"], how="left", validate="many_to_one",)
+    # 用 record_id + filename_stem 對回每支 TDMS；many_to_one：manifest 每支檔只能有一列
+    df = df.merge(df_manifest, on=merge_keys, how="left", validate="many_to_one")
+    # 檢查是否有對不上的manifest
+    missing_manifest = df["capture_start_elapsed_sec"].isna()
+    if missing_manifest.any():
+        miss_stems = sorted(df.loc[missing_manifest, "filename_stem"].unique())
+        raise ValueError(f"有 {int(missing_manifest.sum())} 窗對不到 manifest，例如：{miss_stems[:5]}")
 
-    # 檢查是不是有些特徵列對不到 manifest:如果有些 window 根本找不到對應的 manifest，那後面全域時間就無法建立，所以直接報錯
-    missing_manifest = df["capture_start_elapsed_sec"].isna().sum()
-    if missing_manifest > 0:
-        raise ValueError(f"有 {missing_manifest} 列 features 無法對齊 dual_session_manifest")
-
-    # 保留局部時間
+    # 保留檔內局部時間
     df["t_start_local"] = df["t_start"].astype(float)
-    
-    if "t_ref" not in df.columns:
-        df["t_ref"] = df["t_start"].astype(float) + window_sec / 2.0
-    
-    df["t_ref_local"] = df["t_ref"].astype(float)
+    # t_ref 一律用窗中心（和 transition 一致），不沿用抽取器可能給的其他定義
+    df["t_ref_local"] = df["t_start_local"] + window_sec / 2.0
 
-    # 把局部時間改成 session 的全域時間:原本 window 的 t_start 是在 TDMS 檔內部的相對時間, 現在把它加上這個 TDMS 在整個 session 的開始時間, 於是就變成整個 session 的全域時間
+    # 換成 session 全域時間 = 這支檔在 session 的開始時間 + 檔內局部時間
     df["t_start"] = df["capture_start_elapsed_sec"].astype(float) + df["t_start_local"]
     df["t_ref"] = df["capture_start_elapsed_sec"].astype(float) + df["t_ref_local"]
 
     # 排序成 session 時間序列
     df = df.sort_values(["record_id", "t_start"]).reset_index(drop=True)
+
+    # 檢查：同一 session 內不可有重複的全域時間（代表檔案時間重疊或 manifest 填錯）
+    dup_time = df.duplicated(["record_id", "t_start"], keep=False)
+    if dup_time.any():
+        dup_sessions = sorted(df.loc[dup_time, "record_id"].unique())
+        raise ValueError(f"有 {int(dup_time.sum())} 窗的全域時間重複，session：{dup_sessions[:5]}")
+
 
     # ========================================================
     # 3. 貼 disturbance 標註(disturbance_flag/eval_class)
@@ -842,12 +992,16 @@ def build_disturbance_inference_feature_csv(
     # ========================================================
     # 4.offband 摘要特徵
     # ========================================================
-    # 如果 feature_config 裡設定要算 offband 摘要（預設是 True），就呼叫外部模組的 build_offband_summary_features，用洩漏頻帶、共振頻帶、offband 頻帶三組能量互相比較，算出像 offband_E_mean、offband_to_leak_focus_E_ratio 這種摘要指標，用來判斷「是不是很多頻段一起升高（比較像寬頻機械干擾）」還是「只有洩漏頻帶升高（比較像真的洩漏）」
+    # 若 feature_extraction_config 啟用 offband 摘要，建立主頻帶、共振頻帶與 offband 的能量摘要及比值。
     if include_offband_summary:
         df = build_offband_summary_features(df, band_config)
         
-        # 檢查 offband 摘要欄位有沒有建出來
-        audit_offband_summary_coverage(df)
+        # 確認 offband 摘要與比值欄位都有成功建立
+        missing_summary = audit_offband_summary_coverage(df)
+        if missing_summary:
+            raise ValueError(
+                f"Disturbance 缺少 offband 摘要特徵：{missing_summary}"
+            )
         
     rule_baseline_feature_names = [
         "offband_E_mean",
@@ -879,33 +1033,8 @@ def build_disturbance_inference_feature_csv(
         feature_cols=baseline_apply_feature_names,
         baseline_payload=fixed_baseline,
     )
-    
-    # 驗證固定 baseline 的 rel_ / z_ 輸出
-    all_raw_feature_cols = select_all_raw_feature_columns(df)
-    
-    summary_base_cols = [
-        c for c in [
-            "offband_E_mean",
-            "offband_E_max",
-            "leak_focus_E_mean",
-            "leak_focus_E_max",
-            "resonance_E_mean",
-            "resonance_E_max",
-        ]
-        if c in df.columns
-    ]
-    
-    for c in summary_base_cols:
-        if c not in all_raw_feature_cols:
-            all_raw_feature_cols.append(c)
-    
-    print("正式 raw feature 數量:", len(all_raw_feature_cols))
 
-    # apply_fixed_normal_baseline() 已經使用 site_baseline.json
-    # 建立完成 rel_* 與 z_*。
-    #
-    # baseline_end_sec 只保留作為事件前正常區間的
-    # QC／分析邊界，不參與 rel/z baseline 計算。
+    # rel_ / z_ 都使用固定 site_baseline 計算；baseline_end_sec 只當 metadata，不參與計算
     # 檢查完整 rel/z
     expected_baseline_derived_features = [
         derived_feature
@@ -1073,6 +1202,10 @@ def build_disturbance_inference_feature_csv(
         "z_resonance_E_max",
     ]
     
+    missing_rule_cols = [c for c in dict.fromkeys(extra_veto_cols) if c not in df.columns]
+    if missing_rule_cols:
+        print(f"ℹ️ 以下規則欄位這次沒有建立，不會輸出：{missing_rule_cols}")
+    
     # 去重複
     extra_veto_cols = [c for c in dict.fromkeys(extra_veto_cols) if c in df.columns]
     # 確保輸出資料夾存在
@@ -1112,7 +1245,7 @@ def build_disturbance_inference_feature_csv(
     if missing_model:
         raise ValueError(f"model csv 缺少 selected features: {missing_model[:20]}")
     elif model_feature_cols_only != final_keep_features:
-        print("⚠️ model csv 的模型特徵順序和 Step2 selected_feature_names 不完全一致")
+        raise ValueError(f"model csv 的模型特徵順序和 Step2 不一致：extra={extra_model[:10]}")
     else:
         print("✅ model csv 與 Step2 selected_feature_names 完全一致")
         
@@ -1167,7 +1300,7 @@ def build_disturbance_inference_feature_csv(
     if missing_rule:
         raise ValueError(f"rule csv 缺少 selected features: {missing_rule[:20]}")
     elif rule_model_feature_cols != final_keep_features:
-        print("⚠️ rule csv 的模型特徵順序和 Step2 selected_feature_names 不完全一致")
+        raise ValueError("rule csv 的模型特徵順序和 Step2 不一致")
     else:
         print("✅ rule csv 內的模型特徵與 Step2 selected_feature_names 完全一致")
 
@@ -1205,71 +1338,11 @@ if __name__ == "__main__":
         output_csv="/Users/paul/Desktop/Final/disturbance_feature_engineering/inference_features_disturbance.csv",
         cache_dir="/Users/paul/Desktop/Final/disturbance_feature_engineering/feature_cache",
         split_name="disturbance_final",
-        n_jobs=2,
+        n_jobs=6,
         require_final_baseline=False,
     )  
     
     
-    
-'''
-# ============================================================
-# 備用工具：從 selected_feature_names 回推依賴欄位
-# 目前正式流程已改為：
-# 在正式 bands 內先建立完整特徵鏈，最後再保留 selected features
-# 這個函式先保留，供未來若要做「只算必要特徵」精簡版時使用
-# ============================================================
-def parse_required_features(selected_feature_names):     # selected_feature_names :Step2 最後選出來、寫進 feature_config.json 裡的那些正式特徵
-    # 從模型最後要的特徵名稱，反推前面特徵工程至少要先算哪些基礎欄位
-    raw_base_features = set()    # 前面最先要先算出來的原始欄位
-    z_base_features = set()      # 哪些欄位後面還要先建成 z_*
-    final_keep_features = set(selected_feature_names)    # 最後真的要保留給模型的正式特徵欄位
-
-    # 只要看到這些前綴，就把前綴剝掉，找回原始欄位名稱
-    prefix_map = {
-        "rel_": "",
-        "z_": "",
-        "delta_prev3mean_": "",
-        "delta_prev5mean_": "",
-        "delta_": "",
-        "local_rel3_": "",
-        "local_rel5_": "",
-        "local_z3_": "",
-        "local_z5_": "",
-        "rolling_std3_": "",
-        "rolling_std5_": "",
-        "rolling_slope3_": "",
-        "rolling_slope5_": "",
-        "rolling_max_gap3_": "",
-        "rolling_max_gap5_": "",
-    }
-
-    # 把模型最後要的每個特徵，一個一個拿來分析
-    for feat in selected_feature_names:
-        # 先特別處理 cusum, 因為 cusum 的依賴關係比別的特徵多一層
-        if feat.startswith("cusum_pos_") or feat.startswith("cusum_neg_"):
-            z_feat = feat.replace("cusum_pos_", "", 1).replace("cusum_neg_", "", 1)
-            if z_feat.startswith("z_"):
-                raw_base_features.add(z_feat[len("z_"):])
-                z_base_features.add(z_feat)
-            continue
-
-        # 一般衍生特徵處理:模型最後選到的是衍生特徵，這裡就把它往回追到原始欄位
-        matched = False
-        for prefix in prefix_map:
-            if feat.startswith(prefix):
-                raw_base_features.add(feat[len(prefix):])
-                matched = True
-                break
-        # 如果不是任何衍生前綴, 那它本身就當成原始欄位
-        if not matched:
-            raw_base_features.add(feat)
-
-    return (
-        sorted(raw_base_features),      # 前面最先要先算的原始欄位
-        sorted(z_base_features),        # 哪些 z_* 欄位後面還要拿去做 cusum
-        sorted(final_keep_features),    # 最後真正要留下給模型的欄位
-    )
-'''
 
 
 
