@@ -643,7 +643,7 @@ def fit_xgb_final(X_train,                    # 訓練特徵,注意這裡還帶�
             base_model,
             param_distributions=param_grid,            # 剛剛定義的搜尋空間
             n_iter=10,                                 # 隨機試 10 組參數
-            cv=gkf.split(X_train_sub, y_train_sub, groups_sub),   # 傳入交叉驗證的切分方式  
+            cv=list(gkf.split(X_train_sub, y_train_sub, groups_sub)),   # 先轉成 list：新版 sklearn 平行運算時不能傳 generator 
             scoring="balanced_accuracy",    # 以 balanced accuracy 當選參數依據
             random_state=42,
             n_jobs=-1,
