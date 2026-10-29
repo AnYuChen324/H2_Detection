@@ -49,7 +49,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from model_manager_two_sensor_final import ModelManager
-from alarm_rule_utils import apply_alarm_method_by_record, split_continuous_segments
+from alarm_rule_utils_v2 import apply_alarm_method_by_record, split_continuous_segments
 
 
 #                                                ************************************************************
@@ -134,7 +134,7 @@ def extract_inference_config(pkg):
         return next(iter(found.values()))
     
     # window_threshold：把每個 window 的機率轉成 0/1（pred_label）的門檻；告警規則的門檻另外寫在規則設定裡
-    window_threshold = _find_threshold("window_threshold", "window_level")shared_feature_utils
+    window_threshold = _find_threshold("window_threshold", "window_level")
     if window_threshold is None:
         raise ValueError("模型存檔找不到 window_threshold（package / thresholds / metadata.performance 都沒有）")
         
