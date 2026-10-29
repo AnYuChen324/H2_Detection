@@ -25,8 +25,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import train_test_split
-
 
 # ============================================================
 # 從 record_id 裡抓出像 _30cm_ 這種格式中的數字
@@ -40,101 +38,77 @@ def parse_distance_cm(record_id: str) -> int:
 
 
 # ============================================================
-# 先把原始資料用 record_id 分組，做出每筆 record 的摘要表
+# 先把原始資料依「切分單位」分組，做出每個單位的摘要表
 # ============================================================
-def build_record_summary(df: pd.DataFrame) -> pd.DataFrame:
+def build_record_summary(df: pd.DataFrame, unit_col: str = "record_id") -> pd.DataFrame:
+    """
+    切分單位：
+      - 有 session_id 就用 session_id（同一個 session 的所有 record 放同一份，最不會洩漏）
+      - 沒有就用 record_id（舊資料：一筆 transition record 就是一次連續錄製）
+    分層依據：distance_cm（從 record_id 解析）；有 leak_quantity 欄位時再加上洩漏量
+    """
     summary = (
-        df.groupby("record_id", as_index=False)    # 依 record_id 分組，as_index=False 表示分組鍵保留成普通欄位，而不是變成索引
-        .agg(                                      # 對每個 record_id 做聚合
-            n_windows=("record_id", "size"),       # 該 record 有幾列資料
-            t_start_min=("t_start", "min"),        # 最小 t_start
-            t_start_max=("t_start", "max"),        # 最大 t_start
+        df.groupby(unit_col, as_index=False)
+        .agg(
+            n_windows=(unit_col, "size"),
+            t_start_min=("t_start", "min"),
+            t_start_max=("t_start", "max"),
+            record_id=("record_id", "first"),
         )
         .copy()
     )
-    # 對 summary["record_id"] 每一列套用 parse_distance_cm，產生新欄位 distance_cm
     summary["distance_cm"] = summary["record_id"].map(parse_distance_cm)
-    # 把距離整數轉成字串，再加上 "cm"，例如 30 變成 "30cm"
     summary["group_key"] = summary["distance_cm"].astype(str) + "cm"
-    return summary.sort_values(["distance_cm", "record_id"]).reset_index(drop=True)
+    if "leak_quantity" in df.columns:
+        qty = df.groupby(unit_col)["leak_quantity"].max()
+        summary["leak_quantity"] = summary[unit_col].map(qty)
+        summary["group_key"] = summary["group_key"] + "_" + summary["leak_quantity"].astype(str) + "ml"
+    return summary.sort_values(["group_key", unit_col]).reset_index(drop=True)
 
 
 # ============================================================
-# 定義切分函式,輸出dev,holdout,split summary
+# 依 group_key 分層，把單位分成 train / dev / holdout 三份
 # ============================================================
 def stratified_record_split(
     record_summary: pd.DataFrame,
     holdout_ratio: float,
+    dev_ratio: float,
     seed: int,
-) -> tuple[list[str], list[str], pd.DataFrame]:
+    unit_col: str = "record_id",
+) -> pd.DataFrame:
     """
-    以 record_id 為單位，依 distance_cm 分層切分。
+    三份的用途（和干擾資料一致）：
+      train   ：訓練模型
+      dev     ：選規則（轉換推論在 dev 上量偵測率，和干擾 dev 的誤報率一起看）
+      holdout ：規則定案後量一次成績
 
-    Dev：80%
-    Holdout：20%
+    每個 group_key 各自打亂後，依比例分配，每份至少 1 個單位（至少要有 3 個單位才分得開）。
     """
+    if not (0 < holdout_ratio < 1 and 0 < dev_ratio < 1 and holdout_ratio + dev_ratio < 1):
+        raise ValueError(f"比例不合理：holdout={holdout_ratio}, dev={dev_ratio}")
 
-    if not 0 < holdout_ratio < 1:
-        raise ValueError(
-            "holdout_ratio 必須介於 0 與 1 之間，"
-            f"目前收到：{holdout_ratio}"
-        )
+    rng = np.random.default_rng(seed)
+    split_map: dict[str, str] = {}
+    for group_key, sub in record_summary.groupby("group_key", sort=True):
+        ids = sorted(sub[unit_col].tolist())
+        n = len(ids)
+        n_h = max(1, int(round(n * holdout_ratio)))
+        n_d = max(1, int(round(n * dev_ratio)))
+        if n_h + n_d >= n:
+            raise ValueError(
+                f"{group_key} 只有 {n} 個 {unit_col}，不夠分成 holdout {n_h} + dev {n_d} + train 至少 1"
+            )
+        shuffled = rng.permutation(ids).tolist()
+        for u in shuffled[:n_h]:
+            split_map[u] = "holdout"
+        for u in shuffled[n_h:n_h + n_d]:
+            split_map[u] = "dev"
+        for u in shuffled[n_h + n_d:]:
+            split_map[u] = "train"
 
-    dev_summary, holdout_summary = (
-        train_test_split(
-            record_summary,
-            test_size=holdout_ratio,
-            random_state=seed,
-            stratify=(
-                record_summary[
-                    "distance_cm"
-                ]
-            ),
-        )
-    )
-
-    dev_ids = sorted(
-        dev_summary[
-            "record_id"
-        ].tolist()
-    )
-
-    holdout_ids = sorted(
-        holdout_summary[
-            "record_id"
-        ].tolist()
-    )
-
-    overlap_ids = (
-        set(dev_ids) &
-        set(holdout_ids)
-    )
-
-    if overlap_ids:
-        raise ValueError(
-            "Dev 與 Holdout 出現重複 "
-            "record_id："
-            f"{sorted(overlap_ids)[:20]}"
-        )
-
-    split_summary = (
-        record_summary.copy()
-    )
-
-    split_summary["split"] = np.where(
-        split_summary[
-            "record_id"
-        ].isin(holdout_ids),
-        "holdout",
-        "dev",
-    )
-
-    return (
-        dev_ids,
-        holdout_ids,
-        split_summary,
-    )
-
+    split_summary = record_summary.copy()
+    split_summary["split"] = split_summary[unit_col].map(split_map)
+    return split_summary
 
 
 # ============================================================
@@ -166,6 +140,15 @@ def main():
         default=0.20,
         help="Holdout 比例，預設為 0.20",
     )
+    
+    # 加入 --dev-ratio，控制 dev（選規則用）的比例
+    parser.add_argument(
+        "--dev-ratio",
+        type=float,
+        default=0.20,
+        help="Dev（選規則用）比例，預設為 0.20",
+    )
+    
     # 加入 --seed 參數，控制隨機抽樣結果
     parser.add_argument(
         "--seed",
@@ -200,114 +183,77 @@ def main():
     if missing:
         raise ValueError(f"輸入 CSV 缺少必要欄位: {missing}")
 
-    # 根據 model 版資料建立 record 層級摘要
-    record_summary = build_record_summary(df)
-    
-    # 呼叫分層切分函式，只在這裡產生一次 dev / holdout record_id
-    dev_ids, holdout_ids, split_summary = stratified_record_split(
+        # 切分單位：有 session_id 用 session_id，沒有就用 record_id
+    unit_col = "session_id" if "session_id" in df.columns else "record_id"
+    record_summary = build_record_summary(df, unit_col=unit_col)
+
+    # 只在這裡產生一次 train / dev / holdout
+    split_summary = stratified_record_split(
         record_summary=record_summary,
         holdout_ratio=args.holdout_ratio,
+        dev_ratio=args.dev_ratio,
         seed=args.seed,
+        unit_col=unit_col,
     )
-    
-    # 用同一組 ids 切 model 版資料
-    df_dev = df[df["record_id"].isin(dev_ids)].copy()
-    df_holdout = df[df["record_id"].isin(holdout_ids)].copy()
-    
-    dev_path = output_dir / "transition_features_dev.csv"
-    holdout_path = output_dir / "transition_features_holdout.csv"
-    split_path = output_dir / "transition_record_split.csv"
+    split_map = dict(zip(split_summary[unit_col], split_summary["split"]))
 
-    df_dev.to_csv(dev_path, index=False, encoding="utf-8-sig")
-    df_holdout.to_csv(holdout_path, index=False, encoding="utf-8-sig")
-    split_summary.to_csv(split_path, index=False, encoding="utf-8-sig")
-    
-    
     # ============================================================
-    # 2. 讀取 rule 版 transition features
+    # 2. 讀取 rule 版 transition features，確認和 model 版是同一批
     # ============================================================
-    # 確認含有規則特徵資料集是否存在
     if not args.rule_csv.exists():
         raise FileNotFoundError(
             f"找不到 rule CSV，請先重跑 transition_feature_engineering_final2.py：{args.rule_csv}"
         )
-    # 從含有規則欄位的資料中，根據 record_id 在 dev_ids 裡的列，形成開發集
     df_rule = pd.read_csv(args.rule_csv)
-
     missing_rule = sorted(required_cols - set(df_rule.columns))
     if missing_rule:
         raise ValueError(f"rule CSV 缺少必要欄位: {missing_rule}")
-    
-    # 確認 model 版與 rule 版是同一批 record
-    model_record_ids = set(df["record_id"].unique())
-    rule_record_ids = set(df_rule["record_id"].unique())
-    
-    if model_record_ids != rule_record_ids:
-        only_model = sorted(model_record_ids - rule_record_ids)[:10]
-        only_rule = sorted(rule_record_ids - model_record_ids)[:10]
+    if unit_col not in df_rule.columns:
+        raise ValueError(f"rule CSV 沒有 {unit_col} 欄，無法和 model 版用同一種單位切分")
+
+    model_units = set(df[unit_col].unique())
+    rule_units = set(df_rule[unit_col].unique())
+    if model_units != rule_units:
         raise ValueError(
-            "model CSV 和 rule CSV 的 record_id 不一致，不能共用 split。\n"
-            f"只在 model 裡的前幾筆: {only_model}\n"
-            f"只在 rule 裡的前幾筆: {only_rule}"
+            f"model CSV 和 rule CSV 的 {unit_col} 不一致，不能共用 split。\n"
+            f"只在 model 裡的前幾筆: {sorted(model_units - rule_units)[:10]}\n"
+            f"只在 rule 裡的前幾筆: {sorted(rule_units - model_units)[:10]}"
         )
-        
-    # 理論上 model/rule 是同一批 window，只是欄位不同，所以 row 數應相同
     if len(df_rule) != len(df):
-        print(
-            "⚠️ model CSV 和 rule CSV 的 row 數不同："
-            f"model={len(df)}, rule={len(df_rule)}。"
-            "如果 rule 版是從同一份 transition feature engineering 輸出，理論上應該相同。"
-        )
-    
-    # 用同一組 ids 切 rule 版資料
-    df_rule_dev = df_rule[df_rule["record_id"].isin(dev_ids)].copy()
-    df_rule_holdout = df_rule[df_rule["record_id"].isin(holdout_ids)].copy()
+        print(f"⚠️ model CSV 和 rule CSV 的 row 數不同：model={len(df)}, rule={len(df_rule)}")
 
-    # 輸出路徑
-    rule_dev_path = output_dir / "transition_rule_features_dev.csv"
-    rule_holdout_path = output_dir / "transition_rule_features_holdout.csv"
-    
-    # 輸出檔案
-    df_rule_dev.to_csv(rule_dev_path, index=False, encoding="utf-8-sig")
-    df_rule_holdout.to_csv(rule_holdout_path, index=False, encoding="utf-8-sig")
+    # 兩個版本都加上 split 欄，後面的程式一律看這一欄
+    df["split"] = df[unit_col].map(split_map)
+    df_rule["split"] = df_rule[unit_col].map(split_map)
 
+    # 1. 模型訓練用：只有 train
+    train_path = output_dir / "transition_features_train.csv"
+    df[df["split"] == "train"].to_csv(train_path, index=False, encoding="utf-8-sig")
+
+    # 2. 轉換推論用：dev + holdout 放同一份，靠 split 欄區分
+    rule_eval_path = output_dir / "transition_rule_features_eval.csv"
+    df_rule[df_rule["split"] != "train"].to_csv(rule_eval_path, index=False, encoding="utf-8-sig")
+
+    split_path = output_dir / "transition_record_split.csv"
+    split_summary.to_csv(split_path, index=False, encoding="utf-8-sig")
+
+    counts = split_summary["split"].value_counts()
     print("=" * 80)
-    print("Transition  Dev / Holdout Split 完成")
+    print("Transition train / dev / holdout Split 完成")
     print("=" * 80)
-    print(f"input_csv           : {input_csv}")
-    print(f"output_dir          : {output_dir}")
-    print(
-        f"dev_ratio           : "
-        f"{1.0 - args.holdout_ratio:.2f}"
-    )
-    
-    print(
-        f"holdout_ratio       : "
-        f"{args.holdout_ratio:.2f}"
-    )
-    print(f"seed                : {args.seed}")
-    print(f"n_total_records     : {record_summary['record_id'].nunique()}")
-    print(f"n_dev_records       : {len(dev_ids)}")
-    print(f"n_holdout_records   : {len(holdout_ids)}")
-    print(f"n_dev_windows       : {len(df_dev)}")
-    print(f"n_holdout_windows   : {len(df_holdout)}")
+    print(f"input_csv     : {input_csv}")
+    print(f"切分單位      : {unit_col}")
+    print(f"比例          : train {1 - args.holdout_ratio - args.dev_ratio:.2f}、"
+          f"dev {args.dev_ratio:.2f}、holdout {args.holdout_ratio:.2f}")
+    print(f"seed          : {args.seed}")
+    print(f"{unit_col} 數 ：train {counts.get('train', 0)}、dev {counts.get('dev', 0)}、holdout {counts.get('holdout', 0)}")
     print()
-    print("Holdout record_ids:")
-    for rid in holdout_ids:
-        print(f"  - {rid}")
+    print("各組分配：")
+    print(split_summary.groupby(["group_key", "split"]).size().unstack(fill_value=0))
     print()
-    print("Split summary by distance:")
-    print(
-        split_summary.groupby(["distance_cm", "split"])["record_id"]
-        .count()
-        .unstack(fill_value=0)
-    )
-    print()
-    print(f"已輸出 dev      : {dev_path}")
-    print(f"已輸出 holdout  : {holdout_path}")
-    print(f"已輸出 split 表 : {split_path}")
-    print(f"已輸出 rule dev      : {rule_dev_path}")
-    print(f"已輸出 rule holdout  : {rule_holdout_path}")
+    print(f"已輸出 模型訓練用 : {train_path}")
+    print(f"已輸出 轉換推論用 : {rule_eval_path}")
+    print(f"已輸出 split 表   : {split_path}")
 
 if __name__ == "__main__":
     main()
