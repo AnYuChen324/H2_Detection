@@ -511,9 +511,6 @@ def collect_disturbance_sessions(
                 df_events["start_elapsed_sec"] = ev_start
                 df_events["end_elapsed_sec"] = ev_end
                 
-            # 貼在原檔第 500 行 df_events["end_elapsed_sec"] = ev_end 的下一行（空一行），
-            # 第 502 行「# ---- TDMS 配對」的上面。注意縮排是 12 格（在 for disturbance_dir 迴圈裡面）
-
             # ---- segments 模式：用取樣序號組連續段，取代下面「逐支配對 + 檔名時間順序」的檢查 ----
             if input_mode == "segments":
                 # 首尾相接、取樣點重疊、manifest 列了但找不到檔、同名檔，都在 build_continuous_segments 裡檢查
