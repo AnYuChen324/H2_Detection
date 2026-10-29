@@ -57,7 +57,17 @@ def build_record_summary(df: pd.DataFrame, unit_col: str = "record_id") -> pd.Da
         )
         .copy()
     )
-    summary["distance_cm"] = summary["record_id"].map(parse_distance_cm)
+    if "distance_cm" in df.columns:
+        # 特徵工程已輸出 distance_cm（v22 連續段的 record_id 是 session_..._seg00，裡面沒有距離）
+        dist = df.groupby(unit_col)["distance_cm"].agg(lambda s: s.dropna().unique().tolist())
+        bad = {u: v for u, v in dist.items() if len(v) != 1}
+        if bad:
+            raise ValueError(f"同一個 {unit_col} 的 distance_cm 不只一種或是空的：{list(bad.items())[:5]}")
+        summary["distance_cm"] = summary[unit_col].map(lambda u: int(round(float(dist[u][0]))))
+    else:
+        # 舊資料沒有 distance_cm 欄：從 record_id 解析（例如 ..._30cm_...）
+        summary["distance_cm"] = summary["record_id"].map(parse_distance_cm)
+        
     summary["group_key"] = summary["distance_cm"].astype(str) + "cm"
     if "leak_quantity" in df.columns:
         qty = df.groupby(unit_col)["leak_quantity"].max()
@@ -230,6 +240,10 @@ def main():
     train_path = output_dir / "transition_features_train.csv"
     df[df["split"] == "train"].to_csv(train_path, index=False, encoding="utf-8-sig")
 
+    # 訓練程式最後評估模型用（只有明確 0/1 標籤的 model 版）；選規則、驗收仍用 transition_rule_features_eval.csv
+    holdout_path = output_dir / "transition_features_holdout.csv"
+    df[df["split"] == "holdout"].to_csv(holdout_path, index=False, encoding="utf-8-sig")
+    
     # 2. 轉換推論用：dev + holdout 放同一份，靠 split 欄區分
     rule_eval_path = output_dir / "transition_rule_features_eval.csv"
     df_rule[df_rule["split"] != "train"].to_csv(rule_eval_path, index=False, encoding="utf-8-sig")
