@@ -94,12 +94,13 @@ def _json_safe(obj):                 # 輸入一個 obj，可以是任何型別�
 # ============================================================
 def extract_inference_config(pkg):
     '''
-    把 pkg 裡推論真正需要的東西拆出來。
+    從模型 package 裡拿出推論必需的東西，並確認沒有缺漏或版本衝突
 
     門檻一律以模型存檔為準，讀不到就直接報錯，不再自動用 0.5：
       - 0.5 不是模型訓練時決定的門檻，悄悄套用的話，後面所有誤報率都會失真
       - 讀不到通常代表模型存檔格式不對或存檔不完整，應該在這裡發現，而不是跑完才發現
     '''
+    # 真正訓練好的模型本體
     model = pkg["model"]                              # 模型本體
     scaler = pkg.get("scaler", None)                  # 訓練時若有標準化才會有；XGB 通常沒有
     metadata = pkg.get("metadata", {}) or {}          # 模型描述資訊
@@ -107,14 +108,14 @@ def extract_inference_config(pkg):
     
     # 模型訓練時真正吃進去的特徵清單（推論必須完全一樣）
     feature_names = metadata.get("features", {}).get("feature_names", None)
-    # 檢查 feature names
+    # 檢查 feature names：如果沒有特徵清單，直接停止。
     if not feature_names:
         raise ValueError("metadata.features.feature_names 不存在")
         
     # 取得 thresholds 設定(先從 package 取得 threshold 集合)
     thresholds = pkg.get("thresholds", {}) or {}
     
-    # 依序找：package 頂層 → thresholds → 舊版 metadata.performance
+    # 尋找指定門檻：依序找 package 頂層 → thresholds → 舊版 metadata.performance
     # 注意：pkg["threshold"] 是舊版留下的 file_threshold 別名（值 = file_threshold），刻意不讀，不能當 window 門檻
     # 有值的地方必須一致；不一致代表存檔裡有舊門檻沒更新，不能猜要用哪個
     def _find_threshold(key, perf_level):
@@ -124,14 +125,16 @@ def extract_inference_config(pkg):
             "metadata.performance": metadata.get("performance", {}).get(perf_level, {}).get("threshold", None),
         }
         found = {src: float(v) for src, v in sources.items() if v is not None}
+        # 三個位置都找不到時，回傳 None
         if not found:
             return None
+        # 模型存檔可能混入舊設定，或有某次更新沒有同步。若程式偷偷用 0.5，後面所有誤報率、告警率與比較結果都可能失真，直接停止
         if len(set(found.values())) > 1:
             raise ValueError(f"模型存檔裡 {key} 有不只一個值，請確認哪個才是正確的：{found}")
         return next(iter(found.values()))
     
     # window_threshold：把每個 window 的機率轉成 0/1（pred_label）的門檻；告警規則的門檻另外寫在規則設定裡
-    window_threshold = _find_threshold("window_threshold", "window_level")
+    window_threshold = _find_threshold("window_threshold", "window_level")shared_feature_utils
     if window_threshold is None:
         raise ValueError("模型存檔找不到 window_threshold（package / thresholds / metadata.performance 都沒有）")
         
@@ -1232,11 +1235,13 @@ def save_postprocess_configs(
             "source": source,
             "baseline_rule_name": selected_rule_name,
             "baseline_rule_settings": _json_safe(settings),
+            # 驗證進度：干擾 holdout 量完是 pending，轉換 holdout 量完才改成 final_verified
+            "validation_status": "pending_transition_holdout",
         }
         final_path = model_folder / "postprocess_config.json"
         with open(final_path, "w", encoding="utf-8") as f:
             json.dump(final_payload, f, indent=2, ensure_ascii=False)
-        print(f"✅ 已輸出正式 postprocess config: {final_path}")
+        print(f"✅ 已輸出鎖定規則 {selected_rule_name}，等待轉換 holdout 最終驗證（validation_status = pending_transition_holdout）: {final_path}")
 
     return candidate_payloads, final_payload
 
@@ -1383,6 +1388,8 @@ def save_final_runtime_feature_schema(
         missing_steps.append("沒有干擾 holdout 成績（請跑干擾推論 mode='evaluate', write_postprocess_final=True）")
     if "transition_holdout_evaluation" not in postprocess:
         missing_steps.append("沒有轉換 holdout 成績（請跑轉換推論 run_transition_feature_inference）")
+    if postprocess.get("validation_status") != "final_verified":
+        missing_steps.append(f"validation_status 應為 final_verified（目前 {postprocess.get('validation_status')!r}）")
     if missing_steps:
         raise ValueError("postprocess_config.json 還不是完整驗證過的正式版，不能產生正式 schema：\n  - "
                          + "\n  - ".join(missing_steps))
@@ -1469,16 +1476,35 @@ def split_dev_holdout_for_rules(df, split_col="split"):
     回傳 (df_dev, df_holdout, split_table)；split_table 記錄每個單位分到哪一邊，方便追查
     """
     if split_col in df.columns:
+        # 把 split 欄位統一整理成小寫純文字
         split = df[split_col].astype(str).str.strip().str.lower()
+        
+        # 如果輸入 CSV 裡還混有 train 資料，程式會提示你，但不會把它拿來：選規則, 評估規則, 報告誤報率
         n_train = int((split == "train").sum())
         if n_train:
             print(f"⚠️ 有 {n_train} 列 split=train（模型訓練看過），不用來選規則或評估，已排除")
+        # 資料品質檢查：確認 split 只能有三種值，train / dev / holdout
         unknown = sorted(set(split) - {"train", "dev", "holdout"})
         if unknown:
             raise ValueError(f"{split_col} 欄出現未知的值：{unknown}（只能是 train / dev / holdout）")
-        df_dev = df[split == "dev"].copy()
-        df_hold = df[split == "holdout"].copy()
+        
+        # 資料隔離的最小單位:優先用 session_id，如果沒有 session_id，才退而求其次以 record_id 為單位。
         unit_col = "session_id" if "session_id" in df.columns else "record_id"
+        
+        # 每個 session 出現過幾種不同的 split(每個 session 只屬於一個 split)？一個 session 從頭到尾只能屬於 train / dev / holdout 其中一份
+        unit_split_count = (pd.DataFrame({"unit": df[unit_col], "split": split})
+                            .groupby("unit")["split"].nunique())
+        # 抓資料洩漏：只要同一個 session 出現在兩種以上 split，程式就直接停止
+        mixed_units = unit_split_count[unit_split_count > 1].index.tolist()
+        if mixed_units:
+            raise ValueError(f"同一個 {unit_col} 出現在多個 split，可能造成資料洩漏："
+                             f"{mixed_units[:10]}（共 {len(mixed_units)} 個）")
+        
+        # 真正取出兩份資料:df_dev,df_hold
+        df_dev = df[split == "dev"].copy()          # 用於比較所有規則、選候選
+        df_hold = df[split == "holdout"].copy()     # 規則定案後，只評估最後選中的那一條
+        
+        # 產生一張「這次規則評估實際用了哪些 session」的紀錄表
         split_table = (df[split != "train"][[unit_col]].assign(rule_split=split[split != "train"])
                        .drop_duplicates().reset_index(drop=True))
         source = f"欄位 {split_col}"
@@ -1491,6 +1517,8 @@ def split_dev_holdout_for_rules(df, split_col="split"):
     print(f"dev / holdout 分法：{source}")
     print(f"  dev     ：{len(df_dev)} 窗，{df_dev[unit_col].nunique()} 個 {unit_col}")
     print(f"  holdout ：{len(df_hold)} 窗，{df_hold[unit_col].nunique()} 個 {unit_col}")
+    
+    # 如果資料切分錯誤，導致 Dev 或 Holdout 沒有任何資料，程式不會硬跑出一個看似正常、其實無意義的結果。
     if df_dev.empty or df_hold.empty:
         raise ValueError("dev 或 holdout 是空的，無法分開選規則和評估")
     return df_dev, df_hold, split_table
@@ -1499,7 +1527,11 @@ def split_dev_holdout_for_rules(df, split_col="split"):
 # ============================================================
 # 只評估一條規則（holdout 用，不排名）
 # ============================================================
-def evaluate_single_rule(df_pred, cfg, window_threshold, max_disturbance_fa=None, min_testable_ratio=0.5):
+def evaluate_single_rule(df_pred,                     # 已經完成 XGBoost 推論的干擾資料，每個 window 都已有 pred_proba、pred_label
+                         cfg,                         # 已選定的告警規則設定，例如連續幾個 window 超標才報警、是否啟用 veto 等
+                         window_threshold,            # 模型把機率轉為初步 leak / non-leak 判定的門檻。
+                         max_disturbance_fa=None,     # 可接受的干擾誤報上限，例如 0.01 代表 1%。
+                         min_testable_ratio=0.5):     # 至少有 50% 的干擾片段夠長，能真正測到這條規則的告警延遲，才把一般誤報率視為可信。
     """
     在 holdout 上只量「已經定案的那一條規則」，不跑其他規則，也不排名，
     避免看了 holdout 的成績又回頭換規則。
@@ -1509,40 +1541,60 @@ def evaluate_single_rule(df_pred, cfg, window_threshold, max_disturbance_fa=None
       - effective_fa：測得出來用一般誤報率，測不出來用橋接誤報率
       - 有給 max_disturbance_fa 時，另外記 meets_fa_limit（holdout 上有沒有達標）
     """
-    # 干擾誤報歸屬先算一次，一般版和橋接版都沿用
+    # 重新標記每個 window 的「誤報歸屬」
+    # during：干擾進行中
+    # tail：干擾結束後的尾端時間
+    # clean：真正沒有干擾的時間
     if "eval_class" in df_pred.columns:
         df_pred = attribute_disturbance_windows(df_pred)
 
+    # 已定案的告警規則套到每個 record_id 上, 套用後的 df_rule 通常會多出：raw_alarm / veto_flag / final_alarm
     df_rule = apply_alarm_method_by_record(df_pred, cfg, window_threshold)
+    # 從資料本身估計：每個 window 長度, 每次滑窗往前移多少秒。
     window_sec, hop_sec = estimate_window_timing(df_pred)
+    # 計算每一段連續訊號實際有多長
     span = compute_segment_span(df_pred)
+    
+    # 只保留「可算給干擾的時間段」:during：干擾當下 / tail：干擾停止後的餘振期間
     if "fa_bucket" in df_pred.columns and df_pred["fa_bucket"].isin(["during", "tail"]).any():
         span = span[df_pred["fa_bucket"].isin(["during", "tail"])]
+    # 算出這條規則理論上的「最短告警延遲」。
     latency = rule_min_alarm_latency_sec(cfg, window_threshold, window_sec, hop_sec)
+    # 計算有多少比例的干擾片段「長度足夠測試此規則」
     testable_ratio = float((span >= latency - 1e-9).mean())
 
+    # 先建立這條規則的基本結果摘要
     metrics = {
-        "rule_name": cfg["name"],
-        "n_windows": int(len(df_pred)),
-        "min_alarm_latency_sec": latency,
-        "fa_testable_ratio": testable_ratio,
-        "fa_testable": testable_ratio >= min_testable_ratio,
-        "veto_rate": float(df_rule["veto_flag"].mean()),
+        "rule_name": cfg["name"],                               # 正在驗收哪一條規則
+        "n_windows": int(len(df_pred)),                         # Holdout 有多少個 window
+        "min_alarm_latency_sec": latency,                       # 這條規則理論上最少多久才能報警
+        "fa_testable_ratio": testable_ratio,                    # 有多少干擾片段真的夠長、能測這條規則
+        "fa_testable": testable_ratio >= min_testable_ratio,    # 可測比例是否至少達 50%
+        "veto_rate": float(df_rule["veto_flag"].mean()),        # 有多少 window 被抗干擾 veto 擋掉
     }
+    # 把實際套用規則後的誤報統計加進去
     metrics.update(summarize_disturbance_rule(df_rule))
+    
+    # 「橋接版」評估:正常狀況下，如果檔案之間有太長空檔，告警規則會重置，因為真實系統不能假設中間的訊號持續存在。
     bridged = summarize_disturbance_rule(
         apply_alarm_method_by_record(df_pred, cfg, window_threshold, max_gap_sec=np.inf))
-    metrics["bridged_disturbance_negative_false_alarm_rate"] = bridged.get(
-        "disturbance_negative_false_alarm_rate", np.nan)
+    # 把橋接版結果另外存起來，刻意與一般版分開
+    metrics["bridged_disturbance_negative_false_alarm_rate"] = bridged.get("disturbance_negative_false_alarm_rate", np.nan)
     metrics["bridged_overall_false_alarm_rate"] = bridged["overall_false_alarm_rate"]
 
-    # 和 dev 選規則時同一個定義的有效誤報率
+    # 優先使用「干擾負樣本誤報率」:和 dev 選規則時同一個定義的有效誤報率
     if "disturbance_negative_false_alarm_rate" in metrics:
         fa, fa_bridged = metrics["disturbance_negative_false_alarm_rate"], metrics["bridged_disturbance_negative_false_alarm_rate"]
     else:
         fa, fa_bridged = metrics["overall_false_alarm_rate"], metrics["bridged_overall_false_alarm_rate"]
+    
+    # 若資料夠長、可正常測試規則 → effective_fa 使用實測誤報率
+    # 若資料太短、無法真正測試這條規則 → effective_fa 改用橋接估計誤報率
     metrics["effective_fa"] = fa if metrics["fa_testable"] else fa_bridged
+    # 記錄 effective_fa 的來源
     metrics["effective_fa_source"] = "measured" if metrics["fa_testable"] else "bridged"
+    
+    # Holdout 的驗收結果
     if max_disturbance_fa is not None:
         metrics["max_disturbance_fa"] = float(max_disturbance_fa)
         metrics["meets_fa_limit"] = bool(metrics["effective_fa"] <= max_disturbance_fa)
@@ -1562,6 +1614,8 @@ def run_disturbance_feature_inference(
     selected_rule_name=None,        # evaluate 模式必填：已定案的規則名稱
     write_postprocess_final=False,  # evaluate 模式才可設 True：寫出正式 postprocess_config.json
     max_disturbance_fa=0.01,        # 干擾誤報率上限（每種規則挑代表時用）
+    selection_reason=None,          # 寫正式版時必填：為什麼選這條（看了轉換比較表的哪些數字）
+    transition_comparison_csv=None, # 選規則時看的轉換比較表路徑（transition_postprocess_candidate_comparison.csv），記錄用
 ):
     '''
     兩種模式：
@@ -1585,6 +1639,8 @@ def run_disturbance_feature_inference(
         raise ValueError("select 模式不能寫正式版：請先選定規則，再用 mode='evaluate' 寫出")
     if mode == "evaluate" and not selected_rule_name:
         raise ValueError("evaluate 模式必須指定 selected_rule_name")
+    if write_postprocess_final and not (selection_reason and str(selection_reason).strip()):
+        raise ValueError("寫正式版時必須填 selection_reason：記下為什麼選這條規則，之後才查得到")
     
     # ---  Step 1-3：載入模型  ---
     # 路徑初始化
@@ -1736,9 +1792,18 @@ def run_disturbance_feature_inference(
             json.dump(rule_metrics, f, indent=2, ensure_ascii=False)
         if final_postprocess is not None:
             final_postprocess["holdout_evaluation"] = rule_metrics
+            # 人工選規則的紀錄：選了哪條、為什麼、看的是哪張比較表
+            final_postprocess["selection"] = _json_safe({
+                "selected_rule_name": selected_rule_name,
+                "selection_source": "disturbance_dev + transition_dev",
+                "selection_reason": str(selection_reason).strip(),
+                "transition_comparison_csv": str(transition_comparison_csv) if transition_comparison_csv else None,
+                "max_disturbance_fa": max_disturbance_fa,
+                "disturbance_tail_sec": DISTURBANCE_TAIL_SEC,
+            })
             with open(model_folder / "postprocess_config.json", "w", encoding="utf-8") as f:
                 json.dump(final_postprocess, f, indent=2, ensure_ascii=False)
-            print("✅ 正式 postprocess_config.json 已附上 holdout 成績")
+            print("✅ postprocess_config.json 已附上干擾 holdout 成績；跑完轉換推論 run_transition_feature_inference 後才是可部署的正式規則")
 
     # 候選 runtime schema（用這次分析的那條規則）
     runtime_feature_schema = save_runtime_feature_schema(
@@ -1819,10 +1884,10 @@ if __name__ == "__main__":
         "xgb_20260923_164944/metadata.json"
     )
 
-    # 已經做完干擾特徵工程的 feature CSV 路徑(規則版-有offband)
+    # 切分程式輸出的規則版特徵（dev + holdout 都在裡面，有 split 欄）
     FEATURE_CSV = Path(
         "/Users/paul/Desktop/Final/disturbance_feature_engineering/"
-        "disturbance_rule_features_holdout.csv"
+        "disturbance_rule_features_eval.csv"
     )
     
     # 第 1 步：選規則（只用 dev），輸出 16 份候選給轉換推論
@@ -1843,6 +1908,8 @@ if __name__ == "__main__":
         mode="evaluate",
         selected_rule_name="這裡填轉換推論選定的規則名稱",
         write_postprocess_final=True,
+        selection_reason="這裡寫為什麼選這條（例如：符合干擾誤報上限，轉換 dev 偵測率最高、延遲可接受）",
+        transition_comparison_csv="這裡填轉換推論輸出的 transition_postprocess_candidate_comparison.csv 路徑",
     )
     '''
     
