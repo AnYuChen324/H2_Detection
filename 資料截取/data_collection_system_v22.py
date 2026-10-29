@@ -7006,8 +7006,24 @@ class DataCollectionGUI:
             # 開始收集
             def collect_loop():
                 if use_continuous:
-                    self._std_continuous_collect(rate, points, n_files, show_last)
+                    # 連續擷取；出錯時錯誤訊息要在「完成」之後顯示，才不會被「完成! 共 0 筆」蓋掉
+                    try:
+                        summary = self._std_continuous_collect(rate, points, n_files, show_last)
+                        err = summary["error"]
+                        n_written = summary["n_written"]
+                    except Exception as exc:          # 連續擷取還沒開始就失敗（例如找不到讀取器）
+                        traceback.print_exc()
+                        ErrorHandler.log_error(exc, "連續擷取（啟動前）")
+                        err, n_written = exc, 0
                     self.root.after(0, self._std_long_complete)
+                    if err is not None:
+                        self.root.after(
+                            0,
+                            lambda e=err, n=n_written: self.std_status.config(
+                                text=f"連續擷取失敗（已存 {n} 支）：{type(e).__name__}: {str(e)[:80]}",
+                                foreground="red",
+                            )
+                        )
                     return
             
                 start_time = time.time()
@@ -7202,16 +7218,13 @@ class DataCollectionGUI:
             should_continue=lambda: self.is_collecting,
         ).run()
     
+        # 出錯時把完整錯誤印到 Spyder 主控台並寫進 error.log；畫面上的紅字由 collect_loop 負責顯示
         if summary["error"] is not None:
             err = summary["error"]
+            print(f"\n[連續擷取錯誤] 已存 {summary['n_written']} 支後停止")
+            traceback.print_exception(type(err), err, err.__traceback__)
             ErrorHandler.log_error(err, "連續擷取")
-            self.root.after(
-                0,
-                lambda e=err, n=summary["n_written"]: self.std_status.config(
-                    text=f"連續擷取中斷（已存 {n} 支，之後沒有資料）：{str(e)[:60]}",
-                    foreground="red",
-                )
-            )
+        return summary
     
     def _std_long_stop(self):
         """停止長時間收集"""

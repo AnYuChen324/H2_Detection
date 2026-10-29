@@ -239,6 +239,7 @@ from shared_feature_utils import (
     validate_baseline_source_isolation,
     load_band_config,
     SIGNAL_RMS_MIN,
+    build_continuous_segments,    # v22 連續段：依取樣序號把首尾相接的 0.5 秒檔組成一段
 )
 
 
@@ -355,12 +356,17 @@ def overlap_seconds(a_start, a_end, b_start, b_end):
 #       dual_session_manifest_*.csv
 #       disturbance_events_*.csv
 # ============================================================
-def collect_disturbance_sessions(root_dir: Path):
+def collect_disturbance_sessions(
+    root_dir: Path,
+    input_mode,      # "segments" 或 "per_file_legacy"
+    fs,              # feature_extraction_config 的 fs（segments 模式換算點數與秒數用）
+):
     """
     掃描每個 disturbance session，配對 TDMS、manifest、event。
     所有問題先收集起來，最後一次列出並停止（人工下載漏檔通常不只一個，方便一次補齊）。
     """
-    file_specs = []       # 後面萃取特徵時要處理哪些 TDMS 檔
+    file_specs = []       # 後面萃取特徵時要處理哪些 TDMS 檔（segments 模式是一段一筆）
+    file_records = []     # segments 模式：一支檔一筆，給資料隔離與內容重複檢查用
     manifest_rows = []    # 每個 TDMS 對應的時間資訊與 metadata
     event_rows = []       # 每個干擾事件的標註資訊
     problems = []         # 收集所有問題，最後一次報錯
@@ -430,6 +436,12 @@ def collect_disturbance_sessions(root_dir: Path):
             # 排除已知有問題的單支檔：同時從 manifest 拿掉，後面的時間檢查才不會再算到它
             row_stems = df_manifest[file_col].map(lambda x: PureWindowsPath(str(x)).stem)
             drop_mask = row_stems.isin(EXCLUDED_FILES)
+            
+            # 連續段不能挖掉中間的檔（會變成兩段，而且 manifest 的時間判斷要重做），v22 資料有問題請直接修 manifest 或整個 session 不用
+            if input_mode == "segments" and drop_mask.any():
+                problems.append(f"{where}：segments 模式不支援 EXCLUDED_FILES，但這個 session 有 {int(drop_mask.sum())} 支在排除名單裡")
+                continue
+            
             for s in row_stems[drop_mask]:
                 excluded.append((where, s, EXCLUDED_FILES[s]))
             df_manifest = df_manifest.loc[~drop_mask].reset_index(drop=True)
@@ -498,6 +510,53 @@ def collect_disturbance_sessions(root_dir: Path):
                 # 將驗證後的數值時間寫回 DataFrame，確保後續使用的是數字型別
                 df_events["start_elapsed_sec"] = ev_start
                 df_events["end_elapsed_sec"] = ev_end
+                
+            # ---- segments 模式：用取樣序號組連續段，取代下面「逐支配對 + 檔名時間順序」的檢查 ----
+            if input_mode == "segments":
+                # 首尾相接、取樣點重疊、manifest 列了但找不到檔、同名檔，都在 build_continuous_segments 裡檢查
+                try:
+                    seg_specs, df_seg_files = build_continuous_segments(manifest_path, disturbance_dir, fs)
+                except ValueError as e:
+                    problems.append(f"{where}：{e}")
+                    continue
+                # 資料夾裡多出 manifest 沒列的 TDMS：來源不明，不允許
+                extra_tdms = sorted({p.name for p in disturbance_dir.glob("*.tdms")} - set(df_seg_files["tdms_name"]))
+                if extra_tdms:
+                    problems.append(f"{where}：資料夾有 {len(extra_tdms)} 支 TDMS 不在 manifest 裡 {extra_tdms[:5]}")
+                    continue
+
+                # 和下面舊流程相同：baseline_end_sec 只當 metadata；事件補上 session 資訊
+                if not df_events.empty:
+                    baseline_end_sec = float(df_events["start_elapsed_sec"].min())
+                else:
+                    baseline_end_sec = float(cap_end.max())
+                df_events["session_id"] = session_id
+                df_events["disturbance_group"] = disturbance_group
+                df_events["disturbance_id"] = disturbance_id
+                event_rows.append(df_events)
+
+                # 一段一筆交給特徵抽取；檔案層級的資訊另外記，用來把窗對回它起點所在的那支檔
+                file_specs.extend(seg_specs)
+                for r in df_seg_files.itertuples(index=False):
+                    file_records.append({"filepath": r.filepath, "record_id": r.segment_id})
+                    manifest_rows.append({
+                        "session_id": session_id,
+                        "record_id": r.segment_id,                                     # 一段一個 record：告警規則、CUSUM／temporal 依它分組
+                        "disturbance_group": disturbance_group,
+                        "disturbance_id": disturbance_id,
+                        "filename_stem": Path(r.filepath).stem,
+                        "tdms_file": str(r.filepath),
+                        "capture_start_elapsed_sec": float(r.capture_start_elapsed_sec),
+                        "capture_end_elapsed_sec": float(pd.to_numeric(r.capture_end_elapsed_sec)),
+                        "capture_mid_elapsed_sec": float(pd.to_numeric(r.capture_mid_elapsed_sec)),
+                        "offset_in_segment_sec": float(r.offset_in_segment_sec),       # 這支檔在段內從第幾秒開始
+                        "baseline_end_sec": baseline_end_sec,
+                        "label": 0,
+                        "leak_status": "leak0",
+                        "disturbance_session_manifest": str(manifest_path),
+                        "disturbance_event_csv": str(event_path),
+                    })
+                continue            
 
             # ---- TDMS 配對：manifest 列的每支都要找到；資料夾裡多出來的也要列出 ----
             row_paths = []         # manifest 每一列對到的檔案路徑
@@ -619,8 +678,12 @@ def collect_disturbance_sessions(root_dir: Path):
     # 把所有 session 的事件資料合併成一張表；若所有 session 都沒有事件，則回傳空表
     df_events_all = pd.concat(event_rows, ignore_index=True) if event_rows else pd.DataFrame()
 
-    print(f"✅ Disturbance session 檢查通過：{len(session_dirs)} 個 session、{len(file_specs)} 支 TDMS")
-    return file_specs, df_manifest_all, df_events_all
+    if input_mode == "segments":
+        print(f"✅ Disturbance session 檢查通過：{len(session_dirs)} 個 session、{len(file_specs)} 段、{len(file_records)} 支 TDMS")
+    else:
+        file_records = file_specs        # 舊流程一筆就是一支檔
+        print(f"✅ Disturbance session 檢查通過：{len(session_dirs)} 個 session、{len(file_specs)} 支 TDMS")
+    return file_specs, df_manifest_all, df_events_all, file_records
 
 
 # ============================================================
@@ -689,8 +752,9 @@ def attach_window_labels_from_disturbance_meta(
                     best_type = str(ev.disturbance_type)
                     best_strength = str(ev.disturbance_strength)
 
-        # 將 window 判定為干擾或乾淨正常:判斷這個 window 有沒有被視為干擾窗,只要有任何重疊，就算干擾窗
-        flag = 1 if best_overlap > 0 else 0
+        # 浮點誤差：例如 2.4 + 0.2 = 2.6000000000000005，剛好「碰到」事件起點的窗會被算成重疊 5e-16 秒；
+        # 重疊不到 1 微秒（1 個取樣點）視為沒有重疊
+        flag = 1 if best_overlap > 1e-6 else 0
         ratio = best_overlap / window_sec if window_sec > 0 else 0.0     # 算重疊比例
 
         # 把這個 window 的結果存進 list
@@ -725,6 +789,7 @@ def build_disturbance_inference_feature_csv(
     feature_config_json,              # Step2 選出的模型特徵與 Feature Execution Plan
     output_csv,                       # 輸出的推論特徵表路徑
     cache_dir,                        # TDMS 特徵計算結果的快取位置
+    input_mode,                       # "segments"（v22 連續錄製，正式）或 "per_file_legacy"（舊資料）；必填
     split_name="disturbance_infer",   # 快取與輸出識別名稱
     n_jobs=2,                         # 平行處理的工作數
     require_final_baseline=False,     # 是否強制 baseline 必須標記為 final
@@ -732,6 +797,11 @@ def build_disturbance_inference_feature_csv(
     """將 disturbance TDMS、session manifest 與干擾事件標註，
         依 Step2 已定案的頻帶、固定 baseline 與特徵計畫，
         轉成可供模型與抗干擾規則評估的逐窗特徵表。"""
+    # segments：v22 連續錄製（正式流程），同一段的 0.5 秒檔在記憶體串起來再切窗，跨檔的窗也會切出來
+    # per_file_legacy：舊資料，每支檔各自切窗，再用 capture_start_elapsed_sec 排到 session 時間軸上
+    if input_mode not in ("segments", "per_file_legacy"):
+        raise ValueError(f"input_mode 只能是 'segments' 或 'per_file_legacy'，目前：{input_mode}")    
+    
     # 把路徑轉成 Path
     root_dir = Path(root_dir)
     band_config_json = Path(band_config_json)
@@ -854,10 +924,13 @@ def build_disturbance_inference_feature_csv(
     print(f"CUSUM 參數：k = {cusum_k}，decay = {cusum_decay}")
 
     # 掃描 disturbance 資料夾，整理出三份資料：
-    # 1. file_specs：後面萃特徵要處理哪些 TDMS 檔
+    # 1. file_specs：file_specs  ：交給特徵抽取的清單（segments 模式是一段一筆，舊模式是一支檔一筆）
     # 2. df_manifest：每個 TDMS 在整個 session 裡的時間位置
     # 3. df_events：每個 session 裡的干擾段落資訊
-    file_specs, df_manifest, df_events = collect_disturbance_sessions(root_dir)
+    # 4.file_records：一支檔一筆，給資料隔離與內容重複檢查用
+    file_specs, df_manifest, df_events, file_records = collect_disturbance_sessions(
+        root_dir, input_mode=input_mode, fs=fs,
+    )
     print("TDMS 檔數量:", len(file_specs))
     print("manifest rows:", len(df_manifest))
     print("event rows:", len(df_events))
@@ -871,14 +944,14 @@ def build_disturbance_inference_feature_csv(
     # 因此不得與建立 site_baseline.json 的正常 calibration TDMS 使用相同檔案、record_id 或內容。
     validate_baseline_source_isolation(
         baseline_payload=fixed_baseline,
-        analysis_records=file_specs,
+        analysis_records=file_records,      # 逐支檔檢查（連續段裡的每一支都要查）
         context="Disturbance feature engineering",
         strict=STRICT_BASELINE_ISOLATION,
     )
 
     # 內容層級的重複與洩漏檢查：比檔案內容的 SHA-256，改過檔名的複本也抓得到
     check_content_duplicates(
-        file_specs,
+        file_records,
         fixed_baseline.get("source_tdms_paths", []),
         strict=STRICT_BASELINE_ISOLATION,
     )
@@ -912,24 +985,52 @@ def build_disturbance_inference_feature_csv(
     # 檢查有沒有 filename（同一 session 共用 record_id，只能靠檔名對回 manifest）
     if "filename" not in df.columns:
         raise ValueError("特徵表缺少 filename 欄位，無法對齊 manifest")
-    df["filename_stem"] = df["filename"].map(normalize_filename_stem)
+    
+    if input_mode == "segments":
+        # 連續段：窗的 t_start 是「段內秒數」，窗也可能跨兩支檔。
+        # 依窗起點落在哪一支檔，對回那支檔的 manifest 列（filename_stem、capture_start_elapsed_sec…），
+        # 再把 t_start 換成「那支檔內的秒數」，後面「全域時間 = capture_start + 檔內時間」的算法就完全不用改。
+        # 例：段內 0.40 秒起的窗 → 落在第 1 支（offset 0.0），檔內 0.40 秒；它會一路延伸到第 2 支的 0.10 秒，這是正常的。
+        file_offsets = (
+            df_manifest[["record_id", "filename_stem", "offset_in_segment_sec"]]
+            .sort_values("offset_in_segment_sec")
+        )
+        df = df.sort_values("t_start").reset_index(drop=True)
+        df = pd.merge_asof(
+            df, file_offsets,
+            left_on="t_start", right_on="offset_in_segment_sec",
+            by="record_id", direction="backward",
+        )
+        if df["filename_stem"].isna().any():
+            raise ValueError("有窗對不到段內的任何一支檔（段的起點和 manifest 不一致）")
+        # 浮點誤差：剛好落在檔案邊界的窗（例如 0.5 - 0.5 = 1e-17）四捨五入到奈秒
+        df["t_start"] = (df["t_start"] - df["offset_in_segment_sec"]).round(9)
+        df = df.drop(columns=["offset_in_segment_sec"])   # manifest 合併時會再帶回來
+    else:
+        df["filename_stem"] = df["filename"].map(normalize_filename_stem)
 
     # 檢查：每支 TDMS 都有算出窗（用檔名判斷，不能用 record_id）
-    expected_stems = {Path(s["filepath"]).stem for s in file_specs}
+    expected_stems = {Path(s["filepath"]).stem for s in file_records}    # 逐支檔檢查（segments 模式的 file_specs 是一段一筆）
     lost_stems = sorted(expected_stems - set(df["filename_stem"]))
     if lost_stems:
         raise ValueError(f"有 {len(lost_stems)} 支 TDMS 沒有算出任何窗：{lost_stems[:10]}")
 
     # 檢查：訊號品質（門檻和 baseline 程式相同）
-    # disturbance 一支檔只有 0.5 秒、session 內檔案之間本來就有間隙，所以排除「整支檔」，不排除整個 session
     bad = pd.Series(False, index=df.index)
     for ch in ("ai0", "ai1"):
         rms = pd.to_numeric(df[f"{ch}_rms"], errors="coerce")
         bad |= ~np.isfinite(rms) | (rms < SIGNAL_RMS_MIN)
     if bad.any():
-        bad_stems = sorted(df.loc[bad, "filename_stem"].unique())
-        print(f"⚠️ 訊號 QC：{len(bad_stems)} 支 TDMS 有壞窗（共 {int(bad.sum())} 窗），整支排除：{bad_stems[:10]}")
-        df = df[~df["filename_stem"].isin(bad_stems)].reset_index(drop=True)
+        if input_mode == "segments":
+            # 連續段：只拿掉中間幾支檔會在段裡挖出空洞，後面的告警規則會把洞前後當成相鄰窗，所以整段排除
+            bad_ids = sorted(df.loc[bad, "record_id"].unique())
+            print(f"⚠️ 訊號 QC：{len(bad_ids)} 段有壞窗（共 {int(bad.sum())} 窗），整段排除：{bad_ids[:10]}")
+            df = df[~df["record_id"].isin(bad_ids)].reset_index(drop=True)
+        else:
+            # 舊資料：一支檔只有 0.5 秒、session 內檔案之間本來就有間隙，所以排除「整支檔」，不排除整個 session
+            bad_stems = sorted(df.loc[bad, "filename_stem"].unique())
+            print(f"⚠️ 訊號 QC：{len(bad_stems)} 支 TDMS 有壞窗（共 {int(bad.sum())} 窗），整支排除：{bad_stems[:10]}")
+            df = df[~df["filename_stem"].isin(bad_stems)].reset_index(drop=True)
         if df.empty:
             raise ValueError("訊號 QC 後沒有任何可用的 TDMS")
 
@@ -1340,6 +1441,7 @@ if __name__ == "__main__":
         split_name="disturbance_final",
         n_jobs=6,
         require_final_baseline=False,
+        input_mode="per_file_legacy",   # 舊資料：每支檔各自切窗；v22 連續錄製改成 "segments"
     )  
     
     

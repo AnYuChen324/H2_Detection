@@ -6,34 +6,24 @@
 1. 讀入 disturbance 的 model / rule（可選 full）三種特徵表
 2. 以 model csv 為基準，檢查至少要有：
    session_id, disturbance_group, t_start
-3. 先把每個 session_id 彙整成一列 summary，算出：
-   n_windows
-   t_start_min / t_start_max
-   disturbance_group
-   disturbance_id
-4. 依 disturbance_group 分組，從每組隨機抽出 holdout_per_group 筆 session 當 holdout，其餘進 dev
-5. 用同一組 session_id，同步切：
-   - model csv
-   - rule csv
-   - full csv（可選）
+3. 先把每個 session_id 彙整成一列 summary
+4. 依 disturbance_group 分層，每組打亂後：
+   holdout_per_group 筆 → holdout、dev_per_group 筆 → dev、其餘 → train
+   同一個 session 整個放在同一份，不會被切開
+5. model / rule / full 三個版本都加上同一個 split 欄
 6. 輸出：
-   disturbance_features_dev.csv
-   disturbance_features_holdout.csv
-   disturbance_rule_features_dev.csv
-   disturbance_rule_features_holdout.csv
-   disturbance_full_features_dev.csv（可選）
-   disturbance_full_features_holdout.csv（可選）
-   disturbance_session_split.csv
+   disturbance_features_train.csv       （model 版，只有 train）→ 模型訓練
+   disturbance_rule_features_eval.csv   （rule 版，dev + holdout）→ 干擾推論
+   disturbance_full_features_all.csv    （full 版，全部，可選）→ 除錯
+   disturbance_session_split.csv        （每個 session 分到哪一份）
 
-用途區分：
-1. model 版：
-   只保留模型訓練需要的欄位，給模型訓練與 transition 合併使用
-2. rule 版：
-   保留模型欄位 + offband 規則欄位，給干擾推論與規則比較使用
-3. full 版：
-   保留全部欄位，供除錯與核對使用
+三份的用途：
+1. train  ：訓練模型（模型看過，不能拿來選規則或評估）
+2. dev    ：選規則（干擾推論 mode="select"）
+3. holdout：規則定案後量一次成績（干擾推論 mode="evaluate"）
+
+每個 disturbance_group 至少要有 holdout_per_group + dev_per_group + 1 個 session。
 '''
-
 
 
 from __future__ import annotations
@@ -66,40 +56,47 @@ def build_session_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# 定義切分函式，輸出 train, holdout, split summary
+# 依 disturbance_group 分層，把 session 分成 train / dev / holdout 三份
 # ============================================================
 def stratified_session_split(
     session_summary: pd.DataFrame,
     holdout_per_group: int,
+    dev_per_group: int,
     seed: int,
-) -> tuple[list[str], list[str], pd.DataFrame]:
-    rng = np.random.default_rng(seed)
-    holdout_ids: list[str] = []
+) -> pd.DataFrame:
+    """
+    三份的用途：
+      train   ：訓練模型（模型看過，不能拿來選規則或評估）
+      dev     ：選規則（干擾推論 mode="select" 用）
+      holdout ：規則定案後量一次成績（干擾推論 mode="evaluate" 用）
 
-    # 按 disturbance_group 分組，逐組處理
+    每個 disturbance_group 各自打亂後：前 holdout_per_group 筆 → holdout，
+    接著 dev_per_group 筆 → dev，其餘 → train（至少要留 1 筆給 train）。
+    同一個 session 整個放在同一份，不會被切開。
+    """
+    rng = np.random.default_rng(seed)
+    split_map: dict[str, str] = {}
+
     for group_key, sub in session_summary.groupby("group_key", sort=True):
         session_ids = sorted(sub["session_id"].tolist())
-
-        if len(session_ids) <= holdout_per_group:
+        need = holdout_per_group + dev_per_group + 1          # +1：至少 1 筆給 train
+        if len(session_ids) < need:
             raise ValueError(
                 f"{group_key} 這組只有 {len(session_ids)} 筆 session，"
-                f"無法留 {holdout_per_group} 筆給 holdout。"
+                f"不夠分成 holdout {holdout_per_group} + dev {dev_per_group} + train 至少 1。"
             )
-
-        chosen = sorted(rng.choice(session_ids, size=holdout_per_group, replace=False).tolist())
-        holdout_ids.extend(chosen)
-
-    holdout_ids = sorted(holdout_ids)
-    train_ids = sorted(set(session_summary["session_id"]) - set(holdout_ids))
+        shuffled = rng.permutation(session_ids).tolist()
+        n_h, n_d = holdout_per_group, dev_per_group
+        for sid in shuffled[:n_h]:
+            split_map[sid] = "holdout"
+        for sid in shuffled[n_h:n_h + n_d]:
+            split_map[sid] = "dev"
+        for sid in shuffled[n_h + n_d:]:
+            split_map[sid] = "train"
 
     split_summary = session_summary.copy()
-    split_summary["split"] = np.where(
-        split_summary["session_id"].isin(holdout_ids),
-        "holdout",
-        "dev",
-    )
-
-    return train_ids, holdout_ids, split_summary
+    split_summary["split"] = split_summary["session_id"].map(split_map)
+    return split_summary
 
 
 # ============================================================
@@ -107,7 +104,7 @@ def stratified_session_split(
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="把 disturbance features CSV 依 session_id 切成 dev / holdout。"
+        description="把 disturbance features CSV 依 session_id 切成 train / dev / holdout。"
     )
 
     # 輸入 3 個
@@ -138,6 +135,13 @@ def main():
         type=Path,
         default=None,
         help="輸出資料夾，預設輸入 CSV 所在資料夾",
+    )   
+    
+    parser.add_argument(
+        "--dev-per-group",
+        type=int,
+        default=1,
+        help="每個 disturbance_group 留幾筆 session 到 dev（選規則用），預設 1",
     )
 
     parser.add_argument(
@@ -183,70 +187,59 @@ def main():
     
     session_summary = build_session_summary(df_model)
 
-    dev_ids, holdout_ids, split_summary = stratified_session_split(
+    split_summary = stratified_session_split(
         session_summary=session_summary,
         holdout_per_group=args.holdout_per_group,
+        dev_per_group=args.dev_per_group,
         seed=args.seed,
     )
-
-    df_model_dev = df_model[df_model["session_id"].isin(dev_ids)].copy()
-    df_model_holdout = df_model[df_model["session_id"].isin(holdout_ids)].copy()
+    split_map = dict(zip(split_summary["session_id"], split_summary["split"]))
     
-    df_rule_dev = df_rule[df_rule["session_id"].isin(dev_ids)].copy()
-    df_rule_holdout = df_rule[df_rule["session_id"].isin(holdout_ids)].copy()
+    # 三個版本都加上 split 欄，後面的程式一律看這一欄，不再各自重新切
+    for df in (df_model, df_rule) + ((df_full,) if df_full is not None else ()):
+        df["split"] = df["session_id"].map(split_map)
+        if df["split"].isna().any():
+            missing = sorted(df.loc[df["split"].isna(), "session_id"].unique().tolist())
+            raise ValueError(f"有 session 在 model csv 裡找不到，無法分配：{missing[:10]}")
     
-    if df_full is not None:
-        df_full_dev = df_full[df_full["session_id"].isin(dev_ids)].copy()
-        df_full_holdout = df_full[df_full["session_id"].isin(holdout_ids)].copy()
-
-    model_dev_path = output_dir / "disturbance_features_dev.csv"
+    # 1. 模型訓練用：只有 train
+    model_train_path = output_dir / "disturbance_features_train.csv"
+    df_model[df_model["split"] == "train"].to_csv(model_train_path, index=False, encoding="utf-8-sig")
+    
+    # 訓練程式最後評估模型用（model 版）；選規則、驗收仍用 disturbance_rule_features_eval.csv
     model_holdout_path = output_dir / "disturbance_features_holdout.csv"
+    df_model[df_model["split"] == "holdout"].to_csv(model_holdout_path, index=False, encoding="utf-8-sig")
     
-    rule_dev_path = output_dir / "disturbance_rule_features_dev.csv"
-    rule_holdout_path = output_dir / "disturbance_rule_features_holdout.csv"
+    # 2. 干擾推論用：dev + holdout 放同一份，靠 split 欄區分
+    #    （干擾推論 select 模式只讀 dev；evaluate 模式只在 holdout 上量定案規則）
+    rule_eval_path = output_dir / "disturbance_rule_features_eval.csv"
+    df_rule[df_rule["split"] != "train"].to_csv(rule_eval_path, index=False, encoding="utf-8-sig")
+    
+    # 3. 除錯用：全部資料都留，含 split 欄
+    if df_full is not None:
+        full_path = output_dir / "disturbance_full_features_all.csv"
+        df_full.to_csv(full_path, index=False, encoding="utf-8-sig")
     
     split_path = output_dir / "disturbance_session_split.csv"
-    
-    df_model_dev.to_csv(model_dev_path, index=False, encoding="utf-8-sig")
-    df_model_holdout.to_csv(model_holdout_path, index=False, encoding="utf-8-sig")
-    
-    df_rule_dev.to_csv(rule_dev_path, index=False, encoding="utf-8-sig")
-    df_rule_holdout.to_csv(rule_holdout_path, index=False, encoding="utf-8-sig")
-    
-    if df_full is not None:
-        full_dev_path = output_dir / "disturbance_full_features_dev.csv"
-        full_holdout_path = output_dir / "disturbance_full_features_holdout.csv"
-        df_full_dev.to_csv(full_dev_path, index=False, encoding="utf-8-sig")
-        df_full_holdout.to_csv(full_holdout_path, index=False, encoding="utf-8-sig")
-    
     split_summary.to_csv(split_path, index=False, encoding="utf-8-sig")
-
-    print("=" * 80)
-    print("Disturbance Dev / Holdout Split 完成")
-    print("=" * 80)
-    print(f"model_csv            : {model_csv}")
-    print(f"rule_csv             : {rule_csv}")
-    print(f"full_csv             : {full_csv if df_full is not None else 'None'}")
-    print(f"output_dir           : {output_dir}")
-    print(f"holdout_per_group    : {args.holdout_per_group}")
-    print(f"seed                 : {args.seed}")
-    print(f"n_total_sessions     : {session_summary['session_id'].nunique()}")
-    print(f"n_dev_sessions       : {len(dev_ids)}")
-    print(f"n_holdout_sessions   : {len(holdout_ids)}")
-    print(f"n_model_dev_windows  : {len(df_model_dev)}")
-    print(f"n_model_holdout_win  : {len(df_model_holdout)}")
-    print(f"n_rule_dev_windows   : {len(df_rule_dev)}")
-    print(f"n_rule_holdout_win   : {len(df_rule_holdout)}")
-    print()
     
-    print(f"已輸出 model dev     : {model_dev_path}")
-    print(f"已輸出 model holdout : {model_holdout_path}")
-    print(f"已輸出 rule dev      : {rule_dev_path}")
-    print(f"已輸出 rule holdout  : {rule_holdout_path}")
+    counts = split_summary["split"].value_counts()
+    print("=" * 80)
+    print("Disturbance train / dev / holdout Split 完成")
+    print("=" * 80)
+    print(f"holdout_per_group : {args.holdout_per_group}")
+    print(f"dev_per_group     : {args.dev_per_group}")
+    print(f"seed              : {args.seed}")
+    print(f"session 數        ：train {counts.get('train', 0)}、dev {counts.get('dev', 0)}、holdout {counts.get('holdout', 0)}")
+    print()
+    print("各 disturbance_group 的分配：")
+    print(split_summary.groupby(["disturbance_group", "split"]).size().unstack(fill_value=0))
+    print()
+    print(f"已輸出 模型訓練用   : {model_train_path}")
+    print(f"已輸出 干擾推論用   : {rule_eval_path}")
     if df_full is not None:
-        print(f"已輸出 full dev      : {full_dev_path}")
-        print(f"已輸出 full holdout  : {full_holdout_path}")
-    print(f"已輸出 split 表      : {split_path}")
+        print(f"已輸出 除錯用 full  : {full_path}")
+    print(f"已輸出 split 表     : {split_path}")
 
 
 

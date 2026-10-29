@@ -171,6 +171,7 @@ Disturbance 特徵工程
 from pathlib import Path
 import sys
 import gc
+import re
 import pandas as pd
 import numpy as np
 import json
@@ -206,6 +207,7 @@ from shared_feature_utils import (
     validate_baseline_source_isolation,
     load_band_config,
     SIGNAL_RMS_MIN,
+    build_continuous_segments,    # v22 連續段：依取樣序號把首尾相接的 0.5 秒檔組成一段
 )
 
 
@@ -301,6 +303,10 @@ def attach_window_labels_from_transition_meta(
         "record_id", "interval_name", "distance_cm", "leak_quantity", "pressure_bar",
         "output_tdms", "normal_end_sec", "leak_start_sec", "onset_gt_sec",
     ]
+    
+    # v22 連續段的 meta 有 session_id（舊 merge 的 transition_meta.csv 沒有）；切分程式靠它讓同一 session 不跨 split
+    if "session_id" in df_meta.columns:
+        meta_cols.append("session_id")
     meta = df_meta[meta_cols].copy()
     
     # 特徵表裡不應該已經有 meta 欄位，否則 merge 會變成 _x / _y
@@ -337,17 +343,252 @@ def attach_window_labels_from_transition_meta(
 
 
 # ============================================================
+# v22 連續錄製：由 manifest + 轉換事件檔建立「連續段」與標註表
+# ============================================================
+# 設定灰色地帶（onset 前後不給 0/1 標籤的範圍）
+#   ONSET 前：按按鈕和實際開閥之間有人的反應時間（約 0.2～0.5 秒），按早按晚都有可能
+#   ONSET 後：閥門打開後流量要一點時間才穩定，洩漏訊號不是瞬間到位
+# 兩個值會寫進標註表，改了要重跑轉換特徵工程
+TRANSITION_GRAY_BEFORE_SEC = 0.5         # 設定切換事件發生前的 0.5 秒為不確定區間，不將這段資料標記為正常或洩漏。
+TRANSITION_GRAY_AFTER_SEC = 1.0          # 設定切換事件發生後的 1 秒為不確定區間，避免將閥門剛開啟、洩漏尚未穩定的訊號直接標記為洩漏。
+
+# 取得感測器距離：從 Manifest 的 position 欄位擷取距離
+def _parse_distance_cm(position):
+    '''從 manifest 的 position（例如 "straight50cm"、"left90cm"）取出距離數字，單位 cm'''
+    m = re.search(r"(\d+(?:\.\d+)?)\s*cm", str(position))
+    return float(m.group(1)) if m else np.nan
+
+# 確認實驗條件一致
+def _single_value(series, what, where, problems):
+    '''同一段裡某個條件欄位只能有一種值（例如壓力），不一致就記成問題'''
+    values = series.dropna().unique().tolist()
+    if len(values) != 1:
+        problems.append(f"{where}：{what} 應該只有一種值，目前 {values[:5]}")
+        return np.nan
+    return values[0]
+
+
+# 根據 Manifest 與事件檔，建立連續錄製資料的 Segment 及標註資訊。
+def build_transition_segment_meta(
+    session_root,                                   # 轉換資料根目錄；底下每個 session 資料夾各有 TDMS、manifest、事件檔
+    fs,                                             # feature_extraction_config 的 fs
+    gray_before_sec=TRANSITION_GRAY_BEFORE_SEC,     # onset 前多少秒不給標籤
+    gray_after_sec=TRANSITION_GRAY_AFTER_SEC,       # onset 後多少秒不給標籤
+):
+    '''
+    每個 session 資料夾需要剛好一份：
+      transition_dual_manifest_*.csv：每支 0.5 秒 TDMS 的取樣序號與時間
+      transition_dual_events_*.csv  ：按「正常／洩漏」按鈕的時間（event_elapsed_sec）
+
+    流程：
+      1. build_continuous_segments：依取樣序號把首尾相接的檔案組成連續段
+      2. 事件檔濾掉 from_state == to_state 的列（啟用標記模式時記的起點，不是切換）
+      3. 每段找出落在段內的 normal→leak 事件，換算成段內秒數 = onset_gt_sec
+         （事件時間和 capture_start_elapsed_sec 用同一個 session 起點，可以直接相減）
+      4. normal_end_sec = onset − gray_before_sec，leak_start_sec = onset + gray_after_sec
+
+    回傳：
+      segment_specs：可直接交給 load_or_compute_features_by_file 的段清單
+      df_meta      ：每段一列，欄位和舊 transition_meta.csv 相同（attach_window_labels_from_transition_meta 直接可用）
+    '''
+    # 將輸入路徑轉成 Path 物件，方便進行檔案與資料夾操作
+    session_root = Path(session_root)
+    # 確認轉換資料根目錄存如果不存在，立即停止程式並顯示錯誤
+    if not session_root.is_dir():
+        raise FileNotFoundError(f"找不到轉換資料根目錄：{session_root}")
+
+    # 遞迴搜尋根目錄底下所有符合命名規則的 Manifest
+    session_dirs = sorted({p.parent for p in session_root.rglob("transition_dual_manifest_*.csv")})
+    # 如果完全找不到 Manifest，代表沒有可處理的 Session
+    if not session_dirs:
+        raise ValueError(f"{session_root} 底下找不到任何 transition_dual_manifest_*.csv")
+
+    # segment_specs：儲存通過檢查的連續段資訊
+    # meta_rows：儲存每段的實驗條件與時間標註，最後轉成 DataFrame
+    # problems：儲存資料異常，最後統一回報
+    # skipped：儲存沒有切換事件、因此不參與轉換評估的 Segment
+    segment_specs, meta_rows, problems, skipped = [], [], [], []
+    # 記錄已經處理過的 Segment ID，避免不同 Session 出現重複 ID，Key 為 Segment ID，Value 為來源 Session 資料夾
+    seen_segment_ids = {}
+
+    # 逐一處理每個 Session 資料夾
+    for sdir in session_dirs:
+        # 取得 Session 相對於資料根目錄的路徑，主要用於錯誤訊息及後續資料追溯
+        where = str(sdir.relative_to(session_root))
+        # 搜尋目前 Session 資料夾中的 Manifest
+        manifests = sorted(sdir.glob("transition_dual_manifest_*.csv"))
+        # 搜尋目前 Session 資料夾中的切換事件檔
+        event_files = sorted(sdir.glob("transition_dual_events_*.csv"))
+        # 每個 Session 必須剛好有一份 Manifest 和一份事件檔，若缺少或出現多份，就記錄問題並跳過目前 Session
+        if len(manifests) != 1 or len(event_files) != 1:
+            problems.append(f"{where}：manifest 和事件檔應各 1 份，目前 {len(manifests)} / {len(event_files)} 份")
+            continue
+
+        # ============================================================
+        # 1. 根據 Manifest 建立連續 Segment
+        # ============================================================
+        # 呼叫外部函式 build_continuous_segments()，根據 TDMS 的取樣序號，將首尾相接的檔案組成連續段
+        specs, df_files = build_continuous_segments(manifests[0], sdir, fs)
+
+        # ============================================================
+        # 2. 讀取事件檔，只保留真正的狀態切換
+        # ============================================================
+        # 讀取事件 CSV
+        ev = pd.read_csv(event_files[0], encoding="utf-8-sig")
+        # 定義事件檔必須包含的欄位
+        need = ["session_id", "event_elapsed_sec", "from_state", "to_state"]
+        # 檢查必要欄位是否存在：若某個欄位不在 ev.columns 中，就加入缺少欄位清單
+        miss = [c for c in need if c not in ev.columns]
+        # 如果缺少必要欄位，記錄問題並跳過目前 Session
+        if miss:
+            problems.append(f"{where}：事件檔缺少欄位 {miss}")
+            continue
+        # 將事件時間轉換成數值
+        ev["event_elapsed_sec"] = pd.to_numeric(ev["event_elapsed_sec"], errors="coerce")
+        # 檢查事件時間是否有空值或非數字
+        if ev["event_elapsed_sec"].isna().any():
+            problems.append(f"{where}：事件檔的 event_elapsed_sec 有空值或非數字")
+            continue
+        
+        # 將 Session ID 轉成字串，並移除前後空白
+        ev["session_id"] = ev["session_id"].astype(str).str.strip()
+        # 整理切換前的狀態名稱，避免前後空白影響比較
+        ev["from_state"] = ev["from_state"].astype(str).str.strip()
+        # 整理切換後的狀態名稱
+        ev["to_state"] = ev["to_state"].astype(str).str.strip()
+        # 只保留切換前後狀態不同的事件
+        ev = ev[ev["from_state"] != ev["to_state"]].reset_index(drop=True)
+        # 如果排除初始狀態紀錄後，沒有任何真正的切換事件，就記錄問題並跳過目前 Session
+        if ev.empty:
+            problems.append(f"{where}：事件檔沒有任何狀態切換（只有 normal→normal 之類的起點紀錄）")
+            continue
+
+        # ============================================================
+        # 3. 確認事件與 Manifest 屬於相同 Session
+        # ============================================================
+        # 從連續段清單中取得所有 Session ID，使用集合去除重複值
+        manifest_sids = {str(s["session_id"]) for s in specs}
+        # 找出事件檔中存在、但 Manifest 中不存在的 Session ID，集合相減表示只保留左邊有、右邊沒有的元素
+        foreign = sorted(set(ev["session_id"]) - manifest_sids)
+        # 如果發現事件來自其他 Session，記錄問題並跳過
+        if foreign:
+            problems.append(f"{where}：事件檔的 session_id {foreign} 不在 manifest 裡")
+            continue
+
+        # ============================================================
+        # 4. 將每筆切換事件對應到所屬的連續 Segment
+        # ============================================================
+        # 記錄已經被分配到某個 Segment 的事件索引，最後用來找出沒有對應到任何連續段的事件
+        used_event_idx = set()
+        # 逐一處理目前 Session 中的所有 Segment
+        for seg in specs:
+            # 取得目前 Segment 的唯一識別碼
+            # 後續 CUSUM、Temporal 等特徵可依 record_id 分組
+            seg_id = seg["record_id"]
+            # 檢查這個 Segment ID 是否曾經出現在其他資料中
+            if seg_id in seen_segment_ids:
+                problems.append(f"segment_id「{seg_id}」同時出現在 {seen_segment_ids[seg_id]} 和 {where}")
+                continue
+            
+            # 記錄目前 Segment ID 的來源資料夾
+            seen_segment_ids[seg_id] = where
+            # 取得 Segment 在整個 Session 時間軸上的開始秒數
+            start = float(seg["start_elapsed_sec"])
+            
+            # 計算 Segment 的實際持續時間，訊號總 Sample 數 ÷ 取樣率 = 秒數
+            duration = seg["n_samples"] / float(fs)
+            # 從事件檔中找出落在目前 Segment 時間範圍內的事件
+            in_seg = ev[
+                (ev["session_id"] == seg["session_id"])             # 條件一：事件與 Segment 屬於相同 Session
+                & (ev["event_elapsed_sec"] >= start)                # 條件二：事件時間大於或等於 Segment 開始時間
+                & (ev["event_elapsed_sec"] < start + duration)      # 條件三：事件時間小於 Segment 結束時間
+            ]
+            # 將目前找到的事件索引加入已使用集合
+            used_event_idx.update(in_seg.index.tolist())
+
+            # 段內沒有切換：多半是中間有斷點，切出了純正常或純洩漏的一小段；沒有 onset 不能做轉換評估，先排除
+            if in_seg.empty:
+                skipped.append(f"{seg_id}（{duration:.2f} 秒，段內沒有切換事件）")
+                continue
+            # 目前只支援「一段一次 normal→leak」；多次切換的標註規則還沒定，直接停止
+            if len(in_seg) > 1:
+                problems.append(f"{seg_id}：段內有 {len(in_seg)} 次切換，目前只支援一次")
+                continue
+            # 取得目前 Segment 中唯一的一筆切換事件
+            e = in_seg.iloc[0]
+            # 確認切換方向必須是 normal→leak，如果是 leak→normal 或其他狀態組合，就記錄問題
+            if not (e["from_state"] == "normal" and e["to_state"] == "leak"):
+                problems.append(f"{seg_id}：切換方向是 {e['from_state']}→{e['to_state']}，目前只支援 normal→leak")
+                continue
+            
+            # 將事件時間從 Session 時間軸轉成 Segment 內部時間
+            onset = float(e["event_elapsed_sec"]) - start      # 段內秒數
+            normal_end = onset - float(gray_before_sec)
+            leak_start = onset + float(gray_after_sec)
+            if normal_end <= 0 or leak_start >= duration:
+                problems.append(
+                    f"{seg_id}：onset={onset:.2f}s、段長 {duration:.2f}s，扣掉灰色地帶後正常段或洩漏段不夠"
+                )
+                continue
+
+            # ---- 4. 段的條件資訊（同一段只能有一種值） ----
+            files = df_files[df_files["segment_id"] == seg_id]
+            pressure = _single_value(pd.to_numeric(files["pressure_bar"], errors="coerce"), "pressure_bar", seg_id, problems)
+            distance = _single_value(files["position"].map(_parse_distance_cm), "距離（position）", seg_id, problems)
+            volume = _single_value(pd.to_numeric(files["matched_volume_ml"], errors="coerce"), "matched_volume_ml", seg_id, problems)
+
+            segment_specs.append(seg)
+            meta_rows.append({
+                "record_id": seg_id,                       # 一段一個 record，CUSUM／temporal 依它分組
+                "session_id": seg["session_id"],
+                "interval_name": where,                    # session 資料夾
+                "distance_cm": distance,
+                "leak_quantity": volume,                   # 洩漏段的設定流量
+                "pressure_bar": pressure,
+                "output_tdms": Path(seg["filepaths"][0]).name,   # 段的第一支檔（追溯用）
+                "normal_end_sec": normal_end,
+                "leak_start_sec": leak_start,
+                "onset_gt_sec": onset,
+                "segment_duration_sec": duration,
+                "n_files": seg["n_files"],
+                "gray_before_sec": float(gray_before_sec),
+                "gray_after_sec": float(gray_after_sec),
+                "onset_source": "transition_events",       # onset 來自按鈕事件（舊 merge 資料是檔名交界）
+            })
+
+        # 有事件沒落在任何段內：事件剛好在斷點的空檔裡，這次切換沒有訊號可用
+        lost = ev.loc[~ev.index.isin(used_event_idx)]
+        for _, e in lost.iterrows():
+            problems.append(f"{where}：事件 {e['from_state']}→{e['to_state']} @ {e['event_elapsed_sec']:.3f}s 不在任何連續段內")
+
+    if skipped:
+        print(f"⚠️ 有 {len(skipped)} 段沒有切換事件，已排除：")
+        for s in skipped:
+            print(f"   - {s}")
+    if problems:
+        raise ValueError(f"轉換資料有 {len(problems)} 個問題，請先修正：\n  - " + "\n  - ".join(problems))
+    if not segment_specs:
+        raise ValueError("沒有任何可用的轉換段")
+
+    df_meta = pd.DataFrame(meta_rows)
+    print(f"✅ 轉換段：{len(df_meta)} 段，onset 來自事件檔；灰色地帶 onset 前 {gray_before_sec}s、後 {gray_after_sec}s")
+    return segment_specs, df_meta
+
+
+# ============================================================
 # 主流程
 # ============================================================
 def build_inference_feature_csv(
-    tdms_dir,                          # transition TDMS 檔案路徑
-    meta_csv,                          # 對應的 transition 標註表
     band_config_json,                  # Step2 輸出的 band 設定
     feature_extraction_config_path,
     baseline_json,
     feature_config_json,               # Step2 輸出的 feature 設定
     output_csv,                        # 最後特徵表要輸出去哪裡
     cache_dir,                         # 中間 band 特徵的快取資料夾
+    input_mode,                        # "segments"（v22 連續錄製，正式）或 "merged_legacy"（舊資料硬接，只供測試）；必填
+    session_root=None,                 # segments 用：轉換資料根目錄（每個 session 資料夾有 TDMS、manifest、事件檔）
+    tdms_dir=None,                     # merged_legacy 用：merge 後的 TDMS 資料夾
+    meta_csv=None,                     # merged_legacy 用：merge 輸出的 transition_meta.csv
     split_name="transition_infer",     # 給 cache / 識別用的名字
     n_jobs=2,                          # 平行處理數量
     require_final_baseline=False,
@@ -367,8 +608,21 @@ def build_inference_feature_csv(
     # ============================================================
     # -----  1. 把所有路徑轉成 Path  -----
     # ============================================================
-    tdms_dir = Path(tdms_dir)
-    meta_csv = Path(meta_csv)
+    # 兩種輸入擇一，不能混用：
+    #   segments     ：v22 連續錄製（正式流程），只需要 session_root
+    #   merged_legacy：舊資料硬接檔（只供測試），需要 tdms_dir + meta_csv
+    if input_mode == "segments":
+        if session_root is None or tdms_dir is not None or meta_csv is not None:
+            raise ValueError("input_mode='segments' 只能給 session_root，不能給 tdms_dir / meta_csv")
+        session_root = Path(session_root)
+    elif input_mode == "merged_legacy":
+        if tdms_dir is None or meta_csv is None or session_root is not None:
+            raise ValueError("input_mode='merged_legacy' 要給 tdms_dir 和 meta_csv，不能給 session_root")
+        tdms_dir = Path(tdms_dir)
+        meta_csv = Path(meta_csv)
+    else:
+        raise ValueError(f"input_mode 只能是 'segments' 或 'merged_legacy'，目前：{input_mode}")
+        
     output_csv = Path(output_csv)
     cache_dir = Path(cache_dir)
     band_config_json = Path(band_config_json)
@@ -380,9 +634,24 @@ def build_inference_feature_csv(
     # ============================================================
     # -----  2. 讀 meta、讀正式設定檔  -----
     # ============================================================
-    df_meta = pd.read_csv(meta_csv)                           # 讀 transition 的標註表(有每個 record 的normal_end_sec/leak_start_sec這些時間標註)
+    if input_mode == "segments":
+        # v22 連續錄製：每個 session 資料夾的 0.5 秒 TDMS 在記憶體串成連續段，onset 來自按鈕事件檔
+        # 這裡要先知道 fs 才能換算點數和秒數，所以先讀一次 extraction config（下面正式載入時會再讀一次）
+        fs_for_segments = float(load_feature_extraction_config(feature_extraction_config_path)["fs"])
+        segment_specs, df_meta = build_transition_segment_meta(session_root, fs_for_segments)
+        # 標註表另存一份，方便核對每段的 onset 與灰色地帶
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        segment_meta_csv = output_csv.with_name(output_csv.stem + "_segment_meta.csv")
+        df_meta.to_csv(segment_meta_csv, index=False, encoding="utf-8-sig")
+        print(f"✅ 轉換段標註表已輸出：{segment_meta_csv}")
+    else:
+        # 舊 FINITE 資料：merge_transition_tdms.py 硬接後的大檔 + transition_meta.csv
+        # 只供流程測試：檔案之間的空檔被刪掉、時間軸被壓縮，onset 是檔名交界，不能當正式結果
+        print("⚠️ merged_legacy 模式：舊資料硬接，只供測試，不可作為正式驗收結果")
+        df_meta = pd.read_csv(meta_csv)                           # 讀 transition 的標註表(有每個 record 的normal_end_sec/leak_start_sec這些時間標註)
+        segment_specs = None
     df_meta["record_id"] = df_meta["record_id"].astype(str).str.strip()    # 避免 meta 的 record_id 如果尾巴不小心多一個空白，例如 abc_001 ，就會跟檔名對不上
-    
+
     # meta 基本檢查：欄位齊全、record_id 不重複、時間完整且順序合理
     # normal_end_sec：可明確視為正常狀態的最後時間點
     # leak_start_sec：可明確視為洩漏狀態的開始時間點
@@ -542,35 +811,46 @@ def build_inference_feature_csv(
     # ============================================================
     # -----  5. 從 meta 裡決定哪些 TDMS 要處理  -----
     # ============================================================
-    valid_record_ids = set(df_meta["record_id"])         # 先從 meta_csv 抓出合法的 record_id
-    all_tdms_files = sorted(tdms_dir.rglob("*.tdms"))    # 掃 tdms_dir 底下所有 .tdms
+    if input_mode == "segments":
+        # 連續段：段清單在第 2 步已經建好（首尾相接、onset 都檢查過）
+        file_specs = segment_specs
+        # 資料隔離與內容重複檢查要逐支檔做，所以另外展開成「一支檔一筆」
+        file_records = [
+            {"filepath": fp, "record_id": spec["record_id"]}
+            for spec in segment_specs
+            for fp in spec["filepaths"]
+        ]
+    else:
+        valid_record_ids = set(df_meta["record_id"])         # 先從 meta_csv 抓出合法的 record_id
+        all_tdms_files = sorted(tdms_dir.rglob("*.tdms"))    # 掃 tdms_dir 底下所有 .tdms
     
-    # 遞迴掃描 tdms_dir 底下的所有 .tdms，包含子資料夾
-    tdms_by_id = {}
-    for p in all_tdms_files:
-        tdms_by_id.setdefault(p.stem, []).append(p)
+        # 遞迴掃描 tdms_dir 底下的所有 .tdms，包含子資料夾
+        tdms_by_id = {}
+        for p in all_tdms_files:
+            tdms_by_id.setdefault(p.stem, []).append(p)
     
-    # 防止不同資料夾有同名檔
-    same_name = {k: [str(x) for x in v] for k, v in tdms_by_id.items() if len(v) > 1}
-    # 找出是否有不同路徑，但檔名相同的 TDMS
-    if same_name:
-        raise ValueError(f"不同資料夾有同檔名的 TDMS：{list(same_name.items())[:5]}")
+        # 防止不同資料夾有同名檔
+        same_name = {k: [str(x) for x in v] for k, v in tdms_by_id.items() if len(v) > 1}
+        # 找出是否有不同路徑，但檔名相同的 TDMS
+        if same_name:
+            raise ValueError(f"不同資料夾有同檔名的 TDMS：{list(same_name.items())[:5]}")
     
-    # 雙向檢查 meta 與檔案是否完整配對
-    meta_without_tdms = sorted(valid_record_ids - set(tdms_by_id))
-    tdms_without_meta = sorted(set(tdms_by_id) - valid_record_ids)
-    if meta_without_tdms:
-        raise ValueError(f"meta 有、但找不到 TDMS：{meta_without_tdms[:10]}（共 {len(meta_without_tdms)} 筆）")
-    if tdms_without_meta:
-        print(f"⚠️ 有 TDMS 不在 meta 裡，會略過：{tdms_without_meta[:10]}（共 {len(tdms_without_meta)} 筆）")
+        # 雙向檢查 meta 與檔案是否完整配對
+        meta_without_tdms = sorted(valid_record_ids - set(tdms_by_id))
+        tdms_without_meta = sorted(set(tdms_by_id) - valid_record_ids)
+        if meta_without_tdms:
+            raise ValueError(f"meta 有、但找不到 TDMS：{meta_without_tdms[:10]}（共 {len(meta_without_tdms)} 筆）")
+        if tdms_without_meta:
+            print(f"⚠️ 有 TDMS 不在 meta 裡，會略過：{tdms_without_meta[:10]}（共 {len(tdms_without_meta)} 筆）")
     
-    # 建立真正會處理的檔案清單
-    file_specs = [{"filepath": str(tdms_by_id[rid][0]), "record_id": rid} for rid in sorted(valid_record_ids)]
-
-    # 如果完全沒對到，就直接報錯
-    if not file_specs:
-        raise ValueError("找不到符合 meta 的 TDMS 檔")
-        
+        # 建立真正會處理的檔案清單
+        file_specs = [{"filepath": str(tdms_by_id[rid][0]), "record_id": rid} for rid in sorted(valid_record_ids)]
+    
+        # 如果完全沒對到，就直接報錯
+        if not file_specs:
+            raise ValueError("找不到符合 meta 的 TDMS 檔")
+        file_records = file_specs        # 舊流程一個 record 就是一支檔
+            
     
     # ============================================================
     # Transition 與固定 Baseline 資料隔離檢查
@@ -579,14 +859,14 @@ def build_inference_feature_csv(
     # 確認這些資料沒有被拿來建立 site_baseline.json，避免 Transition 訓練／驗證資料參與正常參考統計。
     validate_baseline_source_isolation(
         baseline_payload=fixed_baseline,
-        analysis_records=file_specs,
+        analysis_records=file_records,      # 逐支檔檢查（連續段裡的每一支都要查）
         context="Transition feature engineering",
         strict=STRICT_BASELINE_ISOLATION,
     )
     
     # 內容層級的重複與洩漏檢查:比「檔案內容」的 SHA-256，不只比路徑或檔名
     check_content_duplicates(
-        file_specs,
+        file_records,
         fixed_baseline.get("source_tdms_paths", []),
         strict=STRICT_BASELINE_ISOLATION,
     )
@@ -832,7 +1112,7 @@ def build_inference_feature_csv(
     # 特徵名稱與順序必須完全一致，避免模型輸入錯位。
     # ============================================================
     base_output_cols = [
-        "filename", "record_id", "t_start", "t_ref", "label",
+        "filename", "record_id", "session_id", "t_start", "t_ref", "label",
         "interval_name", "distance_cm", "leak_quantity", "pressure_bar",
         "output_tdms", "normal_end_sec", "leak_start_sec", "onset_gt_sec",
     ]
@@ -1007,7 +1287,22 @@ if __name__ == "__main__":
         cache_dir="/Users/paul/Desktop/Final/transition_feature_engineering/transition_30ml_test/feature_cache",    # 中繼快取資料夾
         split_name="transition_30ml_test",
         n_jobs=6,
+        input_mode="merged_legacy",     # 舊 FINITE 資料硬接，只供測試；v22 新資料改成下面的 segments 寫法
     )
+    
+    # v22 連續錄製（正式流程）：每個 session 資料夾放 0.5 秒 TDMS + transition_dual_manifest + transition_dual_events
+    # build_inference_feature_csv(
+    #     input_mode="segments",
+    #     session_root="/Users/paul/Desktop/Final/transition_v22",
+    #     band_config_json=BAND_CONFIG_JSON,
+    #     feature_extraction_config_path=FEATURE_EXTRACTION_CONFIG,
+    #     baseline_json=BASELINE_JSON,
+    #     feature_config_json=FEATURE_CONFIG_JSON,
+    #     output_csv=".../inference_features_transition_model.csv",
+    #     cache_dir=".../feature_cache",
+    #     split_name="transition_v22",
+    #     n_jobs=3,                     # 連續段每秒約 24 MB，段長時調小
+    # )
     
     '''
     # 檢查特徵對齊

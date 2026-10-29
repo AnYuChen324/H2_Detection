@@ -2698,8 +2698,12 @@ def compute_model_feature_importance(
         groups = df_dev["record_id"].values           # 沒指定時退回以檔案分組（建議傳 session_id，避免同場次跨兩邊）
     groups = np.asarray(groups)
 
-    # 折數不能超過組數（例如只有 3 個場次就只能切 3 折）
-    n_splits = min(n_splits, len(np.unique(groups)))
+    # 折數受「每一類各有幾個獨立組」限制：每個場次只有一種 label，
+    # 若折數 = 總組數，每折只剩一個場次 → 驗證折只有一種類別，所有折都會被跳過（和 fold-wise CV 同一套寫法）
+    groups_per_class = {int(lbl): len(np.unique(groups[y == lbl])) for lbl in np.unique(y)}
+    n_splits = min(n_splits, *groups_per_class.values())
+    if n_splits < 2:
+        raise ValueError(f"模型重要性：每一類至少需要 2 個獨立組，目前：{groups_per_class}")
     
     # StratifiedGroupKFold：同一組不拆開（Group），並盡量讓每折的正常 / 洩漏比例相近（Stratified）
     cv = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)

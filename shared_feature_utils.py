@@ -56,6 +56,17 @@ FS       = 1_000_000     # 預設採樣率 1MHz
 # 設定 DC 前處理
 REMOVE_DC = True
 
+
+# 去直流方式（全流程共用：Step2、baseline、干擾、轉換、runtime 都經過 extract_window_features_core_bands）
+#   "per_window"：每個 0.2 秒窗各自減掉自己的平均值
+#   load_one_tdms_record 的 REMOVE_DC（每檔一次）保留；之後再做每窗一次，結果只等於「每窗一次」
+#   （先減一個常數、再減窗平均，常數會被消掉）
+DC_MODE = "per_window"
+
+# 特徵公式版本：只要改了特徵算法就要換字串。
+# load_feature_extraction_config 會要求設定檔的 base_feature_version 和它一樣
+FEATURE_FORMULA_VERSION = "v4_window_dc_ai0ai1"
+
 # 先初始化為空集合，再根據本次資料實際收斂出的 selected_leak_bands 動態指定
 TEMPORAL_BAND_NAMES = set()
 
@@ -502,13 +513,22 @@ def make_records_signature(records):
 def make_file_specs_signature(file_specs):
     payload = []
     for f in file_specs:
-        stat = Path(f["filepath"]).stat()
+        # 連續段有很多支檔（filepaths），單檔流程只有一支（filepath）；兩種都逐檔記下指紋
+        # 段裡任何一支檔被換掉、或段的組成（哪幾支、順序）改變，快取都會失效
+        paths = f["filepaths"] if "filepaths" in f else [f["filepath"]]
+        files = []
+        for fp in paths:
+            stat = Path(fp).stat()
+            files.append({
+                "filepath": str(Path(fp).resolve()),
+                "size": stat.st_size,   # 其中 size 很重要，因為即使檔名一樣，只要檔案內容被更新，檔案大小通常也會變
+                "mtime_ns": stat.st_mtime_ns,    # 檔案被替換時修改時間會改變，即使大小剛好相同
+            })
         payload.append({
             "record_id": f["record_id"],
-            "filepath": str(Path(f["filepath"]).resolve()),
-            "size": stat.st_size,   # 其中 size 很重要，因為即使檔名一樣，只要檔案內容被更新，檔案大小通常也會變
-            "mtime_ns": stat.st_mtime_ns,    # 檔案被替換時修改時間會改變，即使大小剛好相同
+            "files": files,
         })
+        
     # 先依 record_id 排序，再轉成字串
     s = json.dumps(sorted(payload, key=lambda x: x["record_id"]), sort_keys=True)
     return hashlib.md5(s.encode()).hexdigest()[:12]
@@ -538,8 +558,16 @@ def load_one_tdms_record(
     channel_ai1 = channels["ai1"]
         
     # 讀出兩個聲道資料，並轉成 numpy array
-    ai0 = np.asarray(channel_ai0[:max_points_per_file], dtype=float)
-    ai1 = np.asarray(channel_ai1[:max_points_per_file], dtype=float)
+    # 先確認檔案實際點數；超過 max_points 直接報錯，不默默截斷
+    # （截斷會讓長訊號的後半段整段消失，而且不會有任何提示）
+    n_total = min(len(channel_ai0), len(channel_ai1))
+    if n_total > max_points_per_file:
+        raise ValueError(
+            f"{filepath.name} 有 {n_total} 點，超過 max_points={max_points_per_file}；"
+            f"請調大 feature_extraction_config 的 max_points，不要截斷資料"
+        )
+    ai0 = np.asarray(channel_ai0[:], dtype=float)
+    ai1 = np.asarray(channel_ai1[:], dtype=float)
     
     # 取樣率：TDMS 有記錄就必須和設定一致，避免頻率軸整個錯掉
     inc = channel_ai0.properties.get("wf_increment") if hasattr(channel_ai0, "properties") else None
@@ -579,6 +607,267 @@ def load_one_tdms_record(
             "diff": diff,
         },
         "label": label,
+    }
+
+
+# ============================================================
+# 連續段（v22 連續錄製）：把首尾相接的 0.5 秒 TDMS 在記憶體裡串成一段
+# ============================================================
+# 為什麼要串：
+#   每支 0.5 秒檔各自切窗（窗長 0.2、步長 0.05）只切得出 7 個窗，
+#   起點 0.35／0.40／0.45 那 3 個跨在兩支檔中間的窗永遠切不出來（少 30%），
+#   而且 CUSUM／rolling 每 0.5 秒就歸零。runtime 是真正連續的資料流，會有這些窗。
+# 為什麼不寫出合併檔：
+#   原始 0.5 秒檔是唯一來源，不會有「原始檔改了、合併檔忘了重做」的問題；
+#   runtime 之後也是「收一塊、接在後面、再切窗」，離線和線上用同一套邏輯。
+
+# manifest 一定要有的欄位（v22 連續模式才會有 first_sample_index 等欄位）
+SEGMENT_MANIFEST_REQUIRED_COLS = [
+    "session_id",                 # 哪一次收資料
+    "acquisition_mode",           # 必須是 "continuous"；舊 FINITE 資料沒有這欄或是空的
+    "first_sample_index",         # 這支檔第一個點是 DAQ 任務啟動後的第幾個取樣點
+    "sample_clock_start_wall",    # DAQ 任務啟動時間；同一個值＝同一個任務
+    "sample_rate",
+    "sample_count",
+    "capture_start_elapsed_sec",  # 這支檔第一個點在 session 時間軸上的秒數（和事件檔同一個起點）
+]
+
+
+def _basename_any_os(path_str):
+    '''
+    從 manifest 記錄的路徑只取檔名。
+    manifest 存的是收資料那台電腦的絕對路徑（例如 C:\\Users\\z\\Desktop\\...），
+    換到分析的電腦後路徑不存在；而且在 Mac/Linux 上 Path() 不認得反斜線，
+    Path("C:\\a\\b.tdms").name 會回傳整串，所以有反斜線時改用 Windows 規則解析。
+    '''
+    from pathlib import PureWindowsPath
+    s = str(path_str).strip()
+    return PureWindowsPath(s).name if "\\" in s else Path(s).name
+
+
+def build_continuous_segments(
+    manifest_csvs,     # 一份或多份 manifest（transition_dual_manifest_*.csv 或 dual_session_manifest_*.csv）
+    tdms_root,         # 存放 TDMS 的根資料夾（會遞迴找檔名）
+    fs_expected,       # feature_extraction_config 的 fs；manifest 的 sample_rate 必須一致
+    file_col=None,     # 要讀哪一欄的檔案；None 時自動判斷（merged_file 或 dual_file 擇一）
+):
+    '''
+    讀 manifest，把「真的首尾相接」的檔案組成連續段。
+
+    判斷規則（全部用取樣序號，不用電腦時間）：
+      1. 同一個 session_id + 同一個 sample_clock_start_wall ＝ 同一個 DAQ 任務
+         （每按一次開始，first_sample_index 都從 0 重算，所以不同任務不能混在一起排序）
+      2. 任務內依 first_sample_index 排序
+      3. 下一支的 first_sample_index == 上一支的 first_sample_index + sample_count → 接上
+         大於 → 中間掉資料，切成新的一段
+         小於 → 資料重疊（同一段錄了兩次），直接報錯
+
+    回傳：
+      segments：list[dict]，每段一筆，可直接當 file_specs 交給 load_or_compute_features_by_file
+                （有 "filepaths" 鍵，worker 會走串接流程）
+      df_files：每支檔一列，多了 filepath、segment_id、offset_in_segment_sec 欄位；
+                各流程用它對回 manifest 的其他欄位（壓力、volume、condition_folder…）
+    '''
+    if isinstance(manifest_csvs, (str, Path)):
+        manifest_csvs = [manifest_csvs]
+    if not manifest_csvs:
+        raise ValueError("沒有提供任何 manifest")
+
+    # ---- 1. 讀所有 manifest，記下每一列來自哪一份 ----
+    frames = []
+    for mp in manifest_csvs:
+        mp = Path(mp)
+        one = pd.read_csv(mp, encoding="utf-8-sig")
+        one["manifest_file"] = mp.name
+        frames.append(one)
+    df = pd.concat(frames, ignore_index=True)
+
+    # ---- 2. 決定檔案欄位：transition 是 merged_file（ai1/ai0/diff），一般 dual session 是 dual_file ----
+    if file_col is None:
+        candidates = [c for c in ("merged_file", "dual_file") if c in df.columns]
+        if len(candidates) != 1:
+            raise ValueError(f"無法判斷檔案欄位，找到 {candidates}；請用 file_col 指定")
+        file_col = candidates[0]
+    missing_cols = [c for c in SEGMENT_MANIFEST_REQUIRED_COLS + [file_col] if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"manifest 缺少欄位：{missing_cols}（舊版有限取樣的 manifest 沒有連續欄位，不能建段）")
+
+    # ---- 3. 必須是連續錄製 ----
+    mode = df["acquisition_mode"].fillna("").astype(str).str.strip()
+    if (mode != "continuous").any():
+        bad = df.loc[mode != "continuous", "manifest_file"].unique().tolist()
+        raise ValueError(f"有非連續錄製的列（acquisition_mode != continuous）：{bad[:5]}；舊 FINITE 資料只能用 merge 測試模式")
+
+    # ---- 4. 數值欄位轉型，不可有空值 ----
+    num_cols = ["first_sample_index", "sample_clock_start_wall", "sample_rate", "sample_count", "capture_start_elapsed_sec"]
+    for c in num_cols:
+        conv = pd.to_numeric(df[c], errors="coerce")
+        if conv.isna().any():
+            raise ValueError(f"manifest 的 {c} 有 {int(conv.isna().sum())} 列空值或非數字")
+        df[c] = conv
+    df["first_sample_index"] = df["first_sample_index"].astype(np.int64)
+    df["sample_count"] = df["sample_count"].astype(np.int64)
+    if (df["sample_count"] <= 0).any():
+        raise ValueError("manifest 有 sample_count <= 0 的列")
+    if not np.allclose(df["sample_rate"].to_numpy(float), float(fs_expected), rtol=1e-9):
+        raise ValueError(f"manifest 的 sample_rate {sorted(df['sample_rate'].unique())} 和設定 fs={fs_expected} 不一致")
+
+    # ---- 5. 用檔名在 tdms_root 底下找到實際檔案 ----
+    tdms_root = Path(tdms_root)
+    name_index = {}
+    for p in tdms_root.rglob("*.tdms"):
+        name_index.setdefault(p.name, []).append(p)
+    df["tdms_name"] = df[file_col].map(_basename_any_os)
+    dup_rows = df.loc[df["tdms_name"].duplicated(keep=False), "tdms_name"].unique().tolist()
+    if dup_rows:
+        raise ValueError(f"manifest 裡同一支檔出現多次：{dup_rows[:5]}")
+    not_found = [n for n in df["tdms_name"] if n not in name_index]
+    if not_found:
+        raise ValueError(f"{tdms_root} 底下找不到 {len(not_found)} 支 manifest 記錄的檔案：{not_found[:5]}")
+    same_name = [n for n in df["tdms_name"] if len(name_index[n]) > 1]
+    if same_name:
+        raise ValueError(f"不同資料夾有同檔名的 TDMS，無法確定用哪一支：{same_name[:5]}")
+    df["filepath"] = df["tdms_name"].map(lambda n: str(name_index[n][0]))
+
+    # ---- 6. 逐個 DAQ 任務檢查首尾相接，切出連續段 ----
+    segments = []
+    seg_id_of_row = pd.Series(index=df.index, dtype=object)
+    offset_of_row = pd.Series(index=df.index, dtype=float)
+    fs = float(fs_expected)
+
+    for session_id, g_session in df.groupby("session_id", sort=True):
+        seg_no = 0
+        # 同一個 session 可能按了好幾次開始（好幾個 DAQ 任務），依任務啟動時間排序
+        for _, g in sorted(g_session.groupby("sample_clock_start_wall"), key=lambda kv: kv[0]):
+            g = g.sort_values("first_sample_index")
+            first = g["first_sample_index"].to_numpy(np.int64)
+            count = g["sample_count"].to_numpy(np.int64)
+            expected_next = first[:-1] + count[:-1]      # 上一支結束後，下一支「應該」從第幾點開始
+
+            overlap = np.where(first[1:] < expected_next)[0]
+            if len(overlap):
+                i = overlap[0]
+                raise ValueError(
+                    f"{session_id}：{g['tdms_name'].iloc[i]} 和 {g['tdms_name'].iloc[i + 1]} 取樣點重疊"
+                    f"（{first[i + 1]} < {expected_next[i]}），同一段資料可能被存了兩次"
+                )
+
+            # 有空檔的位置：下一支從這裡開新段
+            gap_pos = np.where(first[1:] > expected_next)[0] + 1
+            for idx_part in np.split(np.arange(len(g)), gap_pos):
+                part = g.iloc[idx_part]
+                segment_id = f"{session_id}_seg{seg_no:02d}"
+                seg_no += 1
+
+                part_count = part["sample_count"].to_numpy(np.int64)
+                offsets = np.concatenate([[0], np.cumsum(part_count)[:-1]]) / fs   # 每支檔在段內從第幾秒開始
+                seg_id_of_row.loc[part.index] = segment_id
+                offset_of_row.loc[part.index] = offsets
+
+                # 檢查：manifest 的 session 時間應該和取樣序號算出來的一致（差超過 1 ms 代表時間欄位有問題）
+                start_elapsed = float(part["capture_start_elapsed_sec"].iloc[0])
+                drift = part["capture_start_elapsed_sec"].to_numpy(float) - (start_elapsed + offsets)
+                if np.max(np.abs(drift)) > 1e-3:
+                    print(f"⚠️ {segment_id}：capture_start_elapsed_sec 和取樣序號推算差 {np.max(np.abs(drift)) * 1000:.2f} ms")
+
+                n_samples = int(part_count.sum())
+                segments.append({
+                    "record_id": segment_id,                          # 後面分組、CUSUM、temporal 都用它
+                    "session_id": str(session_id),
+                    "filepaths": part["filepath"].tolist(),           # 依時間順序
+                    "file_sample_counts": part_count.tolist(),        # 讀檔時逐支核對點數
+                    "first_sample_index": int(part["first_sample_index"].iloc[0]),
+                    "n_samples": n_samples,
+                    "n_files": int(len(part)),
+                    "start_elapsed_sec": start_elapsed,               # 段起點在 session 時間軸的位置（換算事件時間用）
+                    "end_elapsed_sec": start_elapsed + n_samples / fs,
+                })
+
+    df["segment_id"] = seg_id_of_row
+    df["offset_in_segment_sec"] = offset_of_row
+
+    # ---- 7. 摘要 ----
+    n_sessions = df["session_id"].nunique()
+    print(f"✅ 連續段：{len(df)} 支檔 → {n_sessions} 個 session → {len(segments)} 段")
+    n_split = len(segments) - n_sessions
+    if n_split > 0:
+        print(f"⚠️ 有 {n_split} 處斷點（取樣序號不連續或重新開始任務），已切成不同段")
+    for seg in segments:
+        print(f"   {seg['record_id']}：{seg['n_files']} 支，{seg['n_samples'] / fs:.2f} 秒")
+    return segments, df
+
+
+def _read_tdms_ai0_ai1_raw(filepath, max_points_per_file, fs_target):
+    '''
+    讀一支 TDMS 的 ai0、ai1，不去直流、不建 diff、不截斷。
+    給連續段用：如果每支檔先各自去直流再接起來，
+    跨檔的窗中間會有一個「兩支檔平均值不同」造成的跳階。
+    '''
+    filepath = Path(filepath)
+    tdms = TdmsFile.read(filepath)
+    group = tdms.groups()[0]
+    channels = {ch.name: ch for ch in group.channels()}
+    if "ai0" not in channels or "ai1" not in channels:
+        raise ValueError(f"{filepath.name} 缺少 ai0 或 ai1，目前聲道：{sorted(channels)}")
+    ch0, ch1 = channels["ai0"], channels["ai1"]
+
+    # 兩聲道長度必須一樣：連續段靠點數對齊時間，截掉任何一點都會讓後面全部錯位
+    if len(ch0) != len(ch1):
+        raise ValueError(f"{filepath.name}：ai0 與 ai1 長度不同（{len(ch0)} / {len(ch1)}）")
+    if len(ch0) > max_points_per_file:
+        raise ValueError(f"{filepath.name} 有 {len(ch0)} 點，超過 max_points={max_points_per_file}")
+
+    inc = ch0.properties.get("wf_increment")
+    if inc and not np.isclose(1.0 / float(inc), fs_target, rtol=1e-6):
+        raise ValueError(f"{filepath.name} 取樣率不一致：TDMS={1.0 / float(inc):.1f} Hz，設定={fs_target} Hz")
+
+    # 檔案存的是 float32，轉成 float64，和單檔流程（dtype=float）一致
+    return np.asarray(ch0[:], dtype=float), np.asarray(ch1[:], dtype=float)
+
+
+def load_segment_record(
+    segment_spec,          # build_continuous_segments 回傳的一段
+    max_points_per_file,   # 每支檔的點數上限（feature_extraction_config 的 max_points）
+    fs_target=FS,
+):
+    '''
+    把一段的所有 TDMS 依序讀進來、接成一條訊號，回傳和 load_one_tdms_record 相同格式的 record，
+    後面的切窗與特徵計算完全共用。
+
+    去直流：這裡不做，交給 extract_window_features_core_bands 每個窗各自做（DC_MODE="per_window"）。
+    記憶體：ai0、ai1、diff 三條 float64，每秒約 24 MB；60 秒的段約 1.4 GB，
+            平行處理時每個 worker 各吃一份，段很長時 n_jobs 要調小。
+    '''
+    filepaths = segment_spec["filepaths"]
+    expected_counts = segment_spec["file_sample_counts"]
+
+    parts_ai0, parts_ai1 = [], []
+    for fp, n_expected in zip(filepaths, expected_counts):
+        a0, a1 = _read_tdms_ai0_ai1_raw(fp, max_points_per_file, fs_target)
+        # 實際點數要和 manifest 一致，不然後面每支檔在段內的時間位置都會算錯
+        if len(a0) != int(n_expected):
+            raise ValueError(f"{Path(fp).name}：檔案有 {len(a0)} 點，manifest 記錄 {n_expected} 點")
+        parts_ai0.append(a0)
+        parts_ai1.append(a1)
+
+    ai0 = np.concatenate(parts_ai0)
+    ai1 = np.concatenate(parts_ai1)
+    del parts_ai0, parts_ai1
+    diff = ai1 - ai0
+
+    first_name = Path(filepaths[0]).name
+    return {
+        "filename": segment_spec["record_id"],    # 窗的名字會變成 <segment_id>_w000、_w001…
+        "filepath": str(filepaths[0]),
+        "record_id": segment_spec["record_id"],
+        "fs": fs_target,
+        "meta": parse_filename(first_name),       # 距離、壓力從第一支檔名解析（同一段條件相同）
+        "signal": {
+            "ai0": ai0,
+            "ai1": ai1,
+            "diff": diff,
+        },
+        "label": segment_spec.get("label"),
     }
 
 
@@ -696,14 +985,24 @@ def _process_one_file_worker(args):
         nperseg,                 # Welch PSD 的分段長度（來自 feature_extraction_config）
         temporal_band_names,     # 需要算 temporal 特徵的頻帶（明確傳入，子行程才看得到）
     ) = args
-    # 讀一個 TDMS 檔案，整理成一筆 record
-    rec = load_one_tdms_record(
-        filepath=file_spec["filepath"],        # TDMS 檔案路徑
-        record_id=file_spec.get("record_id"),  # 這筆資料的名稱或 id
-        label=file_spec.get("label"),          # 這筆資料是不是 leak
-        max_points_per_file=max_points,        # 避免一次讀太大
-        fs_target=fs,                          # 用指定取樣率讀取
-    )
+    
+    # 有 filepaths（多支檔）＝連續段：把整段串成一條訊號再切窗，跨檔的窗也會切出來
+    # 只有 filepath（單支檔）＝舊流程：一支檔各自切窗
+    if "filepaths" in file_spec:
+        rec = load_segment_record(
+            segment_spec=file_spec,
+            max_points_per_file=max_points,
+            fs_target=fs,
+        )
+    else:
+        # 讀一個 TDMS 檔案，整理成一筆 record
+        rec = load_one_tdms_record(
+            filepath=file_spec["filepath"],        # TDMS 檔案路徑
+            record_id=file_spec.get("record_id"),  # 這筆資料的名稱或 id
+            label=file_spec.get("label"),          # 這筆資料是不是 leak
+            max_points_per_file=max_points,        # 避免一次讀太大
+            fs_target=fs,                          # 用指定取樣率讀取
+        )
 
     # 把整段訊號切成很多小視窗
     windows = sliding_window_records(
@@ -1175,6 +1474,17 @@ def extract_window_features_core_bands(records, core_bands, aux_bands=None, low_
         ai1  = r["signal"]["ai1"]     # near
         diff = r["signal"]["diff"]    # 差分
         fs   = r["fs"]                # 採樣率
+        
+        # ===== 每個窗各自去直流 =====
+        # 只用這個窗自己的平均值，不用到前後的資料：
+        #   - runtime 一次只拿得到眼前這個窗，做得到同樣的事
+        #   - 結果和檔案切在哪裡無關（跨檔窗不會因為兩支檔各自去直流而出現跳階）
+        # 減法會產生新陣列，不會改到原始訊號（切窗時拿的是 view，改了會影響相鄰窗）
+        # diff 也要自己減：(ai1 - ai0) 去直流 = ai1 去直流 - ai0 去直流，兩種寫法結果相同
+        if DC_MODE == "per_window":
+            ai0 = ai0 - np.mean(ai0)
+            ai1 = ai1 - np.mean(ai1)
+            diff = diff - np.mean(diff)
         
         # 建立一個feat dict 儲存 filename/record_id/t_start/label
         feat = {
@@ -2659,6 +2969,16 @@ def load_feature_extraction_config(config_path):
     # include_offband_summary 是一個開關（要不要計算 offband 摘要特徵）
     if not isinstance(payload["include_offband_summary"], bool,):
         raise ValueError("include_offband_summary 必須是 JSON boolean")
+        
+    # 特徵公式版本必須和程式一致：
+    # 改過特徵算法（例如去直流改成每窗一次）後，舊設定檔的版本字串不同 → 直接停止，
+    # 逼你重建 baseline、重跑 Step2，避免新舊算法的特徵混在一起
+    if str(payload["base_feature_version"]) != FEATURE_FORMULA_VERSION:
+        raise ValueError(
+            f"feature_extraction_config 的 base_feature_version={payload['base_feature_version']}，"
+            f"但目前程式的特徵公式是 {FEATURE_FORMULA_VERSION}；"
+            f"請把設定檔改成 {FEATURE_FORMULA_VERSION}，再依序重建 baseline、重跑 Step2"
+        )
 
     return payload
 
