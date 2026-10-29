@@ -29,8 +29,9 @@ from pathlib import Path
 import pandas as pd
 import json  # 記得在檔案最上面加這行 import
 
-transition_dev_csv = Path("/Users/paul/Desktop/Final/transition_feature_engineering/transition_30ml_test/transition_features_dev.csv")
-disturbance_dev_csv = Path("/Users/paul/Desktop/Final/disturbance_feature_engineering/disturbance_features_dev.csv")
+# 兩支切分程式的 train 份（模型訓練用）；dev / holdout 留給推論選規則和評估，不能拿來訓練
+transition_dev_csv = Path("/Users/paul/Desktop/Final/transition_feature_engineering/transition_30ml_test/transition_features_train.csv")
+disturbance_dev_csv = Path("/Users/paul/Desktop/Final/disturbance_feature_engineering/disturbance_features_train.csv")
 selected_json = Path("/Users/paul/Desktop/Final/test_result/feature_config_micro.json")
 
 output_dir = Path("/Users/paul/Desktop/Final/test_result")
@@ -51,8 +52,24 @@ if not selected_features:
     raise ValueError("feature_config_micro.json 裡的 selected_feature_names 是空的")
 
 # 來源欄位
-df_transition_dev["source_dataset"] = "transition_dev"
-df_disturbance_dev["source_dataset"] = "disturbance_dev"
+df_transition_dev["source_dataset"] = "transition_train"
+df_disturbance_dev["source_dataset"] = "disturbance_train"
+
+
+# 防呆 1：只能用 train 份訓練（dev / holdout 是推論選規則和評估用的，模型不能看過）
+for name, df_ in (("transition", df_transition_dev), ("disturbance", df_disturbance_dev)):
+    if "split" not in df_.columns:
+        print(f"⚠️ {name} 沒有 split 欄，無法確認是不是 train 份（可能是舊版切分程式的輸出）")
+        continue
+    wrong = sorted(set(df_["split"].dropna().astype(str)) - {"train"})
+    if wrong:
+        raise ValueError(f"{name} 訓練資料裡出現 split = {wrong}，只能用 train 份訓練，請確認輸入檔路徑")
+
+# 防呆 2：灰色地帶（label 是空值）不拿來訓練
+n_gray = int(df_transition_dev["label"].isna().sum()) if "label" in df_transition_dev.columns else 0
+if n_gray:
+    print(f"transition 有 {n_gray} 窗 label 是空值（灰色地帶），不拿來訓練，已排除")
+    df_transition_dev = df_transition_dev[df_transition_dev["label"].notna()].copy()
 
 # 干擾資料全部設成 non-leak
 df_disturbance_dev["label"] = 0
