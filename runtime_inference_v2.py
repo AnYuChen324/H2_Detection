@@ -121,9 +121,11 @@ from shared_feature_utils import (
     validate_runtime_extractable_features,
     load_band_config,              # 和其他程式同一套頻帶驗證（final、要有 offband）
     apply_fixed_normal_baseline,   # 和離線同一套 baseline 計算（缺統計值直接報錯，不自己估）
+    BandConfig,                    # extract_base_feature_table 的型別註記會用到
 )
 
-from alarm_rule_utils import apply_alarm_method_by_record
+from alarm_rule_utils_v2 import apply_alarm_method_by_record
+from build_site_baseline_v2 import resolve_runtime_band_groups   # runtime_streaming 與 API 都從本模組 import 它
 
 
 # ============================================================
@@ -586,29 +588,28 @@ def load_runtime_configs(
         "selected_feature_names": selected_feature_names,                         # 模型最終要吃的特徵欄位清單
         "raw_base_features": raw_base_features,                                   # 最底層要先算出來的原始特徵（衍生特徵的上游）
         "execution_plan": execution_plan,                                         # 哪些 z_* 欄位後面還要再做 CUSUM
+        "z_base_features": list(execution_plan["cusum_input_features"]),          # runtime_streaming 要做 CUSUM 的 z_ 欄位
         "final_keep_features": final_keep_features,                               # 最後輸出表要保留的欄位
         
         # ========================================================
         # 底層特徵萃取參數(這些參數正式來源是 feature_extraction_config.json)
         # ========================================================
         # window / PSD 相關參數
-        "window_sec": float(extraction_cfg.get("window_sec", fallback_window_sec)),     # 切窗長度 
-        "hop_sec": float(extraction_cfg.get("hop_sec", fallback_hop_sec)),              # 移動步長  
-        "fs": float(extraction_cfg.get("fs", fallback_fs)),                             # 取樣率
-        "nperseg": int(extraction_cfg.get("nperseg", fallback_nperseg)),              # 做頻譜分析（Welch/PSD）時每段的點數
-        "max_points": int(extraction_cfg.get("max_points", fallback_max_points)),     # 讀 TDMS 時最多讀多少點，避免超大檔案吃爆記憶體
+        "window_sec": float(extraction_cfg["window_sec"]),      # 切窗長度 
+        "hop_sec": float(extraction_cfg["hop_sec"]),            # 移動步長  
+        "fs": float(extraction_cfg["fs"]),                      # 取樣率
+        "nperseg": int(extraction_cfg["nperseg"]),              # 做頻譜分析（Welch/PSD）時每段的點數
+        "max_points": int(extraction_cfg["max_points"]),        # 讀 TDMS 時最多讀多少點，避免超大檔案吃爆記憶體
         
         # ========================================================
         # CUSUM 參數
         # ========================================================
         # CUSUM 參數
-        "cusum_k": feature_payload.get("cusum_k", fallback_cusum_k),              # 累積偏移特徵的靈敏度跟衰減係數
-        "cusum_decay": feature_payload.get("cusum_decay", fallback_cusum_decay),
+        "cusum_k": feature_payload["cusum_k"],              # 累積偏移特徵的靈敏度跟衰減係數
+        "cusum_decay": feature_payload["cusum_decay"],
         
         # 是否建立 offband / leak-focused / resonance 的 summary features。
-        "include_offband_summary": bool(
-            extraction_cfg.get("include_offband_summary", fallback_include_offband_summary)
-        ),
+        "include_offband_summary": bool(extraction_cfg["include_offband_summary"]),
         
         # 記錄這次 runtime 實際使用的底層特徵版本與設定檔指紋。
         # 後面輸出 run_info 時可以用來追蹤這次推論到底用了哪一版特徵工程。
@@ -1399,10 +1400,9 @@ def load_model_bundle(metadata_json_path):
     # 讀書特徵清單
     feature_names = metadata["features"]["feature_names"]
     # 優先看 thresholds.json 裡有沒有 window_threshold；沒有的話，退回去看 metadata.json 裡 performance.window_level.threshold；兩個都沒有，最後保底用 0.5
-    window_threshold = thresholds.get(
-        "window_threshold",
-        metadata.get("performance", {}).get("window_level", {}).get("threshold", 0.5),
-    )
+    if "window_threshold" not in thresholds or thresholds["window_threshold"] is None:
+        raise ValueError(f"{thresholds_path} 沒有 window_threshold，不使用預設值；請確認訓練程式有存門檻")
+    window_threshold = thresholds["window_threshold"]
 
     return {
         "model": model,
