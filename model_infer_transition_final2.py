@@ -71,7 +71,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from model_manager_two_sensor_final import ModelManager
 
 # 共用告警規則函式
-from alarm_rule_utils import (
+from alarm_rule_utils_v2 import (
     apply_alarm_method_by_record,
     rule_kwargs_from_cfg,     # 規則參數檢查（和干擾推論、runtime 同一套，只維護一份）
     _cfg_value,               # 取設定值：None、NaN 都當作「沒寫」
@@ -79,7 +79,7 @@ from alarm_rule_utils import (
 
 # 和干擾推論共用：載入模型、拆推論設定、檢查欄位、正式 runtime schema
 # （只維護一份，避免兩支程式的檢查規則不一致）
-from model_infer_disturbance_final2 import (
+from model_infer_disturbance_final3 import (
     resolve_model_location_from_metadata,
     get_xgb_model,
     extract_inference_config,
