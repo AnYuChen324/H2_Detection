@@ -303,6 +303,10 @@ def attach_window_labels_from_transition_meta(
         "record_id", "interval_name", "distance_cm", "leak_quantity", "pressure_bar",
         "output_tdms", "normal_end_sec", "leak_start_sec", "onset_gt_sec",
     ]
+    
+    # v22 連續段的 meta 有 session_id（舊 merge 的 transition_meta.csv 沒有）；切分程式靠它讓同一 session 不跨 split
+    if "session_id" in df_meta.columns:
+        meta_cols.append("session_id")
     meta = df_meta[meta_cols].copy()
     
     # 特徵表裡不應該已經有 meta 欄位，否則 merge 會變成 _x / _y
@@ -341,20 +345,20 @@ def attach_window_labels_from_transition_meta(
 # ============================================================
 # v22 連續錄製：由 manifest + 轉換事件檔建立「連續段」與標註表
 # ============================================================
-# 灰色地帶（onset 前後不給 0/1 標籤的範圍）
+# 設定灰色地帶（onset 前後不給 0/1 標籤的範圍）
 #   ONSET 前：按按鈕和實際開閥之間有人的反應時間（約 0.2～0.5 秒），按早按晚都有可能
 #   ONSET 後：閥門打開後流量要一點時間才穩定，洩漏訊號不是瞬間到位
 # 兩個值會寫進標註表，改了要重跑轉換特徵工程
-TRANSITION_GRAY_BEFORE_SEC = 0.5
-TRANSITION_GRAY_AFTER_SEC = 1.0
+TRANSITION_GRAY_BEFORE_SEC = 0.5         # 設定切換事件發生前的 0.5 秒為不確定區間，不將這段資料標記為正常或洩漏。
+TRANSITION_GRAY_AFTER_SEC = 1.0          # 設定切換事件發生後的 1 秒為不確定區間，避免將閥門剛開啟、洩漏尚未穩定的訊號直接標記為洩漏。
 
-
+# 取得感測器距離：從 Manifest 的 position 欄位擷取距離
 def _parse_distance_cm(position):
     '''從 manifest 的 position（例如 "straight50cm"、"left90cm"）取出距離數字，單位 cm'''
     m = re.search(r"(\d+(?:\.\d+)?)\s*cm", str(position))
     return float(m.group(1)) if m else np.nan
 
-
+# 確認實驗條件一致
 def _single_value(series, what, where, problems):
     '''同一段裡某個條件欄位只能有一種值（例如壓力），不一致就記成問題'''
     values = series.dropna().unique().tolist()
@@ -364,6 +368,7 @@ def _single_value(series, what, where, problems):
     return values[0]
 
 
+# 根據 Manifest 與事件檔，建立連續錄製資料的 Segment 及標註資訊。
 def build_transition_segment_meta(
     session_root,                                   # 轉換資料根目錄；底下每個 session 資料夾各有 TDMS、manifest、事件檔
     fs,                                             # feature_extraction_config 的 fs
@@ -386,71 +391,119 @@ def build_transition_segment_meta(
       segment_specs：可直接交給 load_or_compute_features_by_file 的段清單
       df_meta      ：每段一列，欄位和舊 transition_meta.csv 相同（attach_window_labels_from_transition_meta 直接可用）
     '''
+    # 將輸入路徑轉成 Path 物件，方便進行檔案與資料夾操作
     session_root = Path(session_root)
+    # 確認轉換資料根目錄存如果不存在，立即停止程式並顯示錯誤
     if not session_root.is_dir():
         raise FileNotFoundError(f"找不到轉換資料根目錄：{session_root}")
 
-    # 有 manifest 的資料夾就是一個 session 資料夾
+    # 遞迴搜尋根目錄底下所有符合命名規則的 Manifest
     session_dirs = sorted({p.parent for p in session_root.rglob("transition_dual_manifest_*.csv")})
+    # 如果完全找不到 Manifest，代表沒有可處理的 Session
     if not session_dirs:
         raise ValueError(f"{session_root} 底下找不到任何 transition_dual_manifest_*.csv")
 
+    # segment_specs：儲存通過檢查的連續段資訊
+    # meta_rows：儲存每段的實驗條件與時間標註，最後轉成 DataFrame
+    # problems：儲存資料異常，最後統一回報
+    # skipped：儲存沒有切換事件、因此不參與轉換評估的 Segment
     segment_specs, meta_rows, problems, skipped = [], [], [], []
+    # 記錄已經處理過的 Segment ID，避免不同 Session 出現重複 ID，Key 為 Segment ID，Value 為來源 Session 資料夾
     seen_segment_ids = {}
 
+    # 逐一處理每個 Session 資料夾
     for sdir in session_dirs:
+        # 取得 Session 相對於資料根目錄的路徑，主要用於錯誤訊息及後續資料追溯
         where = str(sdir.relative_to(session_root))
+        # 搜尋目前 Session 資料夾中的 Manifest
         manifests = sorted(sdir.glob("transition_dual_manifest_*.csv"))
+        # 搜尋目前 Session 資料夾中的切換事件檔
         event_files = sorted(sdir.glob("transition_dual_events_*.csv"))
+        # 每個 Session 必須剛好有一份 Manifest 和一份事件檔，若缺少或出現多份，就記錄問題並跳過目前 Session
         if len(manifests) != 1 or len(event_files) != 1:
             problems.append(f"{where}：manifest 和事件檔應各 1 份，目前 {len(manifests)} / {len(event_files)} 份")
             continue
 
-        # ---- 1. 連續段（首尾相接檢查都在這裡） ----
+        # ============================================================
+        # 1. 根據 Manifest 建立連續 Segment
+        # ============================================================
+        # 呼叫外部函式 build_continuous_segments()，根據 TDMS 的取樣序號，將首尾相接的檔案組成連續段
         specs, df_files = build_continuous_segments(manifests[0], sdir, fs)
 
-        # ---- 2. 讀事件檔，只留真正的狀態切換 ----
+        # ============================================================
+        # 2. 讀取事件檔，只保留真正的狀態切換
+        # ============================================================
+        # 讀取事件 CSV
         ev = pd.read_csv(event_files[0], encoding="utf-8-sig")
+        # 定義事件檔必須包含的欄位
         need = ["session_id", "event_elapsed_sec", "from_state", "to_state"]
+        # 檢查必要欄位是否存在：若某個欄位不在 ev.columns 中，就加入缺少欄位清單
         miss = [c for c in need if c not in ev.columns]
+        # 如果缺少必要欄位，記錄問題並跳過目前 Session
         if miss:
             problems.append(f"{where}：事件檔缺少欄位 {miss}")
             continue
+        # 將事件時間轉換成數值
         ev["event_elapsed_sec"] = pd.to_numeric(ev["event_elapsed_sec"], errors="coerce")
+        # 檢查事件時間是否有空值或非數字
         if ev["event_elapsed_sec"].isna().any():
             problems.append(f"{where}：事件檔的 event_elapsed_sec 有空值或非數字")
             continue
+        
+        # 將 Session ID 轉成字串，並移除前後空白
         ev["session_id"] = ev["session_id"].astype(str).str.strip()
+        # 整理切換前的狀態名稱，避免前後空白影響比較
         ev["from_state"] = ev["from_state"].astype(str).str.strip()
+        # 整理切換後的狀態名稱
         ev["to_state"] = ev["to_state"].astype(str).str.strip()
+        # 只保留切換前後狀態不同的事件
         ev = ev[ev["from_state"] != ev["to_state"]].reset_index(drop=True)
+        # 如果排除初始狀態紀錄後，沒有任何真正的切換事件，就記錄問題並跳過目前 Session
         if ev.empty:
             problems.append(f"{where}：事件檔沒有任何狀態切換（只有 normal→normal 之類的起點紀錄）")
             continue
 
-        # 事件和 manifest 必須是同一個 session，不然時間起點不同、不能相減
+        # ============================================================
+        # 3. 確認事件與 Manifest 屬於相同 Session
+        # ============================================================
+        # 從連續段清單中取得所有 Session ID，使用集合去除重複值
         manifest_sids = {str(s["session_id"]) for s in specs}
+        # 找出事件檔中存在、但 Manifest 中不存在的 Session ID，集合相減表示只保留左邊有、右邊沒有的元素
         foreign = sorted(set(ev["session_id"]) - manifest_sids)
+        # 如果發現事件來自其他 Session，記錄問題並跳過
         if foreign:
             problems.append(f"{where}：事件檔的 session_id {foreign} 不在 manifest 裡")
             continue
 
-        # ---- 3. 每段對上自己的 onset ----
+        # ============================================================
+        # 4. 將每筆切換事件對應到所屬的連續 Segment
+        # ============================================================
+        # 記錄已經被分配到某個 Segment 的事件索引，最後用來找出沒有對應到任何連續段的事件
         used_event_idx = set()
+        # 逐一處理目前 Session 中的所有 Segment
         for seg in specs:
+            # 取得目前 Segment 的唯一識別碼
+            # 後續 CUSUM、Temporal 等特徵可依 record_id 分組
             seg_id = seg["record_id"]
+            # 檢查這個 Segment ID 是否曾經出現在其他資料中
             if seg_id in seen_segment_ids:
                 problems.append(f"segment_id「{seg_id}」同時出現在 {seen_segment_ids[seg_id]} 和 {where}")
                 continue
+            
+            # 記錄目前 Segment ID 的來源資料夾
             seen_segment_ids[seg_id] = where
-
+            # 取得 Segment 在整個 Session 時間軸上的開始秒數
             start = float(seg["start_elapsed_sec"])
+            
+            # 計算 Segment 的實際持續時間，訊號總 Sample 數 ÷ 取樣率 = 秒數
             duration = seg["n_samples"] / float(fs)
+            # 從事件檔中找出落在目前 Segment 時間範圍內的事件
             in_seg = ev[
-                (ev["session_id"] == seg["session_id"])
-                & (ev["event_elapsed_sec"] >= start)
-                & (ev["event_elapsed_sec"] < start + duration)
+                (ev["session_id"] == seg["session_id"])             # 條件一：事件與 Segment 屬於相同 Session
+                & (ev["event_elapsed_sec"] >= start)                # 條件二：事件時間大於或等於 Segment 開始時間
+                & (ev["event_elapsed_sec"] < start + duration)      # 條件三：事件時間小於 Segment 結束時間
             ]
+            # 將目前找到的事件索引加入已使用集合
             used_event_idx.update(in_seg.index.tolist())
 
             # 段內沒有切換：多半是中間有斷點，切出了純正常或純洩漏的一小段；沒有 onset 不能做轉換評估，先排除
@@ -461,11 +514,14 @@ def build_transition_segment_meta(
             if len(in_seg) > 1:
                 problems.append(f"{seg_id}：段內有 {len(in_seg)} 次切換，目前只支援一次")
                 continue
+            # 取得目前 Segment 中唯一的一筆切換事件
             e = in_seg.iloc[0]
+            # 確認切換方向必須是 normal→leak，如果是 leak→normal 或其他狀態組合，就記錄問題
             if not (e["from_state"] == "normal" and e["to_state"] == "leak"):
                 problems.append(f"{seg_id}：切換方向是 {e['from_state']}→{e['to_state']}，目前只支援 normal→leak")
                 continue
-
+            
+            # 將事件時間從 Session 時間軸轉成 Segment 內部時間
             onset = float(e["event_elapsed_sec"]) - start      # 段內秒數
             normal_end = onset - float(gray_before_sec)
             leak_start = onset + float(gray_after_sec)
@@ -1056,7 +1112,7 @@ def build_inference_feature_csv(
     # 特徵名稱與順序必須完全一致，避免模型輸入錯位。
     # ============================================================
     base_output_cols = [
-        "filename", "record_id", "t_start", "t_ref", "label",
+        "filename", "record_id", "session_id", "t_start", "t_ref", "label",
         "interval_name", "distance_cm", "leak_quantity", "pressure_bar",
         "output_tdms", "normal_end_sec", "leak_start_sec", "onset_gt_sec",
     ]
