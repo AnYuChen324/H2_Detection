@@ -206,6 +206,10 @@ def main():
     model_train_path = output_dir / "disturbance_features_train.csv"
     df_model[df_model["split"] == "train"].to_csv(model_train_path, index=False, encoding="utf-8-sig")
     
+    # 訓練程式最後評估模型用（model 版）；選規則、驗收仍用 disturbance_rule_features_eval.csv
+    model_holdout_path = output_dir / "disturbance_features_holdout.csv"
+    df_model[df_model["split"] == "holdout"].to_csv(model_holdout_path, index=False, encoding="utf-8-sig")
+    
     # 2. 干擾推論用：dev + holdout 放同一份，靠 split 欄區分
     #    （干擾推論 select 模式只讀 dev；evaluate 模式只在 holdout 上量定案規則）
     rule_eval_path = output_dir / "disturbance_rule_features_eval.csv"
