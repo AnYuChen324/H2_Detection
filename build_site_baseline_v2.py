@@ -759,7 +759,7 @@ def main():
     baseline_schema_status = args.schema_status
 
     # -- 正常 TDMS 資料 --
-    tdms_paths = sorted(str(p) for p in args.normal_dir.glob("*.tdms"))
+    tdms_paths = sorted(str(p) for p in args.normal_dir.rglob("*.tdms"))   # v22 的檔在 session 子資料夾裡
     if not tdms_paths:     # 沒有 TDMS 就停止
         raise ValueError(f"在 {args.normal_dir} 找不到任何 .tdms 檔案")
     if args.tdms_limit is not None:     # 測試模式只使用前 N 支
