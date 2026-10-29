@@ -6,8 +6,7 @@
 模型機率 pred_proba
 → 建立 veto_mask
 → 機率平滑
-→ threshold/consecutive/n-of-m/hysteresis
-→ 必要時執行 two-stage
+→ threshold/consecutive/n-of-m/hysteresis（參數缺一個就報錯，不補預設值）
 → 移除持續時間太短的警報
 → 輸出 raw/final/veto 結果
 """
@@ -23,27 +22,30 @@ import pandas as pd               # 資料表、數值轉換、rolling mean
 # ============================================================
 def _apply_single_veto_rule(df,       # 包含特徵欄位的 DataFrame
                             rule):    # 單條規則設定
+
+    # 欄位、運算子、門檻三個都要寫清楚，缺一個就停
+    missing = [k for k in ("col", "op", "threshold") if _cfg_value(rule, k) is None]
+    if missing:
+        raise ValueError(f"veto rule 缺少 {missing}：{rule}")
+        
     # 取得這條規則要使用的欄位名稱
-    col = rule["col"]
+    col, op, thr = rule["col"], rule["op"], float(rule["threshold"])
     # 如果資料沒有正式規則需要的欄位，直接停止
     if col not in df.columns:
         raise ValueError(f"veto rule 指定的欄位不存在: {col}")
 
     # 將欄位轉成數值
     s = pd.to_numeric(df[col], errors="coerce")
-    op = rule.get("op", "ge")    # 取得比較運算子,如果規則沒有提供 op，預設使用：ge(大於等於)
-
     if op == "ge":    # >= threshold
-        return s >= rule["threshold"]
+        return s >= thr
     if op == "gt":    # > threshold
-        return s > rule["threshold"]
+        return s > thr
     if op == "le":    # <= threshold
-        return s <= rule["threshold"]
+        return s <= thr
     if op == "lt":    # < threshold
-        return s < rule["threshold"]
-
-    raise ValueError(f"未知 veto op: {op}")
+        return s < thr
     
+    raise ValueError(f"未知 veto op: {op}（只支援 ge / gt / le / lt）")
     
 # ============================================================
 # 根據規則設定去產生一條布林遮罩：True 代表這個 window 被 veto , False 代表這個 window 可以正常進 alarm rule
@@ -54,36 +56,105 @@ def build_veto_mask_for_record(sub_df, cfg):
     if not cfg.get("use_veto", False):
         return np.zeros(len(sub_df), dtype=bool)
     
-    # 表示目前還沒有找到可使用的 veto 規則
-    veto_series = None
-
-    # 如果設定有單一 veto_column，優先使用它, 如果欄位不存在，直接報錯
-    if cfg.get("veto_column"):
-        col = cfg["veto_column"]
+    # 每一種 veto 條件各產生一條布林遮罩，最後用 OR 合併
+    # （之前有 veto_column 時會直接忽略 veto_rules；兩種都寫的話，現在兩種都會生效）
+    # 缺值（NaN）的窗一律「不 veto」：沒有證據說它是干擾，就不擋
+    masks = []
+    
+    # 單一 veto_column
+    col = _cfg_value(cfg, "veto_column")
+    if col:
         if col not in sub_df.columns:
             raise ValueError(f"指定的 veto_column 不存在: {col}")
-        # 如果欄位本來就是布林值：True / False，就直接當成 veto 結果。
         raw = sub_df[col]
         if pd.api.types.is_bool_dtype(raw):
-            veto_series = raw.fillna(False).astype(bool)
+            # 欄位本來就是布林值：True / False，就直接當成 veto 結果
+            masks.append(raw.fillna(False).astype(bool))
         else:
-            # 如果欄位是數值型，就比較：數值 >= veto_threshold, 不能轉成數值或缺值的資料會補成 0。
-            thr = cfg.get("veto_threshold", 0.5)
-            veto_series = pd.to_numeric(raw, errors="coerce").fillna(0) >= thr
+            # 數值欄位：數值 >= veto_threshold 才 veto。門檻必須寫在設定裡，不再自動用 0.5
+            thr = _cfg_value(cfg, "veto_threshold")
+            if thr is None:
+                raise ValueError(f"veto_column={col} 是數值欄位，但規則沒有 veto_threshold")
+            masks.append((pd.to_numeric(raw, errors="coerce") >= float(thr)).fillna(False))
     
-    # 如果沒有單一 veto_column，但有多條 veto_rules，就逐條執行
-    elif cfg.get("veto_rules"):
-        # 每一條規則產生自己的布林遮罩
-        masks = [_apply_single_veto_rule(sub_df, rule).fillna(False) for rule in cfg["veto_rules"]]
-        veto_series = masks[0].copy()
-        for mask in masks[1:]:
-            veto_series |= mask    # 將規則用 OR 合併:規則 A 成立 OR 規則 B 成立→ veto=True
+    # 多條 veto_rules：逐條執行
+    for rule in (cfg.get("veto_rules") or []):
+        masks.append(_apply_single_veto_rule(sub_df, rule).fillna(False))
     
     # use_veto=True，卻沒有指定 veto_column 或 veto_rules 時直接停止（不自己猜欄位）
-    if veto_series is None:
+    if not masks:
         raise ValueError("use_veto=True，但規則沒有指定 veto_column 或 veto_rules")
-
+    
+    veto_series = masks[0].copy()
+    for mask in masks[1:]:
+        veto_series |= mask    # 將規則用 OR 合併:規則 A 成立 OR 規則 B 成立→ veto=True
     return veto_series.astype(bool).values
+
+
+# ============================================================
+# 規則參數：每種方法需要哪些參數，缺一個就停（不補預設值）
+# ============================================================
+SUPPORTED_METHODS = ("threshold", "consecutive", "n_of_m", "hysteresis")
+
+RULE_REQUIRED_PARAMS = {
+    "threshold":   ["smooth_window", "alarm_threshold"],
+    "consecutive": ["smooth_window", "alarm_threshold", "consecutive"],
+    "n_of_m":      ["smooth_window", "alarm_threshold", "n_hits", "m_window"],
+    "hysteresis":  ["smooth_window", "high_threshold", "low_threshold"],
+}
+_INT_PARAMS = {"smooth_window", "consecutive", "n_hits", "m_window"}
+
+
+def _cfg_value(cfg, key):
+    '''取 cfg[key]；None 和 NaN 都當作「沒寫」（從 CSV / JSON 讀回來的空值常常是 NaN）'''
+    v = cfg.get(key)
+    if v is None:
+        return None
+    if isinstance(v, (float, np.floating)) and np.isnan(v):
+        return None
+    return v
+
+
+def _validate_rule_params(method, params, rule_name=None):
+    '''檢查 method 和它需要的參數；有問題直接報錯，錯誤訊息帶規則名稱方便找'''
+    who = f"規則 {rule_name}" if rule_name else "規則"
+    if method == "two_stage":
+        raise ValueError(f"{who} 是 two_stage：它要等 Stage 1 那段警報結束才決定要不要重判，"
+                         "即時系統做不到（等於偷看未來），已不支援")
+    if method not in SUPPORTED_METHODS:
+        raise ValueError(f"{who} 的 method={method!r} 不支援（只支援 {SUPPORTED_METHODS}）")
+
+    missing = [k for k in RULE_REQUIRED_PARAMS[method] if params.get(k) is None]
+    if missing:
+        raise ValueError(f"{who}（{method}）缺少參數：{missing}")
+
+    for k in ("smooth_window", "consecutive", "n_hits", "m_window"):
+        if params.get(k) is not None and params[k] < 1:
+            raise ValueError(f"{who} 的 {k}={params[k]}，必須 >= 1")
+    for k in ("alarm_threshold", "high_threshold", "low_threshold"):
+        if params.get(k) is not None and not (0.0 <= params[k] <= 1.0):
+            raise ValueError(f"{who} 的 {k}={params[k]} 不在 0～1 之間")
+    if method == "n_of_m" and params["n_hits"] > params["m_window"]:
+        raise ValueError(f"{who} 的 n_hits={params['n_hits']} 不可大於 m_window={params['m_window']}")
+    if method == "hysteresis" and params["low_threshold"] > params["high_threshold"]:
+        raise ValueError(f"{who} 的 low_threshold={params['low_threshold']} 不可大於 "
+                         f"high_threshold={params['high_threshold']}")
+
+
+def rule_kwargs_from_cfg(cfg):
+    '''
+    從規則設定挑出 detect_leak_events 需要的參數（只挑這個 method 用得到的），並檢查。
+    cfg 裡多出來的鍵（name、base_rule、veto 設定、評估成績…）不影響。
+    '''
+    method = cfg.get("method")
+    params = {}
+    for k in RULE_REQUIRED_PARAMS.get(method, []):
+        v = _cfg_value(cfg, k)
+        if v is not None:
+            v = int(v) if k in _INT_PARAMS else float(v)
+        params[k] = v
+    _validate_rule_params(method, params, rule_name=cfg.get("name"))
+    return {"method": method, **params}
 
 
 # ============================================================
@@ -91,14 +162,14 @@ def build_veto_mask_for_record(sub_df, cfg):
 # ============================================================
 def detect_leak_events(
     probs,                   # 每個 window 的洩漏機率
-    method="consecutive",    # 警報方法
-    alarm_threshold=0.5,     # 機率門檻
-    smooth_window=3,         # 平滑窗數 smooth_window=3：第 3 個點的分數會參考前 3 個 window 的平均
-    consecutive=2,           # 連續命中數
-    n_hits=3,                # M 選 N
-    m_window=5,              #
-    high_threshold=0.8,      # 遲滯門檻
-    low_threshold=0.4,       #
+    method,                  # 警報方法：threshold / consecutive / n_of_m / hysteresis
+    smooth_window=None,      # 平滑窗數 smooth_window=3：第 3 個點的分數會參考前 3 個 window 的平均（1 = 不平滑）
+    alarm_threshold=None,    # 機率門檻（threshold / consecutive / n_of_m）
+    consecutive=None,        # 連續命中數（consecutive）
+    n_hits=None,             # M 選 N 的 N（n_of_m）
+    m_window=None,           # M 選 N 的 M（n_of_m）
+    high_threshold=None,     # 遲滯：開警報的門檻（hysteresis）
+    low_threshold=None,      # 遲滯：關警報的門檻（hysteresis）
     veto_mask=None,          # 哪些 window 不准報警
 ):
     '''
@@ -109,35 +180,21 @@ def detect_leak_events(
     2.這些 pred_proba 先做平滑
     3.再套不同 alarm rule
     4.看哪種 rule 在干擾資料上最不容易誤報
+
+    參數沒有預設值：這個方法需要的參數沒給就報錯（之前缺參數會偷偷用 0.5、3、2…，跑得出結果但不是你設定的規則）
     '''
-        
-    # 1. 先統一視窗參數型別
-    smooth_window = max(int(smooth_window), 1)
-    consecutive = max(int(consecutive), 1)
-
-    if n_hits is not None:
-        n_hits = int(n_hits)
-
-    if m_window is not None:
-        m_window = int(m_window)
-
-    # n_of_m 必須同時具備兩個參數
-    if method == "n_of_m":
-        if n_hits is None or m_window is None:
-            raise ValueError(
-                "method=n_of_m 時必須提供 "
-                "n_hits 與 m_window"
-            )
-
-        if n_hits <= 0 or m_window <= 0:
-            raise ValueError(
-                "n_hits 與 m_window 必須大於 0"
-            )
-
-        if n_hits > m_window:
-            raise ValueError(
-                "n_hits 不可大於 m_window"
-            )
+    # 1. 統一型別並檢查（缺參數、範圍不合理都會停）
+    params = {"smooth_window": smooth_window, "alarm_threshold": alarm_threshold,
+              "consecutive": consecutive, "n_hits": n_hits, "m_window": m_window,
+              "high_threshold": high_threshold, "low_threshold": low_threshold}
+    params = {k: (None if v is None else (int(v) if k in _INT_PARAMS else float(v)))
+              for k, v in params.items()}
+    _validate_rule_params(method, params)
+    smooth_window = params["smooth_window"]
+    alarm_threshold = params["alarm_threshold"]
+    consecutive = params["consecutive"]
+    n_hits, m_window = params["n_hits"], params["m_window"]
+    high_threshold, low_threshold = params["high_threshold"], params["low_threshold"]
 
     # 2. 使用轉成整數後的 smooth_window 做平滑
     # 先平滑：做 rolling mean 平滑, 降低單點噪聲, 避免某一個 window 突然飆高就亂報警
@@ -269,10 +326,11 @@ def split_continuous_segments(sub, max_gap_sec=None):
 
     if max_gap_sec is None:
         hop_sec = float(np.median(np.diff(t)))     # 步長（大多數相鄰窗的時間差）
-        if "t_ref" in sub.columns:
-            window_sec = float(np.median((sub["t_ref"] - sub["t_start"]).to_numpy(dtype=float)) * 2.0)
-        else:
-            window_sec = hop_sec
+        # 窗長只能從 t_ref（窗中心）推回來；沒有 t_ref 就不知道窗長，不能拿步長頂替：
+        # 頂替的話門檻只剩 2 個步長（0.10 秒），檔案首尾相接的 0.20 秒交界會被誤切成空檔
+        if "t_ref" not in sub.columns:
+            raise ValueError("資料沒有 t_ref 欄位，無法推算窗長：請補 t_ref，或明確傳入 max_gap_sec")
+        window_sec = float(np.median((sub["t_ref"] - sub["t_start"]).to_numpy(dtype=float)) * 2.0)
         max_gap_sec = window_sec + hop_sec
 
     # 每段的第一窗標 True，累加後就得到段編號
@@ -282,84 +340,28 @@ def split_continuous_segments(sub, max_gap_sec=None):
 
 
 # ============================================================
-# two-stage 規則：短事件先用 stage1，長事件再用 stage2 複核
-# ============================================================
-def detect_two_stage_events(probs, stage1_cfg, stage2_cfg, window_threshold, veto_mask=None):
-    # ---  stage 1：先用短干擾最佳規則  ---
-    smoothed1, detected1 = detect_leak_events(
-        probs,
-        method=stage1_cfg["method"],
-        alarm_threshold=stage1_cfg.get("alarm_threshold", window_threshold),
-        smooth_window=stage1_cfg.get("smooth_window", 3),
-        consecutive=stage1_cfg.get("consecutive", 2),
-        n_hits=stage1_cfg.get("n_hits", 3),
-        m_window=stage1_cfg.get("m_window", 5),
-        high_threshold=stage1_cfg.get("high_threshold", 0.8),
-        low_threshold=stage1_cfg.get("low_threshold", 0.4),
-        veto_mask=None,     # Stage 1 完全不套 veto
-    )
-
-    # 先假設 Stage 1 結果就是最終結果
-    final_detected = detected1.copy()
-    # 建立欄位記錄哪些 window 進過 Stage 2
-    stage2_applied = np.zeros(len(probs), dtype=int)
-
-    # 先找 stage1 報出的連續 alarm 段
-    runs = find_positive_runs(detected1)
-    # 預設 Stage 1 警報至少連續四個 window，才進 Stage 2
-    trigger_len = stage2_cfg.get("trigger_run_length", 4)
-
-    # 逐段計算長度
-    for start, end in runs:
-        run_len = end - start + 1
-
-        # 只有夠長的事件才進 stage 2, 太短就跳過，因此短區段會直接保留 Stage 1 結果，不經過 Stage 2，也不套 veto
-        if run_len < trigger_len:
-            continue
-        # 取出目前區段的：模型機率, 對應 veto mask
-        seg_probs = probs[start:end + 1]
-        seg_veto = None if veto_mask is None else veto_mask[start:end + 1]
-
-        _, seg_detected2 = detect_leak_events(
-            seg_probs,
-            method=stage2_cfg["method"],
-            alarm_threshold=stage2_cfg.get("alarm_threshold", window_threshold),
-            smooth_window=stage2_cfg.get("smooth_window", 3),
-            consecutive=stage2_cfg.get("consecutive", 2),
-            n_hits=stage2_cfg.get("n_hits", 3),
-            m_window=stage2_cfg.get("m_window", 5),
-            high_threshold=stage2_cfg.get("high_threshold", 0.8),
-            low_threshold=stage2_cfg.get("low_threshold", 0.4),
-            veto_mask=seg_veto,     # Stage 2 會正式套用 veto
-        )
-        
-        # 用 Stage 2 結果覆蓋原本 Stage 1 的該段結果
-        final_detected[start:end + 1] = seg_detected2
-        stage2_applied[start:end + 1] = 1     # 將這個區段標記成：1
-
-    return smoothed1, detected1, final_detected, stage2_applied
-
-
-# ============================================================
 # 每個 session / record 分開套規則
 # ============================================================
 def apply_alarm_method_by_record(
         df_pred,             # 推論後的 DataFrame,至少要有：record_id, t_start, pred_proba
         cfg,                 # alarm rule 的設定字典
-        window_threshold,
+        window_threshold,    # 保留參數讓呼叫方式不變；規則門檻一律由 cfg 提供，這裡不再拿來當預設
         max_gap_sec=None):   # 相鄰窗超過這個秒數視為空檔；None = 窗長 + 步長
     '''
     把 alarm rule 真正套到每一條 record 上
     '''
+    # 結果是用 index 寫回去的：index 有重複的話，會寫到別的列上，而且不會報錯
+    if not df_pred.index.is_unique:
+        raise ValueError("df_pred 的 index 有重複（可能是 concat 時沒加 ignore_index=True），請先 reset_index(drop=True)")
+    
     # 先複製一份資料，並依照：record_id, t_start 排序。(因為 alarm rule 是沿著時間走的,如果時間順序亂掉，rolling / consecutive 就全錯)
     df_out = df_pred.copy().sort_values(["record_id", "t_start"]).copy()
     
-    # 新增 5 個欄位
+    # 新增 4 個欄位
     df_out["smoothed_proba_rule"] = np.nan     # 存平滑後的機率序列
     df_out["veto_flag"] = 0                    # 是否被 veto
     df_out["detected_rule_raw"] = 0            # 未套 veto 的警報
     df_out["detected_rule"] = 0                # 套完 veto 的正式警報
-    df_out["stage2_applied"] = 0               # 是否經過 Stage 2
     
     # --  最短持續時間（即時版）：一段警報要持續滿 min_leak_duration_sec 才開始報 --
     def suppress_short_alarm_runs(sub, detected, min_leak_duration_sec):
@@ -401,45 +403,26 @@ def apply_alarm_method_by_record(
     
         return detected.astype(int)
         
+    # 規則參數一次檢查完：缺參數、two_stage、不支援的 method 都在這裡停，不補任何預設值
+    rule_kwargs = rule_kwargs_from_cfg(cfg)
+    # 最短持續時間：沒寫（None / NaN）= 不限制，這是明確的意思，不是猜測
+    min_leak_duration_sec = _cfg_value(cfg, "min_leak_duration_sec")
+    
     # 逐 record 處理；同一條 record 中間若有空檔，再切成幾段，每段獨立跑 alarm rule
-    min_leak_duration_sec = cfg.get("min_leak_duration_sec", None)
-
     for rid, rec in df_out.groupby("record_id"):
         rec = rec.sort_values("t_start")
-
+    
         for seg_index in split_continuous_segments(rec, max_gap_sec):
             sub = df_out.loc[seg_index].sort_values("t_start")   # 這一段連續的 windows
             probs = sub["pred_proba"].values                     # 這段時間序列的 leak 機率
-
+    
             # 根據正式設定建立這一段的 veto mask
             veto_mask = build_veto_mask_for_record(sub, cfg)
-
-            # ---  兩階段規則  ---
-            if cfg["method"] == "two_stage":
-                smoothed, detected_raw, detected, stage2_applied = detect_two_stage_events(
-                    probs=probs,
-                    stage1_cfg=cfg["stage1"],
-                    stage2_cfg=cfg["stage2"],
-                    window_threshold=window_threshold,
-                    veto_mask=veto_mask,
-                )
-                df_out.loc[sub.index, "stage2_applied"] = stage2_applied.astype(int)
-
-            # ---  單一規則：跑兩次，一次不套 veto（raw），一次套 veto（正式）  ---
-            else:
-                rule_kwargs = dict(
-                    method=cfg["method"],
-                    alarm_threshold=cfg.get("alarm_threshold", window_threshold),
-                    smooth_window=cfg.get("smooth_window", 3),
-                    consecutive=cfg.get("consecutive", 2),
-                    n_hits=cfg.get("n_hits", 3),
-                    m_window=cfg.get("m_window", 5),
-                    high_threshold=cfg.get("high_threshold", 0.8),
-                    low_threshold=cfg.get("low_threshold", 0.4),
-                )
-                smoothed, detected_raw = detect_leak_events(probs, veto_mask=None, **rule_kwargs)
-                _, detected = detect_leak_events(probs, veto_mask=veto_mask, **rule_kwargs)
-
+    
+            # 跑兩次：一次不套 veto（raw），一次套 veto（正式）
+            smoothed, detected_raw = detect_leak_events(probs, veto_mask=None, **rule_kwargs)
+            _, detected = detect_leak_events(probs, veto_mask=veto_mask, **rule_kwargs)
+            
             # 最短持續時間（即時版）：raw 與正式結果都套
             detected_raw = suppress_short_alarm_runs(sub, detected_raw, min_leak_duration_sec)
             detected = suppress_short_alarm_runs(sub, detected, min_leak_duration_sec)
@@ -454,7 +437,7 @@ def apply_alarm_method_by_record(
     df_out["veto_flag"] = df_out["veto_flag"].astype(int)
     df_out["detected_rule_raw"] = df_out["detected_rule_raw"].astype(int)
     df_out["detected_rule"] = df_out["detected_rule"].astype(int)
-    df_out["stage2_applied"] = df_out["stage2_applied"].astype(int)
+    
     
     return df_out
 
