@@ -9,6 +9,12 @@
 → threshold/consecutive/n-of-m/hysteresis（參數缺一個就報錯，不補預設值）
 → 移除持續時間太短的警報
 → 輸出 raw/final/veto 結果
+
+週期取樣（API 每 interval_sec 擷取 capture_sec）：
+  simulate_periodic_capture → 離線模擬「每批是獨立一段」
+  apply_batch_warmup        → 每批開頭 warmup_sec 不輸出報警（仍參與平滑與計數）
+  BatchConfirmer            → 最近 n 批中 m 批有報警才確認
+  這三個函式離線評估與 API 共用，參數由 postprocess_config.json 的 "sampling" 決定
 """
 
 from collections import deque     # 載入雙端佇列
@@ -442,4 +448,107 @@ def apply_alarm_method_by_record(
     return df_out
 
 
+# ============================================================
+# 週期取樣（每 interval_sec 擷取 capture_sec）共用工具
+# ============================================================
+def simulate_periodic_capture(df_pred,        # 模型對連續錄製資料進行逐窗推論後的 DataFrame(至少需要 record_id、t_start 等欄位)
+                              capture_sec,    # 每次實際擷取訊號的時間長度 
+                              interval_sec,   # 兩次擷取起點之間的時間間隔
+                              offset_sec,     # 第一批擷取相對於原始連續段起點的時間偏移
+                              window_sec):    # 每個特徵視窗的時間長度
+    '''
+    從連續段的逐窗結果，模擬現場的週期取樣：只留下整個窗都落在某次擷取內的窗，
+    每次擷取當成獨立的 record（record_id 後面加 __b{批號}），規則引擎會自動每批從頭計算。
+    前提：模型特徵沒有跨窗狀態（每窗去直流、沒有 CUSUM / temporal），結果才會等於 API。
+    offset_sec 要是 hop 的整數倍，窗才會和 API 切出來的對齊。
+    '''
+    # 先依原始 record_id 排序，再依每個視窗的開始時間排序
+    df = df_pred.sort_values(["record_id", "t_start"])
+    # 計算每個視窗相對於第一批擷取起點的時間。
+    rel = df["t_start"] - df.groupby("record_id")["t_start"].transform("min") - offset_sec
+    # 計算每個視窗屬於第幾個週期。
+    k = np.floor((rel + 1e-9) / interval_sec)            # 第幾批（+1e-9：避免 4.9999999 被算成上一批）
+    # 計算每個視窗的開始時間位於目前週期中的哪個位置。
+    pos = rel - k * interval_sec                          # 窗起點在這一批裡的位置
+    # 判斷哪些視窗可以保留：兩個條件都成立才保留該視窗
+    # 條件一：rel >= -1e-9，只保留第一批擷取起點之後的視窗。
+    # 條件二：pos + window_sec <= capture_sec + 1e-9，要求整個視窗都位於當次擷取時間範圍內。
+    keep = (rel >= -1e-9) & (pos + window_sec <= capture_sec + 1e-9)
+    out = df[keep].copy()      # 只保留符合週期擷取條件的視窗。
+    out["source_record_id"] = out["record_id"]               # 保存原始連續段的 record_id。
+    out["batch_index"] = k[keep].astype(int)                 # 記錄每個保留視窗所屬的批次編號。
+    out["batch_start_sec"] = out["t_start"] - pos[keep]      # 計算每個視窗所屬批次的開始時間。
+    # 將原本的 record_id 改成每批獨立的 ID。
+    out["record_id"] = out["source_record_id"].astype(str) + "__b" + out["batch_index"].astype(str)
+   
+    return out.reset_index(drop=True)     # 回傳模擬週期擷取後的逐窗推論結果。
+
+
+# ============================================================
+# 對每一批擷取資料套用暖機時間限制。
+# ============================================================
+def apply_batch_warmup(df_rule,      # 已經經過警報規則引擎處理的逐窗結果。需要包含 t_start、record_id、detected_rule、detected_rule_raw 等欄位。
+                       warmup_sec):  # 每批開始後，暫時不允許輸出警報的時間長度。
+    """
+    批內暖機處理。
+
+    每批開始後 warmup_sec 秒內不輸出警報，但暖機期間的視窗仍參與前面的平滑與計數。
+
+    同時保留暖機前的警報結果，方便後續分析：
+    1. 暖機前原本有多少警報。
+    2. 暖機機制抑制了多少警報。
+    3. 暖機後實際還剩多少警報。
+    """
+    # 建立副本，避免直接修改原始 DataFrame
+    df_rule = df_rule.copy()
+    # 保留暖機處理前的最終警報結果
+    df_rule["detected_rule_before_warmup"] = df_rule["detected_rule"].copy()
+    # 保留暖機處理前的原始警報結果
+    df_rule["detected_rule_raw_before_warmup"] = df_rule["detected_rule_raw"].copy()
+    
+    # 暖機時間不可為負值
+    if warmup_sec < 0:
+        raise ValueError("warmup_sec 不可小於 0")
+
+    # 如果沒有設定暖機時間，所有視窗都不屬於暖機期間
+    # 仍保留原始警報欄位與 is_warmup，方便不同設定比較
+    if warmup_sec == 0:
+        df_rule["is_warmup"] = False
+        return df_rule
+    
+    # 決定每批的開始時間
+    # 如果有 batch_start_sec，直接使用該欄位，否則以每個 record 第一個視窗的開始時間作為批次起點
+    start = (df_rule["batch_start_sec"] if "batch_start_sec" in df_rule.columns
+             else df_rule.groupby("record_id")["t_start"].transform("min"))
+    # 判斷每個視窗是否位於暖機時間內。
+    # 這裡使用視窗開始時間判斷，並不是要求整個視窗都位於暖機區間。
+    in_warmup = (df_rule["t_start"] - start) < warmup_sec - 1e-9
+    # 將暖機期間的警報結果強制設為 0。
+    df_rule.loc[in_warmup, ["detected_rule", "detected_rule_raw"]] = 0
+    return df_rule      # 回傳已套用暖機限制的逐窗警報結果。
+
+
+# ============================================================
+# 跨批次警報確認器：避免單一批次偶發的警報直接被視為確認警報。
+# ============================================================
+class BatchConfirmer:
+    '''最近 n 批中至少 m 批有報警才確認（API 與離線評估共用同一套）'''
+    # 確認警報確認條件合理。
+    def __init__(self, m, n):
+        # m 至少為 1，否則不需要任何警報就可能成立。
+        # m 不能大於 n，否則最近 n 批不可能累積到 m 批警報。
+        if not 1 <= m <= n:
+            raise ValueError(f"confirm_m={m}、confirm_n={n} 不合理")
+        self.m = m                         # 儲存至少需要幾批出現警報，才算確認成立。
+        self.history = deque(maxlen=n)     # 建立固定長度的雙端佇列，用來保存最近 n 批的警報狀態。
+    
+    # 清空所有歷史批次的警報紀錄。
+    def reset(self):
+        self.history.clear()
+
+    # 將目前批次是否有警報轉成布林值。
+    # 如果歷史紀錄已達 n 筆，deque 會自動移除最舊的一筆。
+    def update(self, batch_has_alarm):
+        self.history.append(bool(batch_has_alarm))     # 將目前批次結果加入歷史紀錄。
+        return sum(self.history) >= self.m
 
