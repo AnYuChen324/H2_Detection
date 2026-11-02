@@ -98,6 +98,24 @@ OFFBAND_BANDS = [
 
 
 # ======================================
+# 要套固定 baseline（產生 rel_ / z_）的頻帶群組摘要欄位
+# 全流程只在這裡定義一次：baseline、轉換 FE、干擾 FE、runtime（離線與串流）都 import 這份
+# 加欄位只改這裡；漏改任何一支，那支就不會產生對應的 rel_ / z_
+# ======================================
+SUMMARY_BASELINE_COLUMNS = [
+    "offband_E_mean",
+    "offband_E_max",
+    "leak_focus_E_mean",
+    "leak_focus_E_max",
+    "resonance_E_mean",
+    "resonance_E_max",
+    # ratio veto 用：log(offband 最大能量 / 洩漏頻帶最大能量)
+    # 套 baseline 後的 rel_ = 「比這個現場的正常比值高幾倍」的 log，現場重建 baseline 後自動適應
+    "log_offbandmax_to_leak_focusmax_E_ratio",
+]
+
+
+# ======================================
 # 正式 band config 的 temporal band 名稱同步
 # ======================================
 def configure_temporal_band_names(
@@ -569,13 +587,18 @@ def load_one_tdms_record(
     ai0 = np.asarray(channel_ai0[:], dtype=float)
     ai1 = np.asarray(channel_ai1[:], dtype=float)
     
-    # 取樣率：TDMS 有記錄就必須和設定一致，避免頻率軸整個錯掉
-    inc = channel_ai0.properties.get("wf_increment") if hasattr(channel_ai0, "properties") else None
+    # 取樣率：v21/v22 擷取程式存在 sample_rate；merge 輸出的合併檔存在 wf_increment
+    # 兩個都沒有（或是 0）就報錯，不默默跳過檢查（取樣率錯了頻率軸會整個錯，但程式不會報錯）
+    props = channel_ai0.properties
+    if props.get("sample_rate"):
+        actual_fs = float(props["sample_rate"])
+    elif props.get("wf_increment"):
+        actual_fs = 1.0 / float(props["wf_increment"])
+    else:
+        raise ValueError(f"{filepath.name} 沒有記錄取樣率（sample_rate / wf_increment），無法確認取樣率")
+    if not np.isclose(actual_fs, fs_target, rtol=1e-6):
+        raise ValueError(f"{filepath.name} 取樣率不一致：TDMS={actual_fs:.1f} Hz，設定={fs_target} Hz")
     fs = fs_target
-    if inc:
-        actual_fs = 1.0 / float(inc)
-        if not np.isclose(actual_fs, fs_target, rtol=1e-6):
-            raise ValueError(f"{filepath.name} 取樣率不一致：TDMS={actual_fs:.1f} Hz，設定={fs_target} Hz")
         
     # 用檔名去解析 metadata
     meta = parse_filename(filepath.name)
@@ -817,9 +840,17 @@ def _read_tdms_ai0_ai1_raw(filepath, max_points_per_file, fs_target):
     if len(ch0) > max_points_per_file:
         raise ValueError(f"{filepath.name} 有 {len(ch0)} 點，超過 max_points={max_points_per_file}")
 
-    inc = ch0.properties.get("wf_increment")
-    if inc and not np.isclose(1.0 / float(inc), fs_target, rtol=1e-6):
-        raise ValueError(f"{filepath.name} 取樣率不一致：TDMS={1.0 / float(inc):.1f} Hz，設定={fs_target} Hz")
+    # 取樣率：v21/v22 擷取程式存在 sample_rate；merge 輸出與 NI 標準波形存在 wf_increment
+    # 兩個都沒有（或是 0）就報錯，不默默跳過檢查（取樣率錯了頻率軸會整個錯，但程式不會報錯）
+    props = ch0.properties
+    if props.get("sample_rate"):
+        actual_fs = float(props["sample_rate"])
+    elif props.get("wf_increment"):
+        actual_fs = 1.0 / float(props["wf_increment"])
+    else:
+        raise ValueError(f"{filepath.name} 沒有記錄取樣率（sample_rate / wf_increment），無法確認取樣率")
+    if not np.isclose(actual_fs, fs_target, rtol=1e-6):
+        raise ValueError(f"{filepath.name} 取樣率不一致：TDMS={actual_fs:.1f} Hz，設定={fs_target} Hz")
 
     # 檔案存的是 float32，轉成 float64，和單檔流程（dtype=float）一致
     return np.asarray(ch0[:], dtype=float), np.asarray(ch1[:], dtype=float)
@@ -2534,6 +2565,13 @@ def build_offband_summary_features(df, band_config):
         # offband 最大能量 / 洩漏主頻帶最大能量
         df["offbandmax_to_leak_focusmax_E_ratio"] = (df["offband_E_max"] / (df["leak_focus_E_max"] + eps))
 
+        # 同一個比值的 log 版本（ratio veto 用，會再套 baseline 變成 rel_ 版本）
+        # 能量比分布很偏斜，取 log 後較對稱；baseline 平均 = 正常時比值的幾何平均
+        # 用 log 相減而不是先除再取 log：分母為 0 時不會變成 inf（能量經過 QC 不會是 0，下限只是保險）
+        df["log_offbandmax_to_leak_focusmax_E_ratio"] = (
+            np.log(np.maximum(df["offband_E_max"], 1e-30))
+            - np.log(np.maximum(df["leak_focus_E_max"], 1e-30)))
+        
     # offband vs resonance：先保留觀察
     # 看某些干擾是不是其實把 offband 拉得比共振還高或看共振是不是只是背景結構，不一定是主要判斷依據
     if offband_e_cols and resonance_e_cols:
@@ -2751,6 +2789,7 @@ def audit_offband_summary_coverage(df):
         "resonance_E_mean", "resonance_E_max",
         "offband_to_leak_focus_E_ratio", "offbandmax_to_leak_focusmax_E_ratio",
         "offband_to_resonance_E_ratio", "offbandmax_to_resonancemax_E_ratio",
+        "log_offbandmax_to_leak_focusmax_E_ratio",
     ]
     # 掃過固定清單，抓出「不在 df.columns 裡」的特徵欄位
     missing = [c for c in summary_cols if c not in df.columns]
