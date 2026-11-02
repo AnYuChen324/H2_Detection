@@ -184,6 +184,7 @@ from shared_feature_utils import (
     select_all_raw_feature_columns,
     GRID_F_MIN, GRID_F_MAX, GRID_WIDTH, GRID_STRIDE,
     SIGNAL_RMS_MIN,
+    SUMMARY_BASELINE_COLUMNS,
 )
 
 
@@ -919,18 +920,8 @@ def main():
     if build_summary_features:
         df_features = build_offband_summary_features(df_features, band_config,)
         
-    # 收集實際存在的摘要欄位
-    summary_base_cols = [
-        c for c in [
-            "offband_E_mean",
-            "offband_E_max",
-            "leak_focus_E_mean",
-            "leak_focus_E_max",
-            "resonance_E_mean",
-            "resonance_E_max",
-        ]
-        if c in df_features.columns
-    ]
+    # 要套 baseline 的摘要欄位（全流程共用一份清單，定義在 shared_feature_utils）
+    summary_base_cols = [c for c in SUMMARY_BASELINE_COLUMNS if c in df_features.columns]
     
     # baseline 真正要存的欄位 = 原始 raw features + summary base features
     baseline_feature_cols = sorted(set(raw_feature_cols + summary_base_cols))
