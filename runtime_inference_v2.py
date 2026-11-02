@@ -122,9 +122,15 @@ from shared_feature_utils import (
     load_band_config,              # 和其他程式同一套頻帶驗證（final、要有 offband）
     apply_fixed_normal_baseline,   # 和離線同一套 baseline 計算（缺統計值直接報錯，不自己估）
     BandConfig,                    # extract_base_feature_table 的型別註記會用到
+    SUMMARY_BASELINE_COLUMNS
 )
 
-from alarm_rule_utils_v2 import apply_alarm_method_by_record
+from alarm_rule_utils_v2 import (
+    apply_alarm_method_by_record,
+    rule_kwargs_from_cfg,    # 規則參數檢查（和干擾 / 轉換推論同一套，不補預設值）
+    _cfg_value,              # None、NaN 都當作「沒寫」
+)
+
 from build_site_baseline_v2 import resolve_runtime_band_groups   # runtime_streaming 與 API 都從本模組 import 它
 
 
@@ -255,132 +261,57 @@ def load_postprocess_config(postprocess_config_path):
 
 
 # ============================================================
-# 專門處理「數值到底算不算『沒提供』」這件事
-# ============================================================
-def _clean_optional_value(v, cast=None):
-    # 先擋 None，再用 pd.isna 擋 JSON 的 NaN，兩種缺值都會回傳 None；如果值是有效的，才用 cast 轉型
-    if v is None:
-        return None
-    try:
-        if isinstance(v, (list, tuple, np.ndarray, pd.Series)):
-            return v
-        if pd.isna(v):
-            return None
-    except Exception:
-        pass
-    return cast(v) if cast is not None else v
-
-
-# ============================================================
 # 整理正式 Runtime 使用的告警與抗干擾規則
 # ============================================================
-def build_runtime_postprocess_settings(feature_payload,            # 上游的 feature_config_micro.json
-                                       baseline_rule_settings):    # postprocess_config.json 規則
-    # 1. 先整理正式規則
-    # 一次性把整個 baseline_rule_settings 掃過一遍，對每一個 key 的 value 都套用 _clean_optional_value(v)（沒給 cast，所以只做「缺值偵測」，不做型別轉換），組出一份全新的 rule dict
-    rule = {
-        k: _clean_optional_value(v)
-        for k, v in dict(baseline_rule_settings).items()
-    }
-    
-    # 2. 再讀取 method / two-stage
-    method = str(rule.get("method", "consecutive"))     # 如果規則裡沒填 method，預設用 "consecutive"（連續視窗判斷）
-    
-    # 第一階段（stage1）:先對整條機率序列做一次「初判」，完全不套 veto
-    stage1 = rule.get("stage1")
-    # 第二階段（stage2）再用一個比較嚴格、需要更長時間或更強證據的規則,去確認「這是不是真的洩漏,而不是一時的雜訊突波」，veto 機制（用 offband/broadband 比值去否決）
-    stage2 = rule.get("stage2")
-    
-    # 只有當 method == "two_stage" 時才檢查這兩個欄位一定要是 dict
-    if method == "two_stage":
-        if not isinstance(stage1, dict) or not isinstance(stage2, dict):
-            raise ValueError("method=two_stage 時，postprocess_config.json 必須包含 stage1 與 stage2")
-    
-    # 3. Threshold
-    # 取出 window_threshold, 如果規則裡沒有這個值，就退回用 feature_payload（也就是 feature_config_micro.json）裡的 threshold，再不行就用寫死的 0.5 保底
-    window_threshold = _clean_optional_value(rule.get("window_threshold"), float)
+# 規則會用到的鍵（和轉換推論 ALARM_RULE_KEYS 相同）
+_RUNTIME_RULE_KEYS = (
+    "method", "alarm_threshold", "smooth_window", "consecutive", "n_hits", "m_window",
+    "high_threshold", "low_threshold", "min_leak_duration_sec",
+    "use_veto", "veto_column", "veto_threshold", "veto_rules",
+)
+
+def build_runtime_postprocess_settings(baseline_rule_settings):
+    '''
+    把 postprocess_config.json 的 baseline_rule_settings 整理成 runtime 用的規則設定。
+    不補任何預設值：參數檢查交給 alarm_rule_utils_v2.rule_kwargs_from_cfg（和干擾 / 轉換推論同一套），
+    缺參數、two_stage、門檻不在 0～1 都直接報錯。
+    這個方法用不到的參數回傳 None（API 會讀這些鍵，鍵名保留）。
+    '''
+    rule = dict(baseline_rule_settings)
+    cfg = {k: rule[k] for k in _RUNTIME_RULE_KEYS if _cfg_value(rule, k) is not None}
+    cfg["name"] = rule.get("name") or "formal_rule"
+    rule_kwargs_from_cfg(cfg)                                   # 不合格直接報錯
+
+    window_threshold = _cfg_value(rule, "window_threshold")
     if window_threshold is None:
-        window_threshold = float(feature_payload.get("threshold", 0.5))
+        raise ValueError("postprocess_config.json 的 baseline_rule_settings 沒有 window_threshold，不使用預設值")
 
-    # 理論上「單一 window 分類門檻」跟「告警規則用的門檻」可以是不同數值，但因為 postprocess_config.json 裡的 baseline_rule_settings 只定義了 window_threshold，沒有另外定義 alarm_threshold，所以會直接把 alarm_threshold 設成跟 window_threshold 一樣
-    alarm_threshold = _clean_optional_value(rule.get("alarm_threshold"), float)
-    if alarm_threshold is None:
-        alarm_threshold = window_threshold
-
-    # 4. Alarm rule 參數
-    # smooth_window 沒讀到的話，保底值是 1——代表「不做平滑」
-    smooth_window = _clean_optional_value(rule.get("smooth_window"), int)
-    if smooth_window is None:
-        smooth_window = 1
-
-    # consecutive 連續告警視窗數:沒讀到的話，退回 feature_config_micro.json 的 min_consecutive_windows，再不行才用寫死的 3
-    consecutive = _clean_optional_value(rule.get("consecutive"), int)
-    if consecutive is None:
-        consecutive = int(feature_payload.get("min_consecutive_windows", 3))
-
-    # 因為這四個只有在 method="n_of_m"（n_hits/m_window）或 method="hysteresis"（high_threshold/low_threshold）時才有意義
-    n_hits = _clean_optional_value(rule.get("n_hits"), int)
-    m_window = _clean_optional_value(rule.get("m_window"), int)
-    high_threshold = _clean_optional_value(rule.get("high_threshold"), float)
-    low_threshold = _clean_optional_value(rule.get("low_threshold"), float)
-
-    # 5. 最短警報持續時間
-    # min_leak_duration_sec 用來判斷「這段連續告警持續夠不夠久才算真正 leak」的秒數門檻
-    min_leak_duration_sec = _clean_optional_value(rule.get("min_leak_duration_sec"), float)
-    if min_leak_duration_sec is None:
-        min_leak_duration_sec = float(feature_payload.get("min_leak_duration_sec", 0.4))
-
-    # 6. Veto 規則(沒填預設 False)
-    # use_veto：決定「要不要用 offband ratio 去否決模型判斷的 leak」
-    use_veto = bool(rule.get("use_veto", False))
-    veto_column = rule.get("veto_column")
-    veto_threshold = _clean_optional_value(rule.get("veto_threshold"), float)
-    veto_rules = rule.get("veto_rules") or []
-    # 型別檢查,確保它真的是 list
+    use_veto = bool(cfg.get("use_veto", False))
+    veto_rules = cfg.get("veto_rules") or []
     if not isinstance(veto_rules, list):
         raise ValueError("veto_rules 必須是 list")
-    # 如果啟用了 veto（use_veto=True），但舊版跟新版兩種 veto 機制都沒有任何一種被設定（not veto_column 且 not veto_rules）,就報錯
-    if use_veto and not veto_column and not veto_rules:
-        raise ValueError("use_veto=True，但 postprocess_config.json  沒有 veto_column 或 veto_rules")
-        
-    # 使用單一數值 veto_column 時，沒有門檻就使用 0.5
-    if use_veto and veto_column and veto_threshold is None:
-        veto_threshold = 0.5
+    if use_veto and not veto_rules and not (cfg.get("veto_column") and cfg.get("veto_threshold") is not None):
+        raise ValueError("use_veto=True，但沒有 veto_rules，也沒有完整的 veto_column + veto_threshold")
 
-    # 7. 依 method 檢查必要參數
-    if method == "n_of_m":
-        if n_hits is None or m_window is None:
-            raise ValueError("method=n_of_m 時必須提供 n_hits 與 m_window")
-
-    if method == "hysteresis":
-        if high_threshold is None or low_threshold is None:
-            raise ValueError("method=hysteresis 時必須提供 high_threshold 與 low_threshold")
-    
-    # 確認 method 本身是這五種合法值之一
-    supported_methods = {"threshold", "consecutive", "n_of_m", "hysteresis", "two_stage",}
-    if method not in supported_methods:
-        raise ValueError(f"不支援的 alarm method: {method}")
+    def _opt(k, cast):
+        v = cfg.get(k)
+        return None if v is None else cast(v)
 
     return {
-        "alarm_method": method,
+        "alarm_method": cfg["method"],
         "window_threshold": float(window_threshold),
-        "alarm_threshold": float(alarm_threshold),
-        "smooth_window": int(smooth_window),
-        "consecutive": int(consecutive),
-        "n_hits": n_hits,
-        "m_window": m_window,
-        "high_threshold": high_threshold,
-        "low_threshold": low_threshold,
-    
+        "alarm_threshold": _opt("alarm_threshold", float),    # hysteresis 時是 None
+        "smooth_window": _opt("smooth_window", int),
+        "consecutive": _opt("consecutive", int),              # 只有 consecutive 方法有值
+        "n_hits": _opt("n_hits", int),
+        "m_window": _opt("m_window", int),
+        "high_threshold": _opt("high_threshold", float),
+        "low_threshold": _opt("low_threshold", float),
         "use_veto": use_veto,
-        "veto_column": veto_column,
-        "veto_threshold": veto_threshold,
+        "veto_column": cfg.get("veto_column"),
+        "veto_threshold": _opt("veto_threshold", float),
         "veto_rules": veto_rules,
-    
-        "stage1": stage1,
-        "stage2": stage2,
-    
-        "min_leak_duration_sec": float(min_leak_duration_sec),
+        "min_leak_duration_sec": _opt("min_leak_duration_sec", float),   # None = 不限制（和 alarm_rule_utils 一致）
     }
 
 
@@ -468,10 +399,7 @@ def load_runtime_configs(
     
     # 後處理規則整理：把 postprocess JSON 中目前選定的正式規則整理成容易使用的數值
     baseline_rule_settings = postprocess_payload["baseline_rule_settings"]     # 取出 baseline_rule_settings
-    postprocess_settings = build_runtime_postprocess_settings(
-        feature_payload,
-        baseline_rule_settings,
-    )
+    postprocess_settings = build_runtime_postprocess_settings(baseline_rule_settings)
 
     # ============================================================
     # 特徵版本一致性檢查
@@ -620,11 +548,6 @@ def load_runtime_configs(
         # 現場場域正常 baseline
         "site_baseline_payload": site_baseline_payload,
         
-        # runtime baseline fallback 參數：若沒有 site baseline，正式推論才會改用新資料前幾窗或前幾秒自行估 baseline
-        "baseline_mode": feature_payload.get("baseline_mode", "first_n_windows"),     # 沒有 site baseline 時，用「前幾窗」還是「前幾秒」自估 baseline
-        "baseline_n_windows": feature_payload.get("baseline_n_windows", 5),           # 前幾窗模式要看幾個窗
-        "baseline_duration_sec": feature_payload.get("baseline_duration_sec", None),  # 前幾秒模式要看幾秒
-        
         # 模型輸出欄位
         "score_col": feature_payload.get("score_col", "leak_score"),   # 模型分數要存在哪個欄位名（預設 "leak_score"）
         "pred_col": feature_payload.get("pred_col", "pred_label"),     # 模型 0/1 預測要存在哪個欄位名（預設 "pred_label"）
@@ -645,13 +568,8 @@ def load_runtime_configs(
         "veto_column": postprocess_settings["veto_column"],
         "veto_threshold": postprocess_settings["veto_threshold"],
         "veto_rules": postprocess_settings["veto_rules"],
-        "min_consecutive_windows": postprocess_settings["consecutive"],     # 連續命中法要求的連續窗數
         "min_leak_duration_sec": postprocess_settings["min_leak_duration_sec"],    # apply_postprocessing 判斷「這段連續告警要持續多久才算真正 leak」的秒數門檻
-            
-        # two-stage
-        "stage1": postprocess_settings["stage1"],
-        "stage2": postprocess_settings["stage2"],
-        
+
         # offband
         "postprocess_payload": postprocess_payload,        # 整份 postprocess_config.json 原始內容
         "baseline_rule_settings": baseline_rule_settings,  # postprocess_payload["baseline_rule_settings"] 這個子物件，方便直接存取
@@ -781,98 +699,6 @@ def parse_required_features(selected_feature_names: list[str]):    # 輸入是�
 
 
 # ============================================================
-# 建立時間序列特徵
-# ============================================================
-def add_window_dynamic_features(
-    df,                      # 原始特徵表
-    feature_cols,            # 哪些欄位要做這些動態特徵
-    group_col="record_id",   # 以哪個 record 為單位分組
-    time_col="t_ref",        # 時間排序依據
-    prev_windows=(3, 5),     # 要回看前 3 個窗、前 5 個窗
-):
-    """建立 delta 與相對前幾窗平均的變化量特徵：delta_* , delta_prev3mean_* , delta_prev5mean_*。"""
-    out = df.copy()    # 先複製一份 DataFrame，避免直接改原始資料
-    out = out.sort_values([group_col, time_col]).reset_index(drop=True)     # 先按照：record_id , t_ref 排序。
-
-    # 過濾真正可用的欄位:這個欄位名真的存在, 而且它是數值欄位
-    valid_cols = [
-        c for c in feature_cols
-        if c in out.columns and pd.api.types.is_numeric_dtype(out[c])
-    ]
-
-    # 依照 record_id 分組:每一筆 record 的時間序列要分開算，不能把不同 record 接在一起算時間差
-    for _, sub in out.groupby(group_col, sort=False):
-        idx = sub.index     # 先把這個 group 在原本 DataFrame 裡對應的索引位置存起來。等等算出來的結果要寫回 out 時，會用到
-        
-        # 逐個特徵欄位處理
-        for col in valid_cols:
-            x = pd.to_numeric(sub[col], errors="coerce")    # 欄位轉成數值型態
-            out.loc[idx, f"delta_{col}"] = x.diff()         # 建立：相鄰兩個 window 的差值。也就是：本窗值 - 前一窗值
-
-            # 再依序處理：回看前 3 個窗 , 回看前 5 個窗
-            for k in prev_windows:
-                # 計算：前 k 個窗的平均值。先 shift(1) 是為了排除「當前窗」本身，只看之前的資料
-                prev_mean = x.shift(1).rolling(k, min_periods=1).mean()
-                out.loc[idx, f"delta_prev{k}mean_{col}"] = x - prev_mean    # 建立：目前這一窗，相對於前 k 窗平均偏了多少
-
-    return out
-
-
-# ============================================================
-# 對每個原始特徵欄位，再往上算一批「局部時間統計特徵」
-# ============================================================
-def add_local_rolling_features(
-    df,                       # 原始特徵表
-    feature_cols,             # 哪些欄位要做這些時間特徵
-    group_col="record_id",    # 以哪個 record 分組
-    time_col="t_ref",         # 時間排序依據
-    windows=(3, 5),           # 要看前 3 窗、前 5 窗
-):
-    """建立 local relative / local z / rolling trend 類特徵。"""
-    out = df.copy()     # 先複製一份資料，避免直接改原始 df
-    out = out.sort_values([group_col, time_col]).reset_index(drop=True)     # 先按照：record_id , t_ref 排序。
-    
-    # 過濾真正能算的欄位:欄位真的存在 , 欄位是數值型
-    valid_cols = [
-        c for c in feature_cols
-        if c in out.columns and pd.api.types.is_numeric_dtype(out[c])
-    ]
-
-    # 依 record_id 分組。每一筆 record 的時間序列分開算，不把不同 record 混在一起。
-    for _, sub in out.groupby(group_col, sort=False):
-        idx = sub.index    # 記住這個分組在原表中的索引，等等算完後可以把結果寫回 out
-        # 開始逐個特徵欄位處理
-        for col in valid_cols:
-            # 把這個欄位轉成數值格式,如果有奇怪值就變成 NaN
-            x = pd.to_numeric(sub[col], errors="coerce")
-            
-            # 依序處理：回看 3 窗 , 回看 5 窗
-            for k in windows:
-                prev = x.shift(1)     # 把序列往後移一格。意思是：只看前面的窗，不包含目前這一窗自己。
-                prev_mean = prev.rolling(k, min_periods=1).mean()          # 算前 k 個窗的平均值
-                prev_std = prev.rolling(k, min_periods=2).std(ddof=1)      # 算前 k 個窗的標準差
-                rolling_std = x.rolling(k, min_periods=2).std(ddof=1)      # 算「包含當前窗」的 rolling standard deviation:最近這一小段的波動程度
-                rolling_max = x.rolling(k, min_periods=1).max()            # 算最近 k 窗中的最大值。比較：當前值離最近最大值差多少。
-
-                # 建立 local_rel 特徵
-                out.loc[idx, f"local_rel{k}_{col}"] = x - prev_mean    # 當前值 - 前 k 窗平均
-                out.loc[idx, f"local_z{k}_{col}"] = (x - prev_mean) / (prev_std + 1e-12)    # 建立 local_z 特徵:(當前值 - 前 k 窗平均) / 前 k 窗標準差
-                out.loc[idx, f"rolling_std{k}_{col}"] = rolling_std       # 建立 rolling_std 特徵：最近 k 窗整體波動大不大。
-                out.loc[idx, f"rolling_max_gap{k}_{col}"] = x - rolling_max     # 建立 rolling_max_gap 特徵：當前值 - 最近 k 窗最大值
-
-                # 算 rolling_slope:對最近 k 個點做一條直線擬合，取它的斜率，洩漏訊號是否有持續上升趨勢，干擾是不是只是瞬間尖峰
-                # 如果斜率是正的：代表最近在往上升
-                slope = x.rolling(k, min_periods=2).apply(
-                    lambda arr: np.polyfit(np.arange(len(arr)), arr, 1)[0]
-                    if np.isfinite(arr).sum() >= 2 else np.nan,
-                    raw=True,
-                )
-                out.loc[idx, f"rolling_slope{k}_{col}"] = slope
-
-    return out
-
-
-# ============================================================
 # 把前面兩種 temporal 特徵都一起加上去
 # ============================================================
 def add_common_temporal_features(df, raw_base_features):
@@ -924,63 +750,28 @@ def build_runtime_features_from_base_table(base_df, runtime_cfg):
     # 先按時間排序，後面才會依時間順序正常運作
     df = df.sort_values(["record_id", "t_ref"]).reset_index(drop=True)
 
-    # 建立 runtime baseline relative 特徵:用前幾窗或前幾秒當 baseline, 建立 rel_*, 建立 z_*
-    df = build_runtime_baseline_features(
-        df=df,
-        raw_base_features=runtime_cfg["raw_base_features"],
-        site_baseline_payload=runtime_cfg["site_baseline_payload"],
-        group_col="record_id",
-        time_col="t_ref",
-        baseline_mode=runtime_cfg["baseline_mode"],
-        baseline_n_windows=runtime_cfg["baseline_n_windows"],
-        baseline_duration_sec=runtime_cfg["baseline_duration_sec"],
-    )
+    plan = runtime_cfg["execution_plan"]
 
-    # 找出哪些 z_* 需要再做 CUSUM
-    needed_z_cols = [
-        f"z_{c}"
-        for c in runtime_cfg["raw_base_features"]
-        if f"z_{c}" in runtime_cfg["z_base_features"]
-    ]
+    # 1. 模型需要的 rel_ / z_：照執行計畫套固定 site baseline（和 FE、streaming 同一套；缺統計值直接報錯，不自己估）
+    if plan["baseline_features"]:
+        df = apply_fixed_normal_baseline(df=df, feature_cols=list(plan["baseline_features"]),
+                                         baseline_payload=runtime_cfg["site_baseline_payload"])
 
-    # 如果有需要，就加 CUSUM, 把前面選定的 z_* 欄位做成：cusum_pos_* , cusum_neg_* , 這種累積偏移特徵。
-    if needed_z_cols:
-        df = add_cusum_features(
-            df=df,
-            input_feature_cols=needed_z_cols,
-            k=runtime_cfg["cusum_k"],
-            decay=runtime_cfg["cusum_decay"],
-        )
-        
-    # 再補上其他 temporal 特徵:會再加：delta_* , delta_prev3mean_* , local_rel* , local_z* , rolling_std* , rolling_slope* 這些時間變化特徵。
-    df = add_common_temporal_features(df, runtime_cfg["raw_base_features"])
+    # 2. 跨窗 CUSUM / temporal：照執行計畫（目前 Step2 不讓跨窗特徵進模型，兩份清單都是空的）
+    if runtime_cfg["z_base_features"]:
+        df = add_cusum_features(df=df, input_feature_cols=list(runtime_cfg["z_base_features"]),
+                                k=runtime_cfg["cusum_k"], decay=runtime_cfg["cusum_decay"])
+    if plan["temporal_base_features"]:
+        df = add_common_temporal_features(df, list(plan["temporal_base_features"]))
 
-    # 如果設定有開，就建立 offband / leak / resonance 摘要特徵
+    # 3. 頻帶群組摘要 + 摘要的 rel_ / z_（規則用；清單和 FE、streaming 共用）
+    summary_base_cols = []
     if runtime_cfg["include_offband_summary"]:
         df = build_offband_summary_features(df, runtime_cfg["band_config"])
-        
-        # 把多個頻帶整理成「洩漏能量、共振能量、非目標頻帶能量，以及它們的比例」
-        summary_base_cols = [
-        c for c in [
-            "offband_E_mean", "offband_E_max",
-            "leak_focus_E_mean", "leak_focus_E_max",
-            "resonance_E_mean", "resonance_E_max",
-        ]
-        if c in df.columns
-    ]
-
+        summary_base_cols = [c for c in SUMMARY_BASELINE_COLUMNS if c in df.columns]
     if summary_base_cols:
-        # 替這些摘要能量建立特徵
-        df = build_runtime_baseline_features(
-            df=df,
-            raw_base_features=summary_base_cols,
-            site_baseline_payload=runtime_cfg["site_baseline_payload"],
-            group_col="record_id",
-            time_col="t_ref",
-            baseline_mode=runtime_cfg["baseline_mode"],
-            baseline_n_windows=runtime_cfg["baseline_n_windows"],
-            baseline_duration_sec=runtime_cfg["baseline_duration_sec"],
-        )
+        df = apply_fixed_normal_baseline(df=df, feature_cols=summary_base_cols,
+                                         baseline_payload=runtime_cfg["site_baseline_payload"])
 
     runtime_extra_cols = [
         "offband_E_mean", "offband_E_max",
@@ -1004,8 +795,9 @@ def build_runtime_features_from_base_table(base_df, runtime_cfg):
     # 合併需要輸出的欄位
     requested_output_cols = (
         base_output_cols                          # 基本識別與時間欄位
-        + runtime_cfg["final_keep_features"]      # 模型訓練時決定的正式特徵欄位
-        + runtime_extra_cols                      # 規則與除錯需要的額外摘要欄位
+        + runtime_cfg["final_keep_features"]      # 模型正式特徵
+        + runtime_cfg["rule_feature_names"]       # 正式規則需要的欄位（來自 runtime_feature_schema，含 veto 欄位）
+        + runtime_extra_cols                      # 除錯用的額外摘要欄位
     )
     
     # 去除重複欄位，同時保留第一次出現的順序
@@ -1015,100 +807,6 @@ def build_runtime_features_from_base_table(base_df, runtime_cfg):
     ))
     
     return df[output_cols].copy()
-
-
-# ============================================================
-# 正式 runtime 建立 baseline relative 特徵 , 優先使用 site baseline，沒有才 fallback 到前幾個窗
-# ============================================================
-def build_runtime_baseline_features(
-    df,                                 # 目前已經算出基礎 band 特徵的表
-    raw_base_features,                  # 哪些原始特徵要拿來做 rel_* 和 z_*
-    site_baseline_payload=None,
-    group_col="record_id",              # 每筆訊號的分組欄位
-    time_col="t_ref",                   # 時間排序欄位
-    baseline_mode="first_n_windows",    # baseline 要怎麼選
-    baseline_n_windows=5,               # 如果用前幾窗，就預設前 5 窗
-    baseline_duration_sec=None,         # 如果用前幾秒，就看這個秒數
-):
-    """
-    建立正式 runtime 的 rel_* 與 z_* 特徵。
-
-    優先順序：
-    1. 若提供 site_baseline.json，優先使用場域正常資料建立的 mean / std
-    2. 若沒有 site baseline，才 fallback 到每筆新資料前幾窗自行估 baseline
-    """
-    # 先複製一份，避免直接改原始 df。然後把資料按照：record_id , t_ref 排序。
-    out = df.copy()
-    out = out.sort_values([group_col, time_col]).reset_index(drop=True)
-
-    # 避免後面做除法時分母太小或等於 0
-    eps = 1e-12
-
-    # 過濾真正可以拿來做 baseline relative 的欄位
-    # 條件是：
-    #   欄位名稱在 raw_base_features 裡
-    #   這個欄位真的存在於 out
-    #   這個欄位是數值型
-    valid_cols = [
-        c for c in raw_base_features
-        if c in out.columns and pd.api.types.is_numeric_dtype(out[c])
-    ]
-    
-    # 如果有場域 baseline 優先使用
-    feature_stats = {}
-    if site_baseline_payload is not None:
-        feature_stats = site_baseline_payload.get("feature_stats", {})
-
-    # 開始逐筆訊號分開處理
-    for _, sub in out.groupby(group_col, sort=False):
-        idx = sub.index      # 記住這一組資料在原表中的索引位置，等等好把結果寫回去
-        t = pd.to_numeric(sub[time_col], errors="coerce")    # 把時間欄位轉成數值型，方便做 baseline 篩選
-
-        # baseline 怎麼選
-        # 如果設定的是 first_seconds，就代表：把每筆訊號最前面幾秒當 baseline
-        if baseline_mode == "first_seconds" and baseline_duration_sec is not None:
-            baseline_mask = t <= float(baseline_duration_sec)
-            # 如果因為某些原因，前幾秒根本沒有選到任何窗，那就退回成：至少拿前 baseline_n_windows 個窗來當 baseline
-            if baseline_mask.sum() == 0:
-                baseline_mask = pd.Series(False, index=sub.index)
-                baseline_mask.iloc[: max(1, baseline_n_windows)] = True
-        # 如果不是 first_seconds 模式，那就走預設：直接拿最前面 baseline_n_windows 個窗當 baseline
-        else:
-            baseline_mask = pd.Series(False, index=sub.index)
-            baseline_mask.iloc[: max(1, baseline_n_windows)] = True
-
-        # 對每個特徵欄位建立 rel_* 和 z_*
-        for col in valid_cols:
-            x = pd.to_numeric(sub[col], errors="coerce")
-
-            # 有現場場域 site_baseline.json 就先用它
-            if col in feature_stats:
-                mu = float(feature_stats[col].get("mean", np.nan))
-                sigma = float(feature_stats[col].get("std", np.nan))
-                
-            else:
-                baseline_values = x[baseline_mask]     # 把剛剛選中的 baseline 那幾窗取出來
-                # 算 baseline 的：mu：平均值 , sigma：標準差
-                mu = baseline_values.mean()
-                sigma = baseline_values.std(ddof=1)
-
-            # 如果 baseline 平均值算不出來，例如全是 NaN，那就退回整段訊號的平均值
-            if pd.isna(mu):
-                mu = x.mean()
-
-            # 如果 baseline 標準差算不出來，或太小，那就退回整段訊號的標準差。
-            if pd.isna(sigma) or sigma < eps:
-                sigma = x.std(ddof=1)
-            
-            # 如果連整段標準差都不可靠，那最後硬設成 1.0。這樣至少後面算 z-score 不會炸掉。
-            if pd.isna(sigma) or sigma < eps:
-                sigma = 1.0
-
-            # 真正建立新特徵
-            out.loc[idx, f"rel_{col}"] = x - mu       # 建立 rel_* 特徵:每一窗的值，相對於 baseline 平均偏了多少
-            out.loc[idx, f"z_{col}"] = (x - mu) / (sigma + eps)     # 建立 z_* 特徵：每一窗相對於 baseline 偏了幾個標準差
-
-    return out
 
 
 # ============================================================
@@ -1391,7 +1089,7 @@ def load_model_bundle(metadata_json_path):
     metadata = json.loads(metadata_json_path.read_text(encoding="utf-8"))
     model = joblib.load(model_dir / "model.pkl")
 
-    # thresholds.json 是選擇性存在的檔案——回頭看 ModelManager.save_model，它只有在 threshold_payload 裡至少有一個值不是 None 時才會真的寫出這個檔案
+    # thresholds.json 由 ModelManager.save_model 寫出；正式模型一定要有（缺檔或缺 window_threshold 都會在下面報錯）
     thresholds_path = model_dir / "thresholds.json"
     thresholds = {}
     if thresholds_path.exists():
@@ -1399,7 +1097,7 @@ def load_model_bundle(metadata_json_path):
 
     # 讀書特徵清單
     feature_names = metadata["features"]["feature_names"]
-    # 優先看 thresholds.json 裡有沒有 window_threshold；沒有的話，退回去看 metadata.json 裡 performance.window_level.threshold；兩個都沒有，最後保底用 0.5
+    # window_threshold 只從 thresholds.json 讀（訓練程式存的最佳門檻）；沒有就直接報錯，不退回 metadata、也不用 0.5 保底
     if "window_threshold" not in thresholds or thresholds["window_threshold"] is None:
         raise ValueError(f"{thresholds_path} 沒有 window_threshold，不使用預設值；請確認訓練程式有存門檻")
     window_threshold = thresholds["window_threshold"]
@@ -1433,13 +1131,13 @@ def run_runtime_pipeline(
     n_jobs=2,                      # 平行處理數量
 ):
     """
-    正式離線推論的完整端到端流程：讀五份正式設定 → 整理新資料 → 跑封裝好的特徵工程 → 雙重欄位一致性檢查 → 模型推論（用規則端 threshold 覆寫） → 逐 record 套告警規則（含 veto/two-stage） → 額外的事件層級後處理（連續/持續時間關卡刻意調鬆,因為已在告警規則階段處理過） → 壓成摘要表並輸出。
+    正式離線推論的完整端到端流程：讀五份正式設定 → 整理新資料 → 跑封裝好的特徵工程 → 雙重欄位一致性檢查 → 模型推論（用規則端 threshold 覆寫） → 逐 record 套告警規則（含 veto） → 額外的事件層級後處理（連續/持續時間關卡刻意調鬆,因為已在告警規則階段處理過） → 壓成摘要表並輸出。
     
     正式即時 / 離線推論入口。
     輸入是一筆或多筆新進 TDMS，
     直接讀 band_config、feature_config、model，
     並優先使用 site_baseline 做 baseline-relative 特徵建立。
-    若未提供 site baseline，才 fallback 到新資料前幾窗估 baseline。
+    只用固定 site baseline，缺統計值直接報錯。
     
     新的 TDMS
        ↓
@@ -1566,9 +1264,9 @@ def run_runtime_pipeline(
     
     # 一致性檢查：確認 threshold 是否一致(訓練時決定的最佳閾值 vs 規則搜尋時用的閾值)
     if abs(model_threshold - rule_threshold) > 1e-12:
-        print("⚠️ 模型 threshold 與 postprocess rule 的 window_threshold 不一致")
-        print("model threshold =", model_threshold)
-        print("rule threshold  =", rule_threshold)
+        raise ValueError(
+            f"模型 window_threshold={model_threshold} 和 postprocess_config 的 {rule_threshold} 不一致："
+            "規則不是用這顆模型選的，請重跑干擾推論")
 
     # 1. 模型只負責產生每個 window 的機率：模型推論，對每個時間窗算出機率分數（score_col）跟二元判斷（pred_col）
     df_pred = run_model_inference(
@@ -1603,12 +1301,10 @@ def run_runtime_pipeline(
         "veto_column": runtime_cfg["veto_column"],
         "veto_threshold": runtime_cfg["veto_threshold"],
         "veto_rules": runtime_cfg["veto_rules"],
-    
-        "stage1": runtime_cfg["stage1"],
-        "stage2": runtime_cfg["stage2"],
+
     }
     
-    # 用整理好的 formal_rule_cfg 對每一個 record_id 分別跑一次告警規則（consecutive/n_of_m/hysteresis/two_stage 其中一種，取決於 formal_rule_cfg["method"]）
+    # 用整理好的 formal_rule_cfg 對每一個 record_id 分別跑一次告警規則（consecutive/n_of_m/hysteresis 其中一種，取決於 formal_rule_cfg["method"]）
     df_alarm = apply_alarm_method_by_record(
         df_pred=df_rule_input,
         cfg=formal_rule_cfg,
