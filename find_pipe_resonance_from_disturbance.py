@@ -3,7 +3,7 @@
 """
 找出管子自身固定的共振候選頻帶。
 1. 先用「敲擊管子」資料，找出哪些頻率在扣除寬頻趨勢後仍有局部凸起
-2. 用 0713 做跨天驗證，並分位置找峰、統計每個 10 kHz 格子在幾個位置都通過
+2. 用驗證批次（預設 0713）做跨天驗證，並分位置找峰、統計每個 10 kHz 格子在幾個位置都通過
 3. 自動產生提案 proposed_resonance_bands.json，人工確認後用 --approve-proposal 核准，
    寫入正式版 approved_resonance_bands.json（每次核准都會留下紀錄）
 
@@ -133,6 +133,7 @@ TAP_FOLDER_KEYWORDS = ("tap_pipe", "tab_pipe", "tappipe")
 
 # ============================================================
 # 預設批次設定:前三天用來找共振候選峰，0713 保留做驗證
+# 欄位名稱裡的 0713 是沿用舊名，實際代表『驗證批次』（可由 --validation-batches 指定）
 # ============================================================
 DEFAULT_SEARCH_BATCHES = {
     "disturbance_ann_0624",
@@ -149,7 +150,8 @@ DEFAULT_VALIDATION_BATCHES = {
 # 共振頻帶網格常數（與 build_site_baseline_v2.py 的 DISCOVERY_* 一致）
 # ============================================================
 from shared_feature_utils import (
-    GRID_F_MIN, GRID_F_MAX, GRID_WIDTH
+    GRID_F_MIN, GRID_F_MAX, GRID_WIDTH,
+    OFFBAND_BANDS,     # offband 的唯一定義來源（和 Step2、band config 一致）
 )
 # GRID_F_MIN：涵蓋的頻率範圍，和 discovery 一樣是 5～500 kHz。
 # GRID_F_MAX：涵蓋的頻率範圍，和 discovery 一樣是 5～500 kHz。
@@ -173,7 +175,8 @@ ALL_BANDS: list[tuple] = []                # 目前正式版的 ALL_BANDS
 EXCLUDED_RANGES: set[tuple] = set()
 # 固定排除：已定為 offband 的頻段（與 band_config_step2.json 的 offband_bands 一致）
 # 和這些範圍有重疊的共振格子，提案時一律預設不納入
-FIXED_EXCLUDED_RANGES = [(10_000, 20_000), (50_000, 60_000), (210_000, 220_000), (315_000, 325_000)]
+# 由 shared_feature_utils.OFFBAND_BANDS 產生，不在這裡另外寫一份（改 offband 只要改 shared）
+FIXED_EXCLUDED_RANGES = [(int(b["f_low"]), int(b["f_high"])) for b in OFFBAND_BANDS]
 
 
 # ============================================================
@@ -267,6 +270,13 @@ def parse_args() -> argparse.Namespace:
         help="指定搜尋批次（覆蓋預設的 0624/0702/0707），例如 disturbance_ann_0624 disturbance_ann_0702；"
              "不可包含驗證批次 0713",
     )
+    
+    data.add_argument(
+        "--validation-batches", nargs="+", default=None,
+        help="跨天驗證用的批次（覆蓋預設的 disturbance_ann_0713），例如模擬資料的批次名稱；"
+             "不可和搜尋批次重疊",
+    )
+    
     data.add_argument(
         "--position-filter", nargs="*", default=None,
         help="只分析特定位置，例如 straight20cm straight50cm；不指定則全部納入",
@@ -1971,7 +1981,8 @@ def main() -> None:
     # 決定：哪些批次拿來「找共振候選峰」,哪些批次拿來「做驗證」
     # 如果你手動傳 --batch-filter，就覆蓋預設搜尋批次
     search_batches = set(args.batch_filter) if args.batch_filter else DEFAULT_SEARCH_BATCHES
-    validation_batches = DEFAULT_VALIDATION_BATCHES
+    validation_batches = set(args.validation_batches) if args.validation_batches else DEFAULT_VALIDATION_BATCHES
+    print(f"搜尋批次：{sorted(search_batches)}／驗證批次：{sorted(validation_batches)}")
     # 檢查:如果搜尋和驗證用到同一天，跨天驗證就沒有意義了，直接停止。
     overlap = search_batches & validation_batches
     if overlap:
