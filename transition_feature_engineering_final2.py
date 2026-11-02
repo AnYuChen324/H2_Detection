@@ -208,6 +208,7 @@ from shared_feature_utils import (
     load_band_config,
     SIGNAL_RMS_MIN,
     build_continuous_segments,    # v22 連續段：依取樣序號把首尾相接的 0.5 秒檔組成一段
+    SUMMARY_BASELINE_COLUMNS,
 )
 
 
@@ -482,8 +483,7 @@ def build_transition_segment_meta(
         used_event_idx = set()
         # 逐一處理目前 Session 中的所有 Segment
         for seg in specs:
-            # 取得目前 Segment 的唯一識別碼
-            # 後續 CUSUM、Temporal 等特徵可依 record_id 分組
+            # 取得目前 Segment 的唯一識別碼，後續 CUSUM、Temporal 等特徵可依 record_id 分組
             seg_id = seg["record_id"]
             # 檢查這個 Segment ID 是否曾經出現在其他資料中
             if seg_id in seen_segment_ids:
@@ -522,54 +522,93 @@ def build_transition_segment_meta(
                 continue
             
             # 將事件時間從 Session 時間軸轉成 Segment 內部時間
+            # 注意：這裡的 onset 是按鈕事件時間，不一定等於物理上真正開始洩漏的瞬間
             onset = float(e["event_elapsed_sec"]) - start      # 段內秒數
-            normal_end = onset - float(gray_before_sec)
-            leak_start = onset + float(gray_after_sec)
+            normal_end = onset - float(gray_before_sec)        # 正常區間的結束時間：從切換事件往前扣除灰色地帶
+            leak_start = onset + float(gray_after_sec)         # 洩漏區間的開始時間：從切換事件往後加上灰色地帶
+            # 檢查灰色地帶是否超出 Segment 範圍
             if normal_end <= 0 or leak_start >= duration:
                 problems.append(
                     f"{seg_id}：onset={onset:.2f}s、段長 {duration:.2f}s，扣掉灰色地帶後正常段或洩漏段不夠"
                 )
                 continue
 
-            # ---- 4. 段的條件資訊（同一段只能有一種值） ----
+            # ========================================================
+            # 5. 取得目前 Segment 的實驗條件
+            # ========================================================
+            # 從檔案資訊表中找出屬於目前 Segment 的所有 TDMS
             files = df_files[df_files["segment_id"] == seg_id]
+            # 將壓力欄位轉成數值
             pressure = _single_value(pd.to_numeric(files["pressure_bar"], errors="coerce"), "pressure_bar", seg_id, problems)
+            # 將 position 欄位轉換成感測器距離
             distance = _single_value(files["position"].map(_parse_distance_cm), "距離（position）", seg_id, problems)
+            # 將設定洩漏量轉成數值，再確認同一段所有 TDMS 的洩漏量是否一致
             volume = _single_value(pd.to_numeric(files["matched_volume_ml"], errors="coerce"), "matched_volume_ml", seg_id, problems)
 
-            segment_specs.append(seg)
+            # ========================================================
+            # 6. 儲存 Segment 與標註資訊
+            # ========================================================
+            segment_specs.append(seg)                      # 將目前 Segment 加入連續段清單
             meta_rows.append({
+                # Segment 的唯一識別碼:CUSUM、Temporal 等特徵依此欄位區分連續訊號
                 "record_id": seg_id,                       # 一段一個 record，CUSUM／temporal 依它分組
+                # 原始錄製 Session 的識別碼
                 "session_id": seg["session_id"],
+                # Session 資料夾的相對路徑，方便追溯來源
                 "interval_name": where,                    # session 資料夾
+                # 感測器與洩漏點的距離，單位 cm
                 "distance_cm": distance,
+                # 實驗設定的洩漏量，取自 matched_volume_ml
                 "leak_quantity": volume,                   # 洩漏段的設定流量
+                # 實驗壓力，單位 bar
                 "pressure_bar": pressure,
+                # 取 Segment 第一支 TDMS 的檔名作為追溯資訊
                 "output_tdms": Path(seg["filepaths"][0]).name,   # 段的第一支檔（追溯用）
+                # 正常區間結束時間，單位秒，此時間之前為預期正常區
                 "normal_end_sec": normal_end,
+                # 洩漏區間開始時間，單位秒，此時間之後為預期洩漏區
                 "leak_start_sec": leak_start,
+                # 按鈕切換事件在 Segment 內部的時間
                 "onset_gt_sec": onset,
+                # Segment 的總持續時間，單位秒
                 "segment_duration_sec": duration,
+                # 此 Segment 包含的 TDMS 檔案數量
                 "n_files": seg["n_files"],
+                # 記錄本次標註使用的事件前灰色地帶秒數
                 "gray_before_sec": float(gray_before_sec),
+                # 記錄本次標註使用的事件後灰色地帶秒數
                 "gray_after_sec": float(gray_after_sec),
+                # 記錄 onset 的來源為按鈕事件檔(與舊版使用 TDMS 檔名交界判斷 onset 的方式不同)
                 "onset_source": "transition_events",       # onset 來自按鈕事件（舊 merge 資料是檔名交界）
             })
-
+            
+        # ============================================================
+        # 7. 檢查是否有事件沒有落在任何連續 Segment 內
+        # ============================================================
         # 有事件沒落在任何段內：事件剛好在斷點的空檔裡，這次切換沒有訊號可用
         lost = ev.loc[~ev.index.isin(used_event_idx)]
+        # 逐一記錄沒有對應連續段的事件
         for _, e in lost.iterrows():
             problems.append(f"{where}：事件 {e['from_state']}→{e['to_state']} @ {e['event_elapsed_sec']:.3f}s 不在任何連續段內")
-
+    
+    # ============================================================
+    # 8. 統一顯示排除資料與檢查結果
+    # ============================================================
+    # 如果有 Segment 因為沒有切換事件而被排除，顯示排除數量及各段資訊
     if skipped:
         print(f"⚠️ 有 {len(skipped)} 段沒有切換事件，已排除：")
         for s in skipped:
             print(f"   - {s}")
+    # 如果處理過程中累積任何資料異常，就停止程式並一次列出所有問題
     if problems:
         raise ValueError(f"轉換資料有 {len(problems)} 個問題，請先修正：\n  - " + "\n  - ".join(problems))
+    # 如果沒有任何通過檢查的 Segment，就停止程式，避免回傳空資料集
     if not segment_specs:
         raise ValueError("沒有任何可用的轉換段")
-
+    
+    # ============================================================
+    # 9. 建立最終標註表並回傳
+    # ============================================================
     df_meta = pd.DataFrame(meta_rows)
     print(f"✅ 轉換段：{len(df_meta)} 段，onset 來自事件檔；灰色地帶 onset 前 {gray_before_sec}s、後 {gray_after_sec}s")
     return segment_specs, df_meta
@@ -970,15 +1009,9 @@ def build_inference_feature_csv(
     # 都使用同一份固定 baseline。
     # normal_end_sec 只負責 transition 標註，不參與 baseline 統計。
     # ============================================================
-    # 規則需要的摘要欄位也套 baseline（和 disturbance 一致，告警規則才能在兩邊用同一組欄位）
-    rule_baseline_feature_names = [
-        c for c in [
-            "offband_E_mean", "offband_E_max",
-            "leak_focus_E_mean", "leak_focus_E_max",
-            "resonance_E_mean", "resonance_E_max",
-        ]
-        if c in df.columns
-    ]
+    # 規則需要的摘要欄位也套 baseline（清單和干擾 FE、runtime 共用，定義在 shared_feature_utils）
+    rule_baseline_feature_names = [c for c in SUMMARY_BASELINE_COLUMNS if c in df.columns]
+
     baseline_apply_feature_names = list(dict.fromkeys(baseline_feature_names + rule_baseline_feature_names))
     
     # Baseline 前動態檢查
@@ -1226,6 +1259,11 @@ def build_inference_feature_csv(
         "z_resonance_E_mean",
         "rel_resonance_E_max",
         "z_resonance_E_max",
+        
+        # ratio veto：比正常時高幾倍（log），干擾推論的候選規則用 rel_ 版本
+        "log_offbandmax_to_leak_focusmax_E_ratio",
+        "rel_log_offbandmax_to_leak_focusmax_E_ratio",
+        "z_log_offbandmax_to_leak_focusmax_E_ratio",
     ]
     
     # 也保留每個 offband 原始頻帶特徵，方便未來規則直接指定單一 offband 欄位
