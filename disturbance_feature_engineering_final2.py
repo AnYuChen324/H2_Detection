@@ -240,6 +240,7 @@ from shared_feature_utils import (
     load_band_config,
     SIGNAL_RMS_MIN,
     build_continuous_segments,    # v22 連續段：依取樣序號把首尾相接的 0.5 秒檔組成一段
+    SUMMARY_BASELINE_COLUMNS,
 )
 
 
@@ -1104,14 +1105,8 @@ def build_disturbance_inference_feature_csv(
                 f"Disturbance 缺少 offband 摘要特徵：{missing_summary}"
             )
         
-    rule_baseline_feature_names = [
-        "offband_E_mean",
-        "offband_E_max",
-        "leak_focus_E_mean",
-        "leak_focus_E_max",
-        "resonance_E_mean",
-        "resonance_E_max",
-    ]
+    # 規則需要的摘要欄位（和轉換 FE、runtime 共用，定義在 shared_feature_utils）
+    rule_baseline_feature_names = list(SUMMARY_BASELINE_COLUMNS)
     
     # 模型與規則需要的 baseline 欄位取聯集
     baseline_apply_feature_names = list(dict.fromkeys(
@@ -1301,6 +1296,11 @@ def build_disturbance_inference_feature_csv(
         "z_resonance_E_mean",
         "rel_resonance_E_max",
         "z_resonance_E_max",
+        
+        # ratio veto：比正常時高幾倍（log），干擾推論的候選規則用 rel_ 版本
+        "log_offbandmax_to_leak_focusmax_E_ratio",
+        "rel_log_offbandmax_to_leak_focusmax_E_ratio",
+        "z_log_offbandmax_to_leak_focusmax_E_ratio",
     ]
     
     missing_rule_cols = [c for c in dict.fromkeys(extra_veto_cols) if c not in df.columns]
@@ -1375,6 +1375,7 @@ def build_disturbance_inference_feature_csv(
         "offband_to_leak_focus_E_ratio", "offbandmax_to_leak_focusmax_E_ratio",
         "offband_to_resonance_E_ratio", "offbandmax_to_resonancemax_E_ratio",
         "z_offband_E_mean","z_offband_E_max",
+        "rel_log_offbandmax_to_leak_focusmax_E_ratio",    # ratio veto 用（相對 baseline）
     ]
     
     # 檢查 Rule CSV 所需欄位是否完整。
