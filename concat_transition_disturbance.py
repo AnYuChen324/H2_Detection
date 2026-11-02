@@ -5,12 +5,13 @@
 '''
 整體流程：
 
-1. 讀入切分後的 transition dev 與 disturbance dev 模型版特徵表
+1. 讀入切分後的 transition train 與 disturbance train 模型版特徵表（變數名和輸出檔名 _dev 是沿用舊名，內容是 train 份）
 2. 讀取 feature_config_micro.json 內的 selected_feature_names
 3. 檢查兩份 dev 資料是否都包含模型訓練必要欄位：
    - record_id
    - label
    - selected_feature_names
+   - session_id
 4. 只保留模型訓練需要的欄位後做合併
 5. 額外保留一份含 metadata 的合併版本，供分析與除錯使用
 6. 輸出：
@@ -27,7 +28,7 @@
 
 from pathlib import Path
 import pandas as pd
-import json  # 記得在檔案最上面加這行 import
+import json  
 
 # 兩支切分程式的 train 份（模型訓練用）；dev / holdout 留給推論選規則和評估，不能拿來訓練
 transition_dev_csv = Path("/Users/paul/Desktop/Final/transition_feature_engineering/transition_30ml_test/transition_features_train.csv")
@@ -78,8 +79,8 @@ df_disturbance_dev["label"] = 0
 if "record_id" not in df_disturbance_dev.columns and "session_id" in df_disturbance_dev.columns:
     df_disturbance_dev["record_id"] = df_disturbance_dev["session_id"]
 
-# 模型訓練必要欄位
-train_cols = ["record_id", "label"] + selected_features
+# session_id：訓練程式內部切 validation / CV 的分組單位（和 split 程式一致，同一個 session 的段不能分到兩邊）
+train_cols = ["record_id", "session_id", "label"] + selected_features
 
 # 檢查欄位
 for name, df_ in {
@@ -89,6 +90,9 @@ for name, df_ in {
     missing = [c for c in train_cols if c not in df_.columns]
     if missing:
         raise ValueError(f"{name} 缺少必要欄位: {missing}")
+    
+    if df_["session_id"].isna().any():
+        raise ValueError(f"{name} 的 session_id 有空值，無法依 session 分組")
 
 # 給訓練用：只留訓練欄位
 df_transition_train = df_transition_dev[train_cols].copy()
