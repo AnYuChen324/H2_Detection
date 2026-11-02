@@ -7,8 +7,8 @@
 不重新訓練模型，不重新找頻帶 / 特徵；rel_ / z_ / offband 欄位由干擾特徵工程產生，這裡只檢查存在。
 
 在完整流程中的位置：
-  1. 干擾推論  mode="select"   ← 本程式：dev 上比較 272 條規則，每種基礎規則挑一個代表 → 16 份候選
-  2. 轉換推論  選規則（dev）    ：16 個候選的洩漏偵測率，和干擾誤報放同一張表 → 你選定一條
+  1. 干擾推論  mode="select"   ← 本程式：dev 上比較所有候選規則（數量依 ALARM_THRESHOLD_GRID × DURATION_GRID 與 veto 組合而定），每個 base_rule（含門檻）挑 1 個代表 → 候選檔
+  2. 轉換推論  選規則（dev）    ：比較各候選的洩漏偵測率，和干擾誤報放同一張表 → 你選定一條
   3. 干擾推論  mode="evaluate" ← 本程式：holdout 上只量選定的那一條，寫出正式 postprocess_config.json
   4. 轉換推論  正式評估（holdout）→ 產生正式 runtime_feature_schema.json
 
@@ -17,7 +17,7 @@
   - disturbance_rule_features_eval.csv（切分程式輸出，有 split 欄：dev / holdout；沒有 split 欄會報錯）
 
 主要輸出（模型資料夾）：
-  - postprocess_config_candidate_top{名次}_{規則名}.json：16 份候選（select、evaluate 都會重寫）
+    - postprocess_config_candidate_top{名次}_{規則名}.json：每種基礎規則一份候選（目前 78 份，依網格而定；select、evaluate 都會重寫）
   - postprocess_config.json：只有 evaluate 且 write_postprocess_final=True 才寫，附 holdout_evaluation
   - runtime_feature_schema_candidate.json
 主要輸出（inference_runs/<run_name>_<時間>/）：
@@ -49,7 +49,45 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from model_manager_two_sensor_final import ModelManager
-from alarm_rule_utils_v2 import apply_alarm_method_by_record, split_continuous_segments
+from alarm_rule_utils_v2 import (
+    apply_alarm_method_by_record, split_continuous_segments,
+    simulate_periodic_capture, apply_batch_warmup, BatchConfirmer,
+)
+
+
+# 現場取樣方式：API 每 interval_sec 擷取 capture_sec（"continuous" 時下面參數不使用）
+SAMPLING = {
+    "mode": "periodic",
+    "capture_sec": 2.4,
+    "warmup_sec": 0.4,
+    "interval_sec": 5.0,
+    "confirm_m": 2,
+    "confirm_n": 3,
+    "offsets_sec": [0.0, 1.0, 2.0, 3.0, 4.0],
+}
+
+
+# ============================================================
+# 候選規則網格（選規則時才用；現場 API 只跑選定的那一條）
+# ============================================================
+# 告警門檻：涵蓋模型機率可能落在的範圍，由 dev 資料挑（XGB 的輸出不是校正過的機率，尺度會隨訓練資料組成、sample_weight 改變，不能只放 0.7 以上）
+ALARM_THRESHOLD_GRID = (0.30, 0.40, 0.50, 0.60, 0.70, 0.80)
+
+# 最短持續時間（原本 0.20～1.00 每 0.05 一格共 17 個；相鄰幾格結果常相同，放粗減少規則數）
+DURATION_GRID = (0.20, 0.30, 0.40, 0.50, 0.60, 0.80, 1.00)
+
+# hysteresis 的關閉門檻 = 開啟門檻 − 這個值
+HYSTERESIS_GAP = 0.20
+
+# z_offband veto：offband 能量比正常高幾個標準差（mean 門檻, max 門檻）
+ZVETO_LEVELS = {"lo": (2.0, 2.5), "mid": (2.5, 3.0), "hi": (3.0, 4.0)}
+
+# ratio veto：offband / 洩漏頻帶的能量比，比「這個現場的正常比值」高幾倍才 veto
+#   欄位 = log(比值) − baseline 正常時的 log(比值) 平均，所以門檻是 log(倍數)
+#   相對 baseline：現場重建 baseline 後自動適應，不會因為現場低頻噪音大而一直 veto
+#   候選範圍看診斷（正常窗 p99 以上、干擾窗中位數以下），倍數由 dev 資料挑
+RATIO_VETO_COL = "rel_log_offbandmax_to_leak_focusmax_E_ratio"
+RATIO_VETO_FOLDS = (1.5, 2.0, 3.0, 5.0)
 
 
 #                                                ************************************************************
@@ -265,6 +303,49 @@ def check_feature_alignment(df, feature_names):
 
     print("✅ 特徵齊全，且沒有 NaN / inf")
     print("=" * 80 + "\n")
+    
+ 
+# ============================================================
+# 週期模式的干擾成績
+# ============================================================
+def score_rule_periodic_disturbance(df_pred, cfg, window_threshold, window_sec, sampling):
+    '''
+    週期模式下一條規則的干擾成績（對多個 offset 取平均）。
+    df_pred 必須先做過 attribute_disturbance_windows：干擾歸屬（during / tail）要在連續資料上判斷，
+    否則干擾結束在批尾時，tail 窗會被切到另一批、算不到這次干擾。
+    '''
+    rows = []
+    for off in sampling["offsets_sec"]:
+        df_b = simulate_periodic_capture(df_pred, sampling["capture_sec"], sampling["interval_sec"], off, window_sec)
+        df_rule = apply_batch_warmup(apply_alarm_method_by_record(df_b, cfg, window_threshold), sampling["warmup_sec"])
+
+        # 批層級：每批有沒有報警、是不是和干擾重疊
+        batch = df_rule.groupby(["source_record_id", "batch_index"]).agg(
+            alarm=("detected_rule", "max"),
+            has_dist=("fa_bucket", lambda s: s.isin(["during", "tail"]).any()),
+        ).reset_index()
+
+        # 確認層級：依時間逐批套 M/N，統計確認時是否和干擾有關
+        n_confirm_dist = n_confirm_clean = 0
+        for _, rec in batch.sort_values("batch_index").groupby("source_record_id"):
+            conf = BatchConfirmer(sampling["confirm_m"], sampling["confirm_n"])
+            prev = False
+            for r in rec.itertuples():
+                now = conf.update(r.alarm)
+                if now and not prev:                          # 亮紅燈的那一批
+                    n_confirm_dist += int(r.has_dist)
+                    n_confirm_clean += int(not r.has_dist)
+                prev = now
+
+        rows.append({
+            **summarize_disturbance_rule(df_rule),                         # 窗層級（只含擷取到的窗）
+            "batch_fa_dist": batch.loc[batch["has_dist"], "alarm"].mean(),  # 擷取到干擾的批中，有報警的比例
+            "batch_fa_clean": batch.loc[~batch["has_dist"], "alarm"].mean(),
+            "confirmed_alarms_dist": n_confirm_dist,                        # 經 M/N 確認後真的亮紅燈的次數
+            "confirmed_alarms_clean": n_confirm_clean,
+        })
+    out = pd.DataFrame(rows)
+    return out.mean(numeric_only=True).to_dict()
 
 
 #                                                ************************************************************
@@ -301,7 +382,7 @@ def attribute_disturbance_windows(df, tail_sec=DISTURBANCE_TAIL_SEC):
         raise ValueError("資料沒有 eval_class 欄位，無法做干擾誤報歸屬")
 
     # 歸屬只跟資料（eval_class、時間）有關，跟規則無關：已經算過、而且 tail 秒數相同，就直接沿用
-    # （compare_disturbance_alarm_methods 會先算一次，之後 272 條規則都不用重算）
+    # （compare_disturbance_alarm_methods 會先算一次，之後所有候選規則都不用重算）
     if "fa_tail_sec" in df.columns and np.allclose(df["fa_tail_sec"].to_numpy(dtype=float), tail_sec):
         return df
     
@@ -796,18 +877,23 @@ def rule_min_alarm_latency_sec(cfg, window_threshold, window_sec, hop_sec, n_win
 # ============================================================
 # 建立所有候選規則
 # ============================================================
-def build_candidate_rule_configs(df_pred):
+def build_candidate_rule_configs(df_pred, thresholds=ALARM_THRESHOLD_GRID):
     """
-    候選規則 =「基礎規則」×「min_leak_duration_sec 秒數」
-    每條展開後的規則都帶 base_rule 欄位，記錄它是從哪條基礎規則展開的，
-    後面每種基礎規則才能各挑一個代表給轉換推論。
-    """
-    duration_candidates = [round(x, 2) for x in np.arange(0.20, 1.05, 0.05)]
+    候選規則 =「基礎規則」×「min_leak_duration_sec」
+    基礎規則依 thresholds 展開：每個門檻是一個獨立的 base_rule。
+    干擾這一面只負責挑出每個 base_rule 的代表；門檻高低要到轉換 dev 用偵測率決定
+    （只看干擾誤報的話，永遠會選最高的門檻）。
 
+    veto 規則每個門檻都有一組（主規則 consecutive k4），只差 veto 條件：
+      - zveto   ：z_offband_E_mean / max 比正常高幾個標準差
+      - ratioveto：offband / 洩漏頻帶能量比，比正常時高幾倍（RATIO_VETO_COL）
+    veto 會不會把真正的洩漏也擋掉，要到轉換推論用洩漏資料才看得出來，這裡只負責提出候選。
+    two_stage 不放進候選：要等 Stage 1 那段警報結束才知道要不要重判，即時系統做不到。
+    """
     def expand_duration_grid(base_rules):
         expanded = []
         for base in base_rules:
-            for d in duration_candidates:
+            for d in DURATION_GRID:
                 cfg = copy.deepcopy(base)                 # 深複製：veto_rules 等內層 list/dict 也各自獨立
                 cfg["base_rule"] = base["name"]           # 從哪條基礎規則展開
                 cfg["name"] = f'{base["name"]}_d{d:.2f}'  # 展開後的完整名稱
@@ -815,73 +901,47 @@ def build_candidate_rule_configs(df_pred):
                 expanded.append(cfg)
         return expanded
 
-    # --- 基礎規則：由寬鬆到嚴格都要有，否則排名永遠只會選到最嚴格的 ---
-    base_rules = [
-        # 寬鬆組（門檻 0.70）
-        {"name": "threshold_s3_t0.70", "method": "threshold",
-         "alarm_threshold": 0.70, "smooth_window": 3},
-        {"name": "consecutive_s3_t0.70_k2", "method": "consecutive",
-         "alarm_threshold": 0.70, "smooth_window": 3, "consecutive": 2},
-        {"name": "consecutive_s3_t0.70_k3", "method": "consecutive",
-         "alarm_threshold": 0.70, "smooth_window": 3, "consecutive": 3},
-        {"name": "n_of_m_s3_t0.70_3of5", "method": "n_of_m",
-         "alarm_threshold": 0.70, "smooth_window": 3, "n_hits": 3, "m_window": 5},
-        {"name": "hysteresis_s3_hi0.70_lo0.50", "method": "hysteresis",
-         "smooth_window": 3, "high_threshold": 0.70, "low_threshold": 0.50},
-
-        # 嚴格組（門檻 0.80 / 0.85）
-        {"name": "consecutive_s3_t0.80_k3", "method": "consecutive",
-         "alarm_threshold": 0.80, "smooth_window": 3, "consecutive": 3},
-        {"name": "consecutive_s3_t0.85_k3", "method": "consecutive",
-         "alarm_threshold": 0.85, "smooth_window": 3, "consecutive": 3},
-        {"name": "consecutive_s3_t0.80_k4", "method": "consecutive",
-         "alarm_threshold": 0.80, "smooth_window": 3, "consecutive": 4},
-        {"name": "n_of_m_s3_t0.80_4of6", "method": "n_of_m",
-         "alarm_threshold": 0.80, "smooth_window": 3, "n_hits": 4, "m_window": 6},
-        {"name": "hysteresis_s3_hi0.80_lo0.60", "method": "hysteresis",
-         "smooth_window": 3, "high_threshold": 0.80, "low_threshold": 0.60},
-    ]
-    # two_stage 不放進候選：它要等 Stage 1 那段警報「結束」才知道要不要用 Stage 2 重判，
-    # 即時系統做不到（等於偷看未來）。alarm_rule_utils 也已不支援，設定檔寫 two_stage 會直接報錯。
+    # --- 基礎規則：每個門檻都配每種方法，方法之間才能公平比較 ---
+    base_rules = []
+    for t in thresholds:
+        lo = round(max(0.05, t - HYSTERESIS_GAP), 2)
+        base_rules += [
+            {"name": f"threshold_s3_t{t:.2f}", "method": "threshold",
+             "alarm_threshold": t, "smooth_window": 3},
+            *[{"name": f"consecutive_s3_t{t:.2f}_k{k}", "method": "consecutive",
+               "alarm_threshold": t, "smooth_window": 3, "consecutive": k} for k in (2, 3, 4)],
+            {"name": f"n_of_m_s3_t{t:.2f}_3of5", "method": "n_of_m",
+             "alarm_threshold": t, "smooth_window": 3, "n_hits": 3, "m_window": 5},
+            {"name": f"hysteresis_s3_hi{t:.2f}_lo{lo:.2f}", "method": "hysteresis",
+             "smooth_window": 3, "high_threshold": t, "low_threshold": lo},
+        ]
     configs = expand_duration_grid(base_rules)
 
-    # --- veto 規則：主規則都是 consecutive_s3_t0.80_k4，只差 veto 條件 ---
-    # 只保留「已經相對固定 normal baseline 標準化」的欄位（z 值、比值），
-    # 不再用 offband_E_mean 這種原始能量的絕對門檻（1e-4…），因為它的大小隨增益、距離、感測器而變，
-    # 寫死的數字在新資料上沒有意義。
-    # veto 會不會把真正的洩漏也擋掉，要到轉換推論用洩漏資料才看得出來，這裡只負責提出候選。
-    veto_main = {"method": "consecutive", "alarm_threshold": 0.80,
-                 "smooth_window": 3, "consecutive": 4, "use_veto": True}
-
-    if {"z_offband_E_mean", "z_offband_E_max"}.issubset(df_pred.columns):
-        zveto_levels = {"lo": (2.0, 2.5), "mid": (2.5, 3.0), "hi": (3.0, 4.0)}
-        zveto_rules = [
-            {**veto_main,
-             "name": f"consecutive_s3_t0.80_k4_zveto_{level}",
-             "veto_rules": [
-                 {"col": "z_offband_E_mean", "op": "ge", "threshold": thr_mean},
-                 {"col": "z_offband_E_max", "op": "ge", "threshold": thr_max},
-             ]}
-            for level, (thr_mean, thr_max) in zveto_levels.items()
-        ]
-        configs.extend(expand_duration_grid(zveto_rules))
-    else:
+    # --- veto 規則：每個門檻各一組 ---
+    has_z = {"z_offband_E_mean", "z_offband_E_max"}.issubset(df_pred.columns)
+    has_ratio = RATIO_VETO_COL in df_pred.columns
+    if not has_z:
         print("⚠️ 缺少 z_offband_E_mean / z_offband_E_max，跳過 zveto 規則")
+    if not has_ratio:
+        print(f"⚠️ 缺少 {RATIO_VETO_COL}，跳過 ratio veto 規則")
 
-    ratio_col = "offbandmax_to_leak_focusmax_E_ratio"
-    if ratio_col in df_pred.columns:
-        ratio_levels = {"lo": 1.5, "mid": 2.0, "hi": 3.0}
-        ratio_rules = [
-            {**veto_main,
-             "name": f"consecutive_s3_t0.80_k4_maxratio_veto_{level}",
-             "veto_rules": [{"col": ratio_col, "op": "ge", "threshold": thr}]}
-            for level, thr in ratio_levels.items()
-        ]
-        configs.extend(expand_duration_grid(ratio_rules))
-    else:
-        print(f"⚠️ 缺少 {ratio_col}，跳過 ratio veto 規則")
+    veto_rules = []
+    for t in thresholds:
+        main = {"method": "consecutive", "alarm_threshold": t,
+                "smooth_window": 3, "consecutive": 4, "use_veto": True}
+        prefix = f"consecutive_s3_t{t:.2f}_k4"
+        if has_z:
+            for level, (thr_mean, thr_max) in ZVETO_LEVELS.items():
+                veto_rules.append({**main, "name": f"{prefix}_zveto_{level}", "veto_rules": [
+                    {"col": "z_offband_E_mean", "op": "ge", "threshold": thr_mean},
+                    {"col": "z_offband_E_max", "op": "ge", "threshold": thr_max}]})
+        if has_ratio:
+            for fold in RATIO_VETO_FOLDS:
+                veto_rules.append({**main, "name": f"{prefix}_ratioveto_x{fold:g}",
+                                   "veto_rules": [{"col": RATIO_VETO_COL, "op": "ge",
+                                                   "threshold": float(np.log(fold))}]})
+    configs.extend(expand_duration_grid(veto_rules))
 
-    # 名稱不能重複（後面用名稱找規則）
     names = [c["name"] for c in configs]
     if len(names) != len(set(names)):
         raise ValueError("候選規則名稱有重複")
@@ -896,6 +956,7 @@ def compare_disturbance_alarm_methods(
     window_threshold,           # 模型的 window 門檻（告警引擎的介面需要；規則門檻寫在各規則裡）
     output_dir=None,            # 有給就輸出總比較表
     min_testable_ratio=0.5,     # 干擾窗中，至少要有這個比例落在「夠長、規則有機會報警」的片段，誤報率才算數
+    sampling=SAMPLING
 ):
     """
     把每條候選規則套到同一份 pred_proba 上，整理成一張比較表。
@@ -936,9 +997,12 @@ def compare_disturbance_alarm_methods(
 
     summary_rows = []
     for cfg in configs:
-        df_rule = apply_alarm_method_by_record(df_pred, cfg, window_threshold)
-
+        
         latency = rule_min_alarm_latency_sec(cfg, window_threshold, window_sec, hop_sec)
+        if sampling["mode"] == "periodic" and latency > sampling["capture_sec"] - 1e-9:
+            continue          # 這條規則在一批之內永遠報不出來
+
+        df_rule = apply_alarm_method_by_record(df_pred, cfg, window_threshold)
         testable_ratio = float((dist_span >= latency - 1e-9).mean())
 
         row = {
@@ -974,6 +1038,10 @@ def compare_disturbance_alarm_methods(
 
         row.update(summarize_disturbance_rule(df_rule))                   # 各類誤報率（含 fa_<干擾類型>）
 
+        if sampling["mode"] == "periodic":
+            row.update({f"periodic_{k}": v for k, v in
+                        score_rule_periodic_disturbance(df_pred, cfg, window_threshold, window_sec, sampling).items()})
+
         # 參考值：把空檔當成不存在，計數和平滑延續過去（假設干擾在空檔期間也持續）
         # 特徵還是各檔各自算的，所以不會有接縫假訊號；通常比「切開」版偏高、偏保守
         # 只當參考，不放進排序；資料本身連續時，兩者會一樣
@@ -986,6 +1054,9 @@ def compare_disturbance_alarm_methods(
         summary_rows.append(row)
 
     summary_df = pd.DataFrame(summary_rows)
+    
+    if summary_df.empty:
+        raise ValueError("沒有任何候選規則：週期模式下所有規則都超過 capture_sec，請加長 capture_sec 或縮短 DURATION")
      
     # 干擾誤報歸屬的前提：干擾觸發的警報最晚在干擾結束後 DISTURBANCE_TAIL_SEC 秒內出現。
     # 規則本身最快就要超過這個秒數才會報的話，它被干擾觸發的警報可能落在 tail 之外、被算成乾淨段誤報
@@ -993,21 +1064,27 @@ def compare_disturbance_alarm_methods(
     if too_slow:
         print(f"⚠️ {len(too_slow)} 條規則最快報警時間超過 DISTURBANCE_TAIL_SEC = {DISTURBANCE_TAIL_SEC} 秒，"
               f"干擾誤報可能被低估（請加長 DISTURBANCE_TAIL_SEC）：{too_slow[:5]}")
-        
-    # 排序：測得出來的在前 → 干擾誤報低 → 乾淨正常誤報低 → 反應快
-    sort_cols, ascending = ["fa_testable"], [False]
-    for col in ["disturbance_negative_false_alarm_rate", "clean_normal_false_alarm_rate", "overall_false_alarm_rate"]:
-        if col in summary_df.columns:
-            sort_cols.append(col)
-            ascending.append(True)
-    sort_cols.append("min_alarm_latency_sec")
-    ascending.append(True)
+    
+    if sampling["mode"] == "periodic":
+        # 週期模式：先看「確認後亮紅燈」次數，再看批層級誤報，最後反應快
+        sort_cols = ["periodic_confirmed_alarms_dist", "periodic_batch_fa_dist",
+                     "periodic_batch_fa_clean", "min_alarm_latency_sec"]
+        ascending = [True, True, True, True]
+    else:
+        sort_cols, ascending = ["fa_testable"], [False]
+        for col in ["disturbance_negative_false_alarm_rate", "clean_normal_false_alarm_rate", "overall_false_alarm_rate"]:
+            if col in summary_df.columns:
+                sort_cols.append(col)
+                ascending.append(True)
+        sort_cols.append("min_alarm_latency_sec")
+        ascending.append(True)
     summary_df = summary_df.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
 
-    n_untestable = int((~summary_df["fa_testable"]).sum())
-    if n_untestable:
-        print(f"⚠️ {n_untestable} 條規則在這份干擾資料上測不出來（片段太短，規則來不及報警），"
-              f"誤報率 0 不代表擋得住干擾，請參考 bridged_* 欄位")
+    if sampling["mode"] != "periodic":
+        n_untestable = int((~summary_df["fa_testable"]).sum())
+        if n_untestable:
+            print(f"⚠️ {n_untestable} 條規則在這份干擾資料上測不出來（片段太短，規則來不及報警），"
+                  f"誤報率 0 不代表擋得住干擾，請參考 bridged_* 欄位")
 
     if output_dir is not None:
         summary_df.to_csv(Path(output_dir) / "disturbance_alarm_method_comparison.csv",
@@ -1030,6 +1107,7 @@ def save_postprocess_configs(
     source="disturbance_dev_rule_selection",       # 記錄規則結果來自哪個流程：干擾規則在 dev 上選出來的（轉換推論會檢查這個值）
     write_final=False,                             # 是否真的寫出正式規則:預設 False,代表預設不會寫出正式版 postprocess_config.json
     max_disturbance_fa=0.01,                       # 干擾誤報率的上限，例如 1%
+    sampling=None,
 ):
     '''
     把干擾規則比較表整理成候選設定檔，交給轉換推論挑選。
@@ -1077,12 +1155,14 @@ def save_postprocess_configs(
     
     # fa_testable=True：資料夠長，直接使用實測誤報率
     # fa_testable=False：資料片段太短，無法直接量測長時間規則的誤報率，因此使用橋接估計值 bridged_*
-    df["effective_fa"] = np.where(
-        df["fa_testable"],      
-        df[fa_col], 
-        df[bridged_col])
-    # 記錄有效誤報率是直接測得，還是橋接估計，讓後續結果可追溯。
-    df["effective_fa_source"] = np.where(df["fa_testable"], "measured", "bridged")
+    if sampling and sampling["mode"] == "periodic":
+        # 週期模式：擷取到干擾的批中，有報警的比例
+        df["effective_fa"] = df["periodic_batch_fa_dist"]
+        df["effective_fa_source"] = "periodic"
+    else:
+        df["effective_fa"] = np.where(df["fa_testable"], df[fa_col], df[bridged_col])
+        # 記錄有效誤報率是直接測得，還是橋接估計，讓後續結果可追溯。
+        df["effective_fa_source"] = np.where(df["fa_testable"], "measured", "bridged")
     # 標記是否符合干擾誤報率上限
     df["meets_fa_limit"] = df["effective_fa"] <= max_disturbance_fa
 
@@ -1171,8 +1251,12 @@ def save_postprocess_configs(
             "disturbance_n_events": selected_row.get("disturbance_n_events"),
             "disturbance_event_hit_rate": selected_row.get("disturbance_event_hit_rate"),
         }
+        
         for c in fa_type_cols:                       # 每種干擾類型各自的誤報率
             settings[c] = selected_row.get(c)
+        for c in selected_row:                       # 週期模式的成績（periodic_*）一起帶給轉換推論
+            if str(c).startswith("periodic_"):
+                settings[c] = selected_row.get(c)
 
         # 確認單一 veto 至少有：要看哪一欄, 用什麼門檻。 → 半套設定，擋下來
         has_single_veto = settings["veto_column"] is not None and settings["veto_threshold"] is not None
@@ -1199,6 +1283,7 @@ def save_postprocess_configs(
             "candidate_rank": rank,                              # 候選排名
             "baseline_rule_name": settings["name"],              # 規則名稱
             "baseline_rule_settings": _json_safe(settings),      # 完整規則參數與驗證結果
+            "sampling": sampling,
         }
         safe_name = re.sub(r"[^\w\-.]", "_", str(settings["name"]))
         path = model_folder / f"postprocess_config_candidate_top{rank:02d}_{safe_name}.json"
@@ -1237,6 +1322,7 @@ def save_postprocess_configs(
             "baseline_rule_settings": _json_safe(settings),
             # 驗證進度：干擾 holdout 量完是 pending，轉換 holdout 量完才改成 final_verified
             "validation_status": "pending_transition_holdout",
+            "sampling": sampling,
         }
         final_path = model_folder / "postprocess_config.json"
         with open(final_path, "w", encoding="utf-8") as f:
@@ -1283,6 +1369,7 @@ def save_runtime_feature_schema(
         "offbandmax_to_resonancemax_E_ratio",
         "z_offband_E_mean",
         "z_offband_E_max",
+        RATIO_VETO_COL,          # ratio veto 用（相對 baseline 的 log 比值）
     ]
 
     # 收集 veto 規則額外用到的欄位
@@ -1531,7 +1618,8 @@ def evaluate_single_rule(df_pred,                     # 已經完成 XGBoost 推
                          cfg,                         # 已選定的告警規則設定，例如連續幾個 window 超標才報警、是否啟用 veto 等
                          window_threshold,            # 模型把機率轉為初步 leak / non-leak 判定的門檻。
                          max_disturbance_fa=None,     # 可接受的干擾誤報上限，例如 0.01 代表 1%。
-                         min_testable_ratio=0.5):     # 至少有 50% 的干擾片段夠長，能真正測到這條規則的告警延遲，才把一般誤報率視為可信。
+                         min_testable_ratio=0.5,      # 至少有 50% 的干擾片段夠長，能真正測到這條規則的告警延遲，才把一般誤報率視為可信。
+                         sampling=None):
     """
     在 holdout 上只量「已經定案的那一條規則」，不跑其他規則，也不排名，
     避免看了 holdout 的成績又回頭換規則。
@@ -1594,6 +1682,12 @@ def evaluate_single_rule(df_pred,                     # 已經完成 XGBoost 推
     # 記錄 effective_fa 的來源
     metrics["effective_fa_source"] = "measured" if metrics["fa_testable"] else "bridged"
     
+    if sampling and sampling["mode"] == "periodic":
+        p = score_rule_periodic_disturbance(df_pred, cfg, window_threshold, window_sec, sampling)
+        metrics.update({f"periodic_{k}": v for k, v in p.items()})
+        metrics["effective_fa"] = metrics["periodic_batch_fa_dist"]     # 和 dev 選規則同一個定義
+        metrics["effective_fa_source"] = "periodic"
+    
     # Holdout 的驗收結果
     if max_disturbance_fa is not None:
         metrics["max_disturbance_fa"] = float(max_disturbance_fa)
@@ -1623,7 +1717,7 @@ def run_disturbance_feature_inference(
     mode="select"（選規則）
       1. 載入模型、推論 pred_proba
       2. 資料分成 dev / holdout，只用 dev
-      3. 在 dev 上比較 272 條規則，每種基礎規則挑一個代表，輸出 16 份候選給轉換推論
+      3. 在 dev 上比較所有候選規則，每個 base_rule 挑一個代表，輸出候選檔給轉換推論
       4. 不寫正式版，不看 holdout
 
     mode="evaluate"（評估定案規則）
@@ -1676,7 +1770,7 @@ def run_disturbance_feature_inference(
     required_rule_feature_cols = [
         "z_offband_E_mean",
         "z_offband_E_max",
-        "offbandmax_to_leak_focusmax_E_ratio",
+        RATIO_VETO_COL,          # 相對 baseline 的 log 比值（ratio veto 用）
     ]
         
     missing_rule_feature_cols = [
@@ -1725,6 +1819,18 @@ def run_disturbance_feature_inference(
     df_dev, df_hold, split_table = split_dev_holdout_for_rules(df_pred)
     split_table.to_csv(output_dir / "rule_split_assignment.csv", index=False, encoding="utf-8-sig")
 
+    # 診斷（只看 dev）：候選門檻、候選倍數有沒有落在合理範圍
+    if "eval_class" in df_dev.columns:
+        print("\n模型機率分位數（dev，對照 ALARM_THRESHOLD_GRID）：")
+        print(df_dev.groupby("eval_class")["pred_proba"]
+              .quantile([0.5, 0.9, 0.99]).unstack().round(3).to_string())
+        print("候選告警門檻：", ALARM_THRESHOLD_GRID)
+        if RATIO_VETO_COL in df_dev.columns:
+            print("\nveto 比值：比正常高幾倍（dev，對照 RATIO_VETO_FOLDS）：")
+            print(np.exp(df_dev.groupby("eval_class")[RATIO_VETO_COL]
+                         .quantile([0.5, 0.9, 0.99]).unstack()).round(2).to_string())
+            print("候選倍數：", RATIO_VETO_FOLDS)
+
     # 模型原始門檻的誤報率（還沒套規則）：select 只看 dev，evaluate 才看 holdout
     # （選規則時不偷看 holdout，連模型原始成績也不看）
     raw_df, raw_tag = (df_dev, "dev") if mode == "select" else (df_hold, "holdout")
@@ -1748,14 +1854,13 @@ def run_disturbance_feature_inference(
     )
 
     print("\n候選規則排名（dev）:")
-    print(summary_df[[
-        "name", "min_leak_duration_sec", "min_alarm_latency_sec", "fa_testable",
-        "disturbance_negative_false_alarm_rate", "bridged_disturbance_negative_false_alarm_rate",
-        "clean_normal_false_alarm_rate", "veto_rate",
-    ]].head(20).to_string(index=False))
+    show = ["name", "min_leak_duration_sec", "min_alarm_latency_sec",
+        "periodic_confirmed_alarms_dist", "periodic_batch_fa_dist", "periodic_batch_fa_clean",
+        "disturbance_negative_false_alarm_rate", "clean_normal_false_alarm_rate", "veto_rate"]
+    print(summary_df[[c for c in show if c in summary_df.columns]].head(20).to_string(index=False))
 
-    if mode == "evaluate" and selected_rule_name not in config_by_name:
-        raise ValueError(f"selected_rule_name 不存在: {selected_rule_name}")
+    if mode == "evaluate" and selected_rule_name not in set(summary_df["name"]):
+        raise ValueError(f"selected_rule_name 不在這次的比較表裡（不存在，或週期模式下批內來不及報而被跳過）: {selected_rule_name}")
 
     # ---  Step 8：輸出候選（evaluate 模式且 write_postprocess_final=True 才寫正式版）  ---
     candidate_postprocesses, final_postprocess = save_postprocess_configs(
@@ -1766,6 +1871,7 @@ def run_disturbance_feature_inference(
         source="disturbance_dev_rule_selection",
         write_final=(mode == "evaluate" and write_postprocess_final),
         max_disturbance_fa=max_disturbance_fa,
+        sampling=SAMPLING
     )
 
     # 分析表用哪條規則、哪份資料：
@@ -1781,7 +1887,7 @@ def run_disturbance_feature_inference(
         analysis_tag = "holdout"
 
     baseline_df, rule_metrics = evaluate_single_rule(analysis_df, config_by_name[rule_name], window_threshold,
-                                                     max_disturbance_fa=max_disturbance_fa)
+                                                     max_disturbance_fa=max_disturbance_fa, sampling=SAMPLING)
     rule_row = _json_safe(summary_df.loc[summary_df["name"] == rule_name].iloc[0].to_dict())
     print(f"\n分析表使用：{rule_name}（{analysis_tag}）")
     print(json.dumps(rule_metrics, indent=2, ensure_ascii=False))
@@ -1834,6 +1940,7 @@ def run_disturbance_feature_inference(
         "run_name": run_name,
         "feature_csv": str(feature_csv),
         "mode": mode,
+        "sampling": SAMPLING,
 
         "n_rows": int(len(df_pred)),
         "n_rows_dev": int(len(df_dev)),
@@ -1855,6 +1962,10 @@ def run_disturbance_feature_inference(
         "feature_names": list(feature_names),
         "window_threshold": float(window_threshold),
         "file_threshold": file_threshold,
+        
+        "alarm_threshold_grid": list(ALARM_THRESHOLD_GRID),
+        "duration_grid": list(DURATION_GRID),
+        "ratio_veto_folds": list(RATIO_VETO_FOLDS),
     }
     with open(output_dir / "run_info.json", "w", encoding="utf-8") as f:
         json.dump(_json_safe(run_info), f, indent=2, ensure_ascii=False)
@@ -1890,7 +2001,7 @@ if __name__ == "__main__":
         "disturbance_rule_features_eval.csv"
     )
     
-    # 第 1 步：選規則（只用 dev），輸出 16 份候選給轉換推論
+    # 第 1 步：選規則（只用 dev），每個 base_rule 輸出一份候選給轉換推論
     run_disturbance_feature_inference(
         feature_csv=FEATURE_CSV,
         metadata_json=MODEL_METADATA_JSON,
