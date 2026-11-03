@@ -394,8 +394,8 @@ FORCE_BAND_DISCOVERY = False
 # 實驗室 baseline 是 candidate → False；現場正式部署時改 True
 REQUIRE_FINAL_BASELINE = False
 
-# baseline 與 Step2 資料重複時：False 只警告（目前實驗室資料共用）；現場資料到位後改 True 直接停止
-STRICT_BASELINE_ISOLATION = False
+# baseline 與 Step2 資料重複時：True 直接停止（11/03 起 baseline 用獨立的正常 session）；舊資料流程測試才改 False
+STRICT_BASELINE_ISOLATION = True
 
 N_JOBS = 6              # 特徵計算的平行數（記憶體不足時調小）
 RUN_SOFT_QC = False     # Soft QC 報表只輸出 CSV 給人看，不影響任何篩選；需要檢查資料時再打開
@@ -410,6 +410,9 @@ RUN_PERMUTATION_TEST = False
 # ============================================================
 # 保留給最終模型推論的日期：Step2 完全不讀（選頻帶、選特徵也算訓練的一部分）
 RESERVED_TEST_DATES = []            # 例如 ["20261023"]；舊資料流程測試留空
+
+# 日期與標籤完全綁定（沒有任何一天同時有正常和洩漏）時：False 直接停止；舊資料流程測試才改 True
+ALLOW_DATE_LABEL_CONFOUND = False
 
 # 內容完全相同的重複檔案："error" 直接停止（新資料）；"drop_conflicts" 排除矛盾的副本（舊資料流程測試）
 DUPLICATE_POLICY = "drop_conflicts"
@@ -3029,11 +3032,19 @@ def select_model_features(
             "combined_score": [combined[f] for f in survivors],             # 最終排序依據
         }).sort_values("combined_score", ascending=False).reset_index(drop=True)
         
-        # 模型重要性 ≤ 0 的特徵（打亂它 AUC 不會掉）不進模型；但至少保留 MIN_FINAL_FEATURES 個（依 combined_score）
-        keep = final_df[final_df["model_importance"] > 0]
-        if len(keep) < MIN_FINAL_FEATURES:
-            keep = final_df.head(MIN_FINAL_FEATURES)
+        # 模型重要性 > 0：打亂它 AUC 會掉 → 保留
+        # 模型重要性 = 0：打亂它 AUC 不變（模型已飽和、或資訊被其他特徵涵蓋，不代表沒用）
+        #                → 只在不足 MIN_FINAL_FEATURES 時，依 combined_score 補
+        # 模型重要性 < 0：打亂它 AUC 反而變好 → 視為雜訊，一律不補
+        tol = 1e-12
+        positive = final_df[final_df["model_importance"] > tol]
+        zero = final_df[final_df["model_importance"].abs() <= tol]
+        n_fill = min(max(0, MIN_FINAL_FEATURES - len(positive)), len(zero))
+        filled = zero.head(n_fill)                 # final_df 已依 combined_score 排序，head 就是分數最高的
+        keep = final_df[final_df["feature"].isin(set(positive["feature"]) | set(filled["feature"]))].copy()
+        keep["filled_by_min_features"] = keep["feature"].isin(filled["feature"])   # 報表看得出哪些是補進來的
         n_drop = len(final_df) - len(keep)
+        n_negative = int((final_df["model_importance"] < -tol).sum())
         final_df = keep.reset_index(drop=True)
 
     # 印出每一步剩下多少特徵，方便確認哪一步刪掉最多
@@ -3042,7 +3053,8 @@ def select_model_features(
               f"前 {len(candidates)} 名 → 去共線性後 {len(survivors)} 個"
               + ("（含跨天穩定性）" if use_date else "（無跨天資料，未納入跨天穩定性）"))
         # 模型重要性篩選後，至少保留幾個特徵（依綜合排序補足）
-        print(f"   模型重要性 ≤ 0 剔除 {n_drop} 個，最終 {len(final_df)} 個（至少保留 {MIN_FINAL_FEATURES}）")
+        print(f"   模型重要性 > 0：{len(final_df) - n_fill} 個；= 0 補入 {n_fill} 個（至少 {MIN_FINAL_FEATURES}）；"
+              f"剔除 {n_drop} 個（其中 < 0 的 {n_negative} 個一律不補）；最終 {len(final_df)} 個")
 
     return {
         "selected_features": final_df["feature"].tolist(),   # 最終特徵（依重要性排序）
@@ -3928,9 +3940,12 @@ if __name__ == "__main__":
     
     n_mixed_days = int(((date_label_df[0] > 0) & (date_label_df[1] > 0)).sum())
     if n_mixed_days == 0:
+        msg = ("沒有任何一天同時錄了正常和洩漏：日期與標籤完全綁在一起。\n"
+               "   選出的頻帶與特徵可能是在分辨「哪天錄的」，結果只能當流程測試，不能定案。")
+        if not ALLOW_DATE_LABEL_CONFOUND:
+            raise ValueError(msg + "\n   舊資料流程測試要繼續跑，請把 ALLOW_DATE_LABEL_CONFOUND 改成 True")
         print("\n" + "!" * 60)
-        print("⚠️ 沒有任何一天同時錄了正常和洩漏：日期與標籤完全綁在一起。")
-        print("   選出的頻帶與特徵可能是在分辨「哪天錄的」，結果只能當流程測試，不能定案。")
+        print("⚠️ " + msg)
         print("!" * 60)
     elif n_mixed_days < len(date_label_df):
         print(f"ℹ️ {len(date_label_df)} 天中有 {n_mixed_days} 天同時有正常和洩漏，其餘只有一種類別")
@@ -4721,6 +4736,16 @@ if __name__ == "__main__":
     print("\n=== Holdout 評估 ===")
     print(classification_report(y_holdout, y_holdout_pred, digits=3, zero_division=0))
     print(f"Holdout AUC = {holdout_auc:.4f}")
+    
+    
+    # file-level（每支檔案取平均機率）：同一支檔的 7 個窗高度相關，不是 7 個獨立樣本 → 以這個為主要指標
+    file_eval = (pd.DataFrame({"record_id": df_holdout["record_id"].to_numpy(),
+                               "y": np.asarray(y_holdout), "p": y_holdout_prob})
+                 .groupby("record_id").agg(y=("y", "first"), p=("p", "mean")))
+    file_auc = _safe_auc(file_eval["y"], file_eval["p"])
+    print("\n=== Holdout 評估（file-level，每支檔案平均機率；主要指標）===")
+    print(classification_report(file_eval["y"], (file_eval["p"] >= 0.5).astype(int), digits=3, zero_division=0))
+    print(f"Holdout file-level AUC = {file_auc:.4f}（{len(file_eval)} 支檔）")
 
     # 依距離、洩漏量、場次分組，各輸出一張表：每組的誤報率、偵測率、F1、AUC
     # 會自動標出誤報最高、偵測最低的組別（現場最可能出問題的條件）
