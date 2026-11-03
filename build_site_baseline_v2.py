@@ -709,6 +709,13 @@ def parse_args() -> argparse.Namespace:
         "--cache-dir", type=Path, default=Path("/Users/paul/Desktop/runtime_outputs/site_baseline_cache"),
         help="特徵快取資料夾",
     )
+    
+    paths.add_argument(
+        "--approved-resonance-json", type=Path,
+        default=Path("/Users/paul/Desktop/Final/resonance/approved_resonance_bands.json"),
+        help="共振程式核准的正式共振頻帶；final 模式會檢查 band_config_step2.json 的共振頻帶和它一致",
+    )
+    
     paths.add_argument(
         "--n-jobs", type=int, default=6,
         help="平行處理數",
@@ -851,6 +858,25 @@ def main():
     expected_band_status = ("discovery" if baseline_mode == "discovery" else "final")
     # 載入並驗證頻帶
     band_config = load_band_config(band_config_path, expected_status=expected_band_status,require_offband=(baseline_mode == "final"))
+    
+    
+    # 共振頻帶一致性：band_config_step2.json 的共振頻帶必須和共振程式核准的正式版相同
+    # （手動複製時容易漏同步；Step2b 也會檢查，但在這裡先擋，免得算完 baseline 才發現）
+    if baseline_mode == "final":
+        approved_path = Path(args.approved_resonance_json)
+        if not approved_path.exists():
+            raise FileNotFoundError(f"找不到正式共振頻帶：{approved_path}")
+        approved_payload = json.loads(approved_path.read_text(encoding="utf-8"))
+        if approved_payload.get("schema_name") != "approved_resonance_bands":
+            raise ValueError(f"{approved_path.name} 不是 approved_resonance_bands 格式（是否讀到提案檔？）")
+        approved = {(b["name"], float(b["f_low"]), float(b["f_high"])) for b in approved_payload["resonance_bands"]}
+        in_config = {(b["name"], float(b["f_low"]), float(b["f_high"])) for b in band_config.resonance_bands}
+        if approved != in_config:
+            raise ValueError(
+                "band_config_step2.json 的共振頻帶和正式版不一致：\n"
+                f"  只在正式版：{sorted(approved - in_config)}\n"
+                f"  只在 band_config：{sorted(in_config - approved)}")
+        print(f"✅ 共振頻帶與正式版一致：{sorted(n for n, _, _ in approved)}")
     
     # 顯示本次實際載入的頻帶數量，方便核對設定
     print("\n=== Band config 驗證完成 ===")
