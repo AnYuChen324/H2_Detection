@@ -69,8 +69,8 @@
   因此每個 manifest 片段必須對應獨立的 TDMS 檔。
 
 - 取樣率假設：
-  頻率軸使用 --fs 指定的取樣率計算，目前不會自動從 TDMS metadata
-  驗證真實取樣率。--fs 設定錯誤會使所有峰值頻率一起偏移。
+  頻率軸使用 --fs 指定的取樣率計算，並會讀取 TDMS 的 sample_rate（或 wf_increment）
+  和 --fs 比對，不一致或沒有記錄時直接停止。
 
 - 平均方式：
   搜尋資料與驗證資料各自只保留 Tap、Background 都有的位置。
@@ -102,6 +102,7 @@ from typing import Iterable, Literal
 import os
 import tempfile
 import json
+import hashlib
 from scipy.ndimage import median_filter
 from datetime import datetime
 from functools import lru_cache
@@ -285,7 +286,7 @@ def parse_args() -> argparse.Namespace:
     # ---------- 片段標記 ----------
     slicing = parser.add_argument_group("片段標記（敲擊 / 背景）")
     slicing.add_argument(
-        "--background-guard-sec", type=float, default=0.5,
+        "--background-guard-sec", type=float, default=1.0,
         help="背景片段要避開敲擊事件前後多少秒，避免沾到敲擊尾波",
     )
     slicing.add_argument(
@@ -721,8 +722,14 @@ def build_slice_records(
 
     # 只保留敲擊事件：和資料夾判斷使用同一套名稱規則（tap / tab_pipe / tappipe）
     types = events["disturbance_type"].astype(str).map(normalize_name)
-    tap_events = events[types.apply(
-        lambda s: any(k in s for k in ("tap",) + TAP_FOLDER_KEYWORDS))].copy()
+    
+    # 一個 session 只應該有一種干擾：同時有敲擊和其他類型，代表標註有誤 → 直接停止
+    is_tap = types.apply(lambda s: any(k in s for k in ("tap",) + TAP_FOLDER_KEYWORDS))
+    if is_tap.any() and not is_tap.all():
+        found = events["disturbance_type"].astype(str).value_counts().to_dict()
+        raise SystemExit(f"{session_dir.parent.name}/{session_dir.name}：同一個 session 標了多種干擾類型 {found}，"
+                         "一個 session 只能有一種干擾，請先修正標註")
+    tap_events = events[is_tap].copy()
 
     # 如果這個 session 裡根本沒有敲擊事件，那就不用分析了，直接回傳空清單
     if tap_events.empty:
@@ -809,13 +816,25 @@ def build_slice_records(
 # 讀取 TDMS 指定聲道，把整段波形抓出來
 # ============================================================
 def read_tdms_channel(filepath: Path,                      # filepath：TDMS 檔案路徑
-                      channel_name: str) -> np.ndarray:    # channel_name：你想讀的聲道名稱，例如 ai1
-    """從 TDMS 檔讀出指定聲道。用 open 串流讀取，只載入需要的那個聲道。"""
+                      channel_name: str,                   # channel_name：你想讀的聲道名稱，例如 ai1
+                      fs_expected: float) -> np.ndarray:   # fs_expected：--fs 設定的取樣率
+    """從 TDMS 檔讀出指定聲道，並確認 TDMS 記錄的取樣率和 --fs 一致（fs 錯了，整條頻率軸會一起偏）。"""
     target = channel_name.lower()
     with TdmsFile.open(filepath) as tdms:
         for group in tdms.groups():
             for channel in group.channels():
                 if channel.name.lower() == target:
+                    # v21／v22 存 sample_rate；merge 過的檔存 wf_increment；兩個都沒有就無法確認
+                    props = channel.properties
+                    if props.get("sample_rate"):
+                        actual_fs = float(props["sample_rate"])
+                    elif props.get("wf_increment"):
+                        actual_fs = 1.0 / float(props["wf_increment"])
+                    else:
+                        raise SystemExit(f"{filepath.name} 沒有記錄取樣率（sample_rate / wf_increment），無法確認取樣率")
+                    # 用 SystemExit 而不是 ValueError：file_psd 會把 ValueError 當成「找不到聲道」吞掉
+                    if not np.isclose(actual_fs, fs_expected, rtol=1e-6):
+                        raise SystemExit(f"{filepath.name} 取樣率不一致：TDMS={actual_fs:.1f} Hz，--fs={fs_expected:.1f} Hz")
                     return np.asarray(channel[:], dtype=np.float64)
         available = [c.name for g in tdms.groups() for c in g.channels()]
     raise ValueError(f"在 {filepath} 找不到聲道 {channel_name}，可用聲道有: {available}")
@@ -851,7 +870,7 @@ def file_psd(tdms_path, channel_name, fs, nperseg, expected_len: int | None = No
     if key not in _PSD_CACHE:
         try:
             # 讀出訊號，用 Welch 方法算頻譜
-            signal = read_tdms_channel(tdms_path, channel_name)
+            signal = read_tdms_channel(tdms_path, channel_name, fs)
             # 訊號硬性檢查
             reason = signal_qc(signal, nperseg)
         except ValueError:                       # 找不到這個聲道
@@ -1376,6 +1395,36 @@ def check_one_file_per_slice(records: list[SliceRecord], name: str) -> None:
         )
 
 
+
+# ============================================================
+# 搜尋與驗證資料不能重疊（session、檔名、內容複本）
+# ============================================================
+def check_search_validation_disjoint(search_records, val_records) -> None:
+    """批次名稱不重疊還不夠：同一個 session 或同一支 TDMS 被複製到兩個批次資料夾，驗證會偏樂觀。"""
+    def fingerprint(p: Path):
+        # 檔案大小 + 前 1 MB 的雜湊：抓「改了檔名的複本」，不用讀完整個檔
+        h = hashlib.sha1()
+        with open(p, "rb") as fh:
+            h.update(fh.read(1 << 20))
+        return (p.stat().st_size, h.hexdigest())
+
+    problems = []
+    same_sess = {r.session_id for r in search_records} & {r.session_id for r in val_records}
+    if same_sess:
+        problems.append(f"session_id 重複：{sorted(same_sess)[:5]}")
+    same_name = {r.tdms_path.name for r in search_records} & {r.tdms_path.name for r in val_records}
+    if same_name:
+        problems.append(f"TDMS 檔名重複：{sorted(same_name)[:5]}")
+    search_fp = {fingerprint(p): p for p in {r.tdms_path for r in search_records}}
+    same_content = [(search_fp[k].name, p.name) for p in sorted({r.tdms_path for r in val_records})
+                    if (k := fingerprint(p)) in search_fp]
+    if same_content:
+        problems.append(f"內容相同的檔（搜尋, 驗證）：{same_content[:5]}")
+    if problems:
+        raise SystemExit("搜尋與驗證資料有重疊，跨天驗證會偏樂觀：\n  " + "\n  ".join(problems))
+    print("✅ 搜尋與驗證資料沒有重疊（session、檔名、內容）")
+
+
 # ============================================================
 # 把任意範圍對齊到 10 kHz 搜尋網格（核准時使用）
 # ============================================================
@@ -1536,6 +1585,43 @@ def report_band_drift(drift: dict) -> bool:
 
 
 # ============================================================
+# 背景殘響檢查：第一個敲擊前的背景 vs 敲擊之間／之後的背景
+# ============================================================
+def check_background_residual(tap_records, bg_records, res, channel, fs, nperseg, warn_db=3.0):
+    """
+    在驗證通過的峰頻率上，比較兩種背景的能量（dB = 中後段 − 前段），並扣掉全頻段的中位數差（整體漂移）。
+    - 差距 < warn_db：背景沒有被敲擊殘響污染，維持現在的做法
+    - 差距 >= warn_db：中後段背景在共振頻率特別高，可能有殘響 → 考慮加大 --background-guard-sec
+    殘響只會讓共振變弱、不會產生假峰，所以這裡只提示、不停止。
+    """
+    eps = 1e-20
+    # 每個 session 第一個敲擊片段的開始時間
+    first_tap = {}
+    for r in tap_records:
+        first_tap[r.session_dir] = min(first_tap.get(r.session_dir, np.inf), r.t_start)
+    pre = [r for r in bg_records if r.t_end <= first_tap.get(r.session_dir, np.inf)]
+    mid = [r for r in bg_records if r.t_end > first_tap.get(r.session_dir, np.inf)]
+    # 兩組只用共同位置，避免位置組成不同造成差異
+    common = {r.position for r in pre} & {r.position for r in mid}
+    pre = [r for r in pre if r.position in common]
+    mid = [r for r in mid if r.position in common]
+    peaks = res.loc[res["validation_0713_pass"], "frequency_Hz"].to_numpy(float)
+    if not pre or not mid or peaks.size == 0:
+        print(f"  {channel}：背景殘響檢查略過（前段 {len(pre)} 片、中後段 {len(mid)} 片、驗證通過峰 {peaks.size} 個）")
+        return
+    f, p_pre = averaged_psd_balanced(pre, channel, fs, nperseg)
+    _, p_mid = averaged_psd_balanced(mid, channel, fs, nperseg)
+    d_db = 10 * np.log10((p_mid + eps) / (p_pre + eps))
+    drift = float(np.median(d_db))                       # 全頻段的整體差（漂移），不算殘響
+    idx = np.clip(np.searchsorted(f, peaks), 0, len(f) - 1)
+    excess = d_db[idx] - drift
+    print(f"  {channel}：背景殘響檢查（前段 {len(pre)} 片、中後段 {len(mid)} 片；整體差 {drift:+.2f} dB）")
+    for f0, e in sorted(zip(f[idx], excess)):
+        mark = "⚠️ 可能有殘響" if e >= warn_db else "✅"
+        print(f"      {f0 / 1000:7.2f} kHz：中後段比前段多 {e:+.2f} dB  {mark}")
+
+
+# ============================================================
 # 找峰（扣除寬頻趨勢）＋ 0713 跨天驗證，整體分析與分位置分析共用
 # ============================================================
 def find_validated_peaks(tap_records, bg_records, val_tap_records, val_bg_records, args):
@@ -1611,20 +1697,27 @@ def find_validated_peaks(tap_records, bg_records, val_tap_records, val_bg_record
         if len(val_freqs) != len(freqs) or not np.allclose(val_freqs, freqs):
             raise SystemExit("搜尋與驗證的頻率軸不一致，請確認兩邊的 fs 與 nperseg 相同")
 
-        # 在 ±validation_tol_hz 範圍內，找出局部凸起最明顯的頻率點；
-        # 兩個驗證數值都從「同一個點」讀取，避免局部凸起和原始 dB 差分別取自不同頻率
+        # 驗證也必須是「真正的局部峰」：用和搜尋階段相同的 find_peaks 條件（高度、prominence、間距）。
+        # 只在 ±validation_tol_hz 內取最大值的話，斜坡或平台的邊緣也可能被當成通過。
+        val_peak_idx, _ = find_peaks(val_local_db,
+                                     height=args.local_peak_db,
+                                     distance=5,
+                                     prominence=args.peak_prominence)
+        val_peak_freqs = val_freqs[val_peak_idx]
+
+        # 兩個驗證數值都從「同一個峰」讀取
         for row_idx, f0 in result_df["frequency_Hz"].items():
-            lo = np.searchsorted(val_freqs, f0 - args.validation_tol_hz, side="left")
-            hi = np.searchsorted(val_freqs, f0 + args.validation_tol_hz, side="right")
-            if lo >= hi:
-                continue
-            j = lo + int(np.argmax(val_local_db[lo:hi]))
+            near = val_peak_idx[np.abs(val_peak_freqs - f0) <= args.validation_tol_hz]
+            if near.size == 0:
+                continue       # ±tol 內沒有真正的峰 → 驗證不通過（欄位維持 NaN / False）
+            j = int(near[np.argmax(val_local_db[near])])
             v_diff, v_local = float(val_diff_db[j]), float(val_local_db[j])
             result_df.at[row_idx, "validation_0713_freq_Hz"] = float(val_freqs[j])   # 0713 對應到的頻率
             result_df.at[row_idx, "validation_0713_tap_vs_bg_dB"] = v_diff
             result_df.at[row_idx, "validation_0713_local_dB"] = v_local
             result_df.at[row_idx, "validation_0713_pass"] = (
                 v_local >= args.local_peak_db and v_diff >= args.peak_db_threshold)
+            
         result_df["validation_0713_pass"] = result_df["validation_0713_pass"].astype(bool)
 
         validation_spectrum_df = pd.DataFrame({
@@ -2037,6 +2130,10 @@ def main() -> None:
     
     # 安全檢查：確認每個 TDMS 檔只被一個片段使用
     check_one_file_per_slice(validation_records, "驗證批次")
+    
+    # 安全檢查：搜尋與驗證不能用到同一個 session、同一支檔，或內容相同的複本
+    check_search_validation_disjoint(all_records, validation_records)
+    
     val_tap_records = [r for r in validation_records if r.label == "tap"]
     val_bg_records = [r for r in validation_records if r.label == "background"]
     
@@ -2088,6 +2185,9 @@ def main() -> None:
         overall_by_channel[ch] = res
         overall_outputs[ch] = (res, spec, vspec)
         print(f"  {ch}: 候選峰 {len(res)}，驗證通過 {int(res['validation_0713_pass'].sum())}")
+        
+        # 背景殘響檢查：比較「第一個敲擊前的背景」和「敲擊之間／之後的背景」在驗證通過峰的能量
+        check_background_residual(tap_records, bg_records, res, ch, args.fs, args.nperseg)
 
     if all(vspec.empty for _, _, vspec in overall_outputs.values()):
         print("0713 驗證資料不足，這次先只輸出前三天的共振候選峰")
