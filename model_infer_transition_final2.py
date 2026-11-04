@@ -92,6 +92,7 @@ from model_infer_disturbance_final3 import (
     split_dev_holdout_for_rules,      # 依 split 欄分 dev / holdout（沒有 split 欄、session 跨兩邊都會報錯）
     estimate_window_timing,           # 從資料估計窗長、步長
     _json_safe,                       # numpy / NaN → JSON 可寫的型別（NaN 存成 null）
+    check_model_feature_contract,     # 模型 metadata 的 feature_contract 和目前設定檔比對（兩支推論共用）
 )
 
 
@@ -185,6 +186,7 @@ def load_model_and_predict(feature_csv, metadata_json, feature_config_json=None)
     models_dir, model_id, model_folder = resolve_model_location_from_metadata(metadata_json)
     manager = ModelManager(models_dir=str(models_dir))
     model_id, pkg = get_xgb_model(manager, model_id=model_id, metadata_json=metadata_json)
+    check_model_feature_contract(metadata_json)     # 模型訓練時的設定檔 = 目前磁碟上的設定檔（和干擾推論同一個檢查）
     model, scaler, feature_names, window_threshold, file_threshold, metadata, model_type = extract_inference_config(pkg)
 
     if feature_config_json is not None:
@@ -202,6 +204,16 @@ def load_model_and_predict(feature_csv, metadata_json, feature_config_json=None)
 
     df = pd.read_csv(feature_csv)
     check_feature_alignment(df, feature_names)
+    
+    # 偵測率以 record（v22 = 連續段）為單位；每個 session 最多只能有一段帶 onset，
+    # 這樣「段層級」的偵測率才等於「session 層級」（特徵工程已排除沒有切換事件的段、一個 session 只允許一次切換）
+    if "session_id" in df.columns and "onset_gt_sec" in df.columns:
+        has_onset = df.dropna(subset=["onset_gt_sec"])
+        n_onset_rec = has_onset.groupby("session_id")["record_id"].nunique()
+        multi = n_onset_rec[n_onset_rec > 1].index.tolist()
+        if multi:
+            raise ValueError(f"有 {len(multi)} 個 session 有不只一段帶 onset，段層級偵測率不等於 session 層級：{multi[:5]}")
+    
     X = df[feature_names].copy()
     if scaler is not None:
         X = scaler.transform(X)
@@ -818,7 +830,8 @@ def score_rule_on_transition(df_pred,
     leak = onset_df[onset_df["has_onset"]]
     normal = onset_df[~onset_df["has_onset"]]
     score = {
-        "n_leak_records": int(len(leak)),
+        "n_leak_records": int(len(leak)),                          # 週期模式 = record 數 × offset 數（評估次數）
+        "n_unique_leak_records": int(leak["record_id"].nunique()),  # 實際有幾條洩漏 record（v22 一個 session 一段，等於 session 數）
         "n_normal_records": int(len(normal)),
         "valid_detection_rate": leak["valid_detection"].mean() if len(leak) else np.nan,     # 洩漏 record 有抓到的比例
         "early_false_alarm_rate": leak["false_alarm"].mean() if len(leak) else np.nan,       # 洩漏 record 在 onset 前就亂報的比例
@@ -1125,7 +1138,12 @@ def run_periodic_onset_evaluation(df_rule_b, window_sec, onset_tolerance_sec, co
     rows = []
     for src, sub in df_rule_b.groupby("source_record_id"):
         onset_vals = pd.to_numeric(sub["onset_gt_sec"], errors="coerce").dropna() if "onset_gt_sec" in sub else pd.Series(dtype=float)
+        
+        # 同一條 record 只能有一個 onset（和連續模式 run_onset_evaluation 同一個檢查）：多個值代表標記有問題，不可默默取第一個
+        if onset_vals.nunique() > 1:
+            raise ValueError(f"record {src} 的 onset_gt_sec 不只一個值：{sorted(onset_vals.unique().tolist())[:5]}")
         onset = float(onset_vals.iloc[0]) if len(onset_vals) else np.nan
+
         conf = BatchConfirmer(confirm_m, confirm_n)
         t_confirm = np.nan
         for _, b in sub.sort_values("t_start").groupby("batch_index", sort=True):
