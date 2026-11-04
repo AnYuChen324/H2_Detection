@@ -23,6 +23,19 @@ import numpy as np                # 建立陣列與布林遮罩
 import pandas as pd               # 資料表、數值轉換、rolling mean
 
 
+
+# ============================================================
+# veto 欄位轉數值：原本就是空值 → 保留 NaN（不 veto）；原本有值卻轉不成數字 → 報錯
+# ============================================================
+def _to_numeric_strict(raw, col):
+    num = pd.to_numeric(raw, errors="coerce")
+    bad = num.isna() & raw.notna()
+    if bad.any():
+        examples = raw[bad].astype(str).unique().tolist()[:5]
+        raise ValueError(f"veto 欄位 {col} 有 {int(bad.sum())} 個值不是數字：{examples}（不可當成「不 veto」）")
+    return num
+
+
 # ============================================================
 # 負責解讀單條 veto 規則
 # ============================================================
@@ -41,7 +54,7 @@ def _apply_single_veto_rule(df,       # 包含特徵欄位的 DataFrame
         raise ValueError(f"veto rule 指定的欄位不存在: {col}")
 
     # 將欄位轉成數值
-    s = pd.to_numeric(df[col], errors="coerce")
+    s = _to_numeric_strict(df[col], col)
     if op == "ge":    # >= threshold
         return s >= thr
     if op == "gt":    # > threshold
@@ -81,8 +94,9 @@ def build_veto_mask_for_record(sub_df, cfg):
             thr = _cfg_value(cfg, "veto_threshold")
             if thr is None:
                 raise ValueError(f"veto_column={col} 是數值欄位，但規則沒有 veto_threshold")
-            masks.append((pd.to_numeric(raw, errors="coerce") >= float(thr)).fillna(False))
-    
+            num = _to_numeric_strict(raw, col)
+            masks.append((num >= float(thr)).fillna(False))
+            
     # 多條 veto_rules：逐條執行
     for rule in (cfg.get("veto_rules") or []):
         masks.append(_apply_single_veto_rule(sub_df, rule).fillna(False))
@@ -359,6 +373,23 @@ def apply_alarm_method_by_record(
     # 結果是用 index 寫回去的：index 有重複的話，會寫到別的列上，而且不會報錯
     if not df_pred.index.is_unique:
         raise ValueError("df_pred 的 index 有重複（可能是 concat 時沒加 ignore_index=True），請先 reset_index(drop=True)")
+        
+    # 輸入防呆：錯的輸入不可以被靜默吞掉（NaN 比較後是 False → 變成「沒有警報」）
+    for col in ("record_id", "t_start", "pred_proba"):
+        if col not in df_pred.columns:
+            raise ValueError(f"df_pred 缺少 {col} 欄位")
+    proba = pd.to_numeric(df_pred["pred_proba"], errors="coerce").to_numpy(dtype=float)
+    if len(proba) == 0:
+        raise ValueError("pred_proba 是空的")
+    if not np.isfinite(proba).all():
+        raise ValueError(f"pred_proba 有 {int((~np.isfinite(proba)).sum())} 個 NaN / Inf（或非數值）")
+    if ((proba < 0) | (proba > 1)).any():
+        raise ValueError("pred_proba 必須介於 0～1")
+    # 同一條 record 的窗時間不可重複；有 t_ref 時，窗中心必須在窗起點之後
+    if df_pred.duplicated(["record_id", "t_start"]).any():
+        raise ValueError("同一個 record_id 有重複的 t_start（同一窗出現兩次？）")
+    if "t_ref" in df_pred.columns and (df_pred["t_ref"] <= df_pred["t_start"]).any():
+        raise ValueError("有窗的 t_ref ≤ t_start（t_ref 應為窗中心）")
     
     # 先複製一份資料，並依照：record_id, t_start 排序。(因為 alarm rule 是沿著時間走的,如果時間順序亂掉，rolling / consecutive 就全錯)
     df_out = df_pred.copy().sort_values(["record_id", "t_start"]).copy()
@@ -462,6 +493,24 @@ def simulate_periodic_capture(df_pred,        # 模型對連續錄製資料進�
     前提：模型特徵沒有跨窗狀態（每窗去直流、沒有 CUSUM / temporal），結果才會等於 API。
     offset_sec 要是 hop 的整數倍，窗才會和 API 切出來的對齊。
     '''
+    # 參數防呆：任何一個不合理，切出來的批就和 API 不一樣（interval_sec = 0 還會除以零）
+    if not (capture_sec > 0 and interval_sec > 0 and window_sec > 0):
+        raise ValueError(f"capture_sec / interval_sec / window_sec 都必須 > 0：{capture_sec}, {interval_sec}, {window_sec}")
+    if capture_sec < window_sec:
+        raise ValueError(f"capture_sec={capture_sec} 比窗長 {window_sec} 還短，一批連一個窗都切不出來")
+    if interval_sec < capture_sec:
+        raise ValueError(f"interval_sec={interval_sec} 比 capture_sec={capture_sec} 短，兩批會重疊")
+    if offset_sec < 0:
+        raise ValueError(f"offset_sec={offset_sec} 不可小於 0")
+    # 時間點要落在窗格上：capture / interval / offset 都必須是步長（hop）的整數倍，窗才會和 API 切的對齊
+    diffs = df_pred.sort_values(["record_id", "t_start"]).groupby("record_id")["t_start"].diff().dropna()
+    if len(diffs):
+        hop_sec = float(diffs.median())
+        bad = {k: v for k, v in (("capture_sec", capture_sec), ("interval_sec", interval_sec), ("offset_sec", offset_sec))
+               if abs(v / hop_sec - round(v / hop_sec)) > 1e-6}
+        if bad:
+            raise ValueError(f"週期擷取的時間不是步長 {hop_sec:.3f} 秒的整數倍：{bad}")
+        
     # 先依原始 record_id 排序，再依每個視窗的開始時間排序
     df = df_pred.sort_values(["record_id", "t_start"])
     # 計算每個視窗相對於第一批擷取起點的時間。
@@ -491,7 +540,6 @@ def apply_batch_warmup(df_rule,      # 已經經過警報規則引擎處理的�
                        warmup_sec):  # 每批開始後，暫時不允許輸出警報的時間長度。
     """
     批內暖機處理。
-
     每批開始後 warmup_sec 秒內不輸出警報，但暖機期間的視窗仍參與前面的平滑與計數。
 
     同時保留暖機前的警報結果，方便後續分析：
@@ -523,8 +571,10 @@ def apply_batch_warmup(df_rule,      # 已經經過警報規則引擎處理的�
     # 判斷每個視窗是否位於暖機時間內。
     # 這裡使用視窗開始時間判斷，並不是要求整個視窗都位於暖機區間。
     in_warmup = (df_rule["t_start"] - start) < warmup_sec - 1e-9
+    df_rule["is_warmup"] = in_warmup.to_numpy()      # 和 warmup_sec = 0 時一樣都輸出這一欄
     # 將暖機期間的警報結果強制設為 0。
     df_rule.loc[in_warmup, ["detected_rule", "detected_rule_raw"]] = 0
+    
     return df_rule      # 回傳已套用暖機限制的逐窗警報結果。
 
 
