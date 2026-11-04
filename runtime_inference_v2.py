@@ -121,6 +121,7 @@ from shared_feature_utils import (
     validate_runtime_extractable_features,
     load_band_config,              # 和其他程式同一套頻帶驗證（final、要有 offband）
     apply_fixed_normal_baseline,   # 和離線同一套 baseline 計算（缺統計值直接報錯，不自己估）
+    load_fixed_normal_baseline,    # 和離線同一套 baseline 讀取驗證（schema / 指紋 / 特徵版本）
     BandConfig,                    # extract_base_feature_table 的型別註記會用到
     SUMMARY_BASELINE_COLUMNS
 )
@@ -202,7 +203,12 @@ def build_runtime_file_specs(tdms_paths):
                 "record_id": record_id,
             }
         )
-
+    # record_id 只取最後 4 層路徑，不同資料夾可能撞名；撞名會讓兩支檔的窗混在同一個 record，直接報錯
+    ids = [s["record_id"] for s in file_specs]
+    duplicated = sorted({i for i in ids if ids.count(i) > 1})
+    if duplicated:
+        raise ValueError(f"record_id 重複（最後 4 層路徑相同）：{duplicated[:5]}，請分開推論或調整資料夾結構")
+    
     return file_specs
 
 
@@ -359,6 +365,7 @@ def load_runtime_configs(
     postprocess_config_path=None,                 # 正式推論真正要讀的offband設定檔
     runtime_feature_schema_path=None,             # 這顆模型實際需要哪些模型欄位與規則欄位
     site_baseline_path=None,                      # 場域正常 baseline 設定檔
+    require_final_baseline=False,                 # 現場部署改 True：只接受 schema_status=final（實驗室 baseline 是 candidate）
     
 ):
     '''負責讀取所有設定檔、檢查版本一致性，最後整理成一個 runtime_cfg 字典給後面流程使用'''
@@ -392,7 +399,15 @@ def load_runtime_configs(
     feature_payload = load_feature_config(feature_config_path)
     postprocess_payload = load_postprocess_config(postprocess_config_path)
     runtime_feature_schema = load_runtime_feature_schema(runtime_feature_schema_path)
-    site_baseline_payload = load_site_baseline(site_baseline_path)                           # 包含正常狀態下各特徵的平均值與標準差
+    # baseline 用 shared 的正式 loader（schema_name / schema_status / feature_stats / band 與 extraction 指紋 / 特徵版本全部檢查）
+    site_baseline_payload = load_fixed_normal_baseline(                                    # 包含正常狀態下各特徵的平均值與標準差
+        site_baseline_path,
+        band_config_path=band_config_path,
+        feature_extraction_config_path=feature_extraction_config_path,
+        require_final=require_final_baseline,
+    )
+    if site_baseline_payload.get("schema_status") != "final":
+        print("⚠️ 使用的是 candidate site_baseline（實驗室）；現場部署要用 final 並設 require_final_baseline=True")                        
     
     # 把 band config 的 temporal band 名稱,同步給 shared_feature_utils 的 raw feature extractor。
     configure_temporal_band_names(band_config.temporal_band_names)
@@ -752,25 +767,25 @@ def build_runtime_features_from_base_table(base_df, runtime_cfg):
 
     plan = runtime_cfg["execution_plan"]
 
-    # 1. 模型需要的 rel_ / z_：照執行計畫套固定 site baseline（和 FE、streaming 同一套；缺統計值直接報錯，不自己估）
-    if plan["baseline_features"]:
-        df = apply_fixed_normal_baseline(df=df, feature_cols=list(plan["baseline_features"]),
-                                         baseline_payload=runtime_cfg["site_baseline_payload"])
+    # 處理順序和轉換 / 干擾特徵工程、runtime_streaming 完全相同：
+    #   1. 頻帶群組摘要 → 2. 固定 baseline（rel_ / z_）→ 3. CUSUM → 4. temporal
+    # 目前契約（週期模式每批 reset）：模型與規則只用單窗特徵，執行計畫的 CUSUM / temporal 清單必須是空的
+    if plan["cusum_input_features"] or plan["temporal_base_features"]:
+        raise ValueError(
+            "feature_execution_plan 有 CUSUM / temporal 特徵，和「模型與規則只用單窗特徵」的契約不一致："
+            f"cusum={plan['cusum_input_features'][:5]}, temporal={plan['temporal_base_features'][:5]}"
+        )
 
-    # 2. 跨窗 CUSUM / temporal：照執行計畫（目前 Step2 不讓跨窗特徵進模型，兩份清單都是空的）
-    if runtime_cfg["z_base_features"]:
-        df = add_cusum_features(df=df, input_feature_cols=list(runtime_cfg["z_base_features"]),
-                                k=runtime_cfg["cusum_k"], decay=runtime_cfg["cusum_decay"])
-    if plan["temporal_base_features"]:
-        df = add_common_temporal_features(df, list(plan["temporal_base_features"]))
-
-    # 3. 頻帶群組摘要 + 摘要的 rel_ / z_（規則用；清單和 FE、streaming 共用）
+    # 1. 頻帶群組摘要（規則用；清單和 FE、streaming 共用）
     summary_base_cols = []
     if runtime_cfg["include_offband_summary"]:
         df = build_offband_summary_features(df, runtime_cfg["band_config"])
         summary_base_cols = [c for c in SUMMARY_BASELINE_COLUMNS if c in df.columns]
-    if summary_base_cols:
-        df = apply_fixed_normal_baseline(df=df, feature_cols=summary_base_cols,
+
+    # 2. 模型需要的 rel_ / z_ ＋ 摘要的 rel_ / z_：一次套固定 site baseline（和 FE、streaming 同一套；缺統計值直接報錯，不自己估）
+    baseline_cols = list(dict.fromkeys(list(plan["baseline_features"]) + summary_base_cols))
+    if baseline_cols:
+        df = apply_fixed_normal_baseline(df=df, feature_cols=baseline_cols,
                                          baseline_payload=runtime_cfg["site_baseline_payload"])
 
     runtime_extra_cols = [
@@ -789,21 +804,21 @@ def build_runtime_features_from_base_table(base_df, runtime_cfg):
         "rel_resonance_E_max", "z_resonance_E_max",
     ]
     
-    # 保留每個視窗的識別資訊與時間資訊，讓後續知道這列特徵來自哪支檔案、哪個時間點
-    base_output_cols = ["filename", "record_id", "t_start", "t_ref"]
+    # 必要欄位（識別 / 時間 + 模型特徵 + 規則欄位）缺任何一欄直接報錯；filename 與摘要除錯欄位才允許不存在
+    required_output_cols = list(dict.fromkeys(
+        ["record_id", "t_start", "t_ref"]
+        + list(runtime_cfg["final_keep_features"])    # 模型正式特徵
+        + list(runtime_cfg["rule_feature_names"])     # 正式規則需要的欄位（來自 runtime_feature_schema，含 veto 欄位）
+    ))
+    missing_required = [c for c in required_output_cols if c not in df.columns]
+    if missing_required:
+        raise ValueError(f"runtime 特徵表缺少必要欄位：{missing_required[:20]}")
     
-    # 合併需要輸出的欄位
-    requested_output_cols = (
-        base_output_cols                          # 基本識別與時間欄位
-        + runtime_cfg["final_keep_features"]      # 模型正式特徵
-        + runtime_cfg["rule_feature_names"]       # 正式規則需要的欄位（來自 runtime_feature_schema，含 veto 欄位）
-        + runtime_extra_cols                      # 除錯用的額外摘要欄位
-    )
-    
-    # 去除重複欄位，同時保留第一次出現的順序
+    optional_output_cols = ["filename"] + runtime_extra_cols     # 除錯用，沒有也不影響判斷
     output_cols = list(dict.fromkeys(
-        c for c in requested_output_cols
-        if c in df.columns                        # 某些設定沒有產生某欄位時，不會直接報錯
+        [c for c in ["filename"] if c in df.columns]
+        + required_output_cols
+        + [c for c in optional_output_cols if c in df.columns]
     ))
     
     return df[output_cols].copy()
@@ -888,28 +903,34 @@ def run_model_inference(
             f"預期 {len(selected_feature_names)}，"
             f"實際 {X.shape[1]}"
         )
+        
+    
+    # 模型輸入不可有 NaN / Inf：XGBoost 會把 NaN 當「缺值」照樣算出機率，不會報錯
+    X_values = X.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
+    bad_cols = [c for c, ok in zip(selected_feature_names, np.isfinite(X_values).all(axis=0)) if not ok]
+    if bad_cols:
+        raise ValueError(f"模型輸入有 NaN / Inf：{bad_cols[:20]}")
 
     # 複製一份原表
     df_out = df_features.copy()
 
-    # ---  三層 fallback  ---
-    # 如果模型支援 predict_proba:優先用 predict_proba 取「洩漏類別（class 1）」的機率
-    if hasattr(model, "predict_proba"):
-        # 如果這個模型可以輸出機率，就直接取「第 1 類」的機率作為分數, 第 1 類就是你定義的 leak 類
-        y_score = model.predict_proba(X)[:, 1]
-    
-    # 如果模型沒有 predict_proba，但有 decision_function(有些模型不直接給機率，只給 decision score。例如某些 SVM 類模型)
-    elif hasattr(model, "decision_function"):
-        # 先拿到原始 decision score, 再用 sigmoid 轉成 0 到 1 之間的值
-        raw_score = model.decision_function(X)
-        y_score = 1.0 / (1.0 + np.exp(-raw_score))
-    
-    # 如果兩個都沒有，就退回用 predict, 就直接用預測類別當分數
-    else:
-        y_score = model.predict(X).astype(float)
+    # 正式模型只接受 predict_proba，並用 classes_ 找出洩漏類別（1）的那一欄，不假設一定是第 2 欄
+    # （原本的 decision_function / predict 後備做法拿掉：predict 的 0/1 當分數會讓平滑與門檻失去意義）
+    if not hasattr(model, "predict_proba"):
+        raise ValueError("正式模型必須支援 predict_proba")
+    classes = list(getattr(model, "classes_", []))
+    if 1 not in classes:
+        raise ValueError(f"模型 classes_ 沒有洩漏類別 1：{classes}")
+    y_score = model.predict_proba(X)[:, classes.index(1)]
+
+    # 分數必須是有效機率：NaN / Inf 或超出 0～1 直接報錯（不補 0，模型失效不能變成「正常」）
+    y_score = np.asarray(y_score, dtype=np.float64)
+    if (not np.isfinite(y_score).all()) or (y_score < 0).any() or (y_score > 1).any():
+        raise ValueError("模型分數有 NaN / Inf 或超出 0～1，不可輸出判斷")
 
     # 把分數寫回表格, 把模型分數存進你指定的欄位名。預設就是：leak_score
     df_out[score_col] = y_score
+    
     # 根據 threshold 轉成 0/1 預測
     df_out[pred_col] = (df_out[score_col] >= threshold).astype(int)
 
@@ -1111,6 +1132,71 @@ def load_model_bundle(metadata_json_path):
     }
 
 
+# ============================================================
+# 模型與 runtime 設定的一致性檢查（離線 runtime、API 都要呼叫）
+# ============================================================
+def check_model_bundle_matches_runtime_cfg(model_bundle, runtime_cfg):
+    """
+    確認載入的模型就是 runtime 設定檔對應的那一顆，任何一項不一致直接停止：
+    1. model_id：metadata.json = runtime_feature_schema.json（postprocess_config.json 有寫的話也要相同）
+    2. 特徵清單（含順序）：model metadata = runtime_feature_schema = feature_config.selected_feature_names
+    3. window_threshold：thresholds.json = postprocess_config
+    """
+    metadata = model_bundle.get("metadata") or {}
+    schema = runtime_cfg["runtime_feature_schema"]
+
+    metadata_model_id = metadata.get("model_id")
+    schema_model_id = schema.get("model_id")
+    postprocess_model_id = runtime_cfg["postprocess_payload"].get("model_id")
+    if not metadata_model_id:
+        raise ValueError("model metadata.json 缺少 model_id，無法確認模型版本")
+    if metadata_model_id != schema_model_id:
+        raise ValueError(f"模型 model_id={metadata_model_id} 和 runtime_feature_schema 的 {schema_model_id} 不一致")
+    if postprocess_model_id is not None and postprocess_model_id != metadata_model_id:
+        raise ValueError(f"模型 model_id={metadata_model_id} 和 postprocess_config 的 {postprocess_model_id} 不一致")
+
+    model_features = list(model_bundle["feature_names"])
+    schema_features = list(runtime_cfg["model_feature_names"])
+    config_features = list(runtime_cfg["selected_feature_names"])
+    if not (model_features == schema_features == config_features):
+        raise ValueError(
+            "模型 / runtime_feature_schema / feature_config 的特徵清單（含順序）不一致："
+            f"model={len(model_features)} 個、schema={len(schema_features)} 個、config={len(config_features)} 個；"
+            "請用同一版設定重新訓練，或恢復這顆模型訓練時的設定檔"
+        )
+
+    model_threshold = float(model_bundle["window_threshold"])
+    rule_threshold = float(runtime_cfg["window_threshold"])
+    if abs(model_threshold - rule_threshold) > 1e-12:
+        raise ValueError(
+            f"模型 window_threshold={model_threshold} 和 postprocess_config 的 {rule_threshold} 不一致："
+            "規則不是用這顆模型選的，請重跑干擾推論")
+
+
+# ============================================================
+# 窗連續性檢查：同一個 record 內不可缺窗
+# ============================================================
+def check_window_continuity(df, *, hop_sec, group_col="record_id", time_col="t_start", tol_ratio=0.01):
+    """
+    告警規則（consecutive / n_of_m / hysteresis）和事件整理都是照列順序算連續，
+    中間少一個窗的話，前後兩窗會被當成相鄰 → 連續計數、持續時間都會算錯。
+    所以同一個 record 內，相鄰兩窗的 t_start 差必須等於 hop_sec（容許 1% 誤差），否則直接停止。
+    """
+    hop_sec = float(hop_sec)
+    for record_id, sub in df.groupby(group_col, sort=False):
+        t = np.sort(pd.to_numeric(sub[time_col], errors="raise").to_numpy(dtype=float))
+        if len(t) < 2:
+            continue
+        gaps = np.diff(t)
+        bad = np.abs(gaps - hop_sec) > hop_sec * tol_ratio
+        if bad.any():
+            i = int(np.argmax(bad))
+            raise ValueError(
+                f"{record_id}：t_start={t[i]:.4f} → {t[i + 1]:.4f} 相差 {gaps[i]:.4f} 秒，"
+                f"不等於 hop_sec={hop_sec}（缺窗或重複窗），告警連續性會算錯"
+            )
+
+
 #                                                  ********************  main entry  ********************
 #                                                  ******************************************************
 # ============================================================
@@ -1127,6 +1213,7 @@ def run_runtime_pipeline(
     postprocess_config_path,       # 正式 offband 設定檔
     runtime_feature_schema_path,
     site_baseline_path=None,       # 場域正常 baseline 設定檔，可選；若提供則優先使用
+    require_final_baseline=False,  # 現場部署改 True：只接受 schema_status=final 的 site_baseline（實驗室 baseline 是 candidate）
     split_name="runtime_infer",    # 這批推論資料的名字
     n_jobs=2,                      # 平行處理數量
 ):
@@ -1208,6 +1295,7 @@ def run_runtime_pipeline(
         postprocess_config_path=postprocess_config_path,
         runtime_feature_schema_path=runtime_feature_schema_path,
         site_baseline_path=site_baseline_path,
+        require_final_baseline=require_final_baseline,
     )
 
     # ------------ 整理新進 TDMS ---------------
@@ -1253,20 +1341,16 @@ def run_runtime_pipeline(
     
     if missing_rule_cols:
         raise ValueError(f"正式 runtime 缺少規則欄位: {missing_rule_cols}")
+        
+    # 同一個 record 內的窗必須每 hop_sec 一個、中間沒有缺窗（告警規則的連續計數是照列順序算的）
+    check_window_continuity(df_features, hop_sec=runtime_cfg["hop_sec"])
 
     # ------------ 跑模型推論 ---------------
     # 載入模型：把剛剛的特徵表丟進模型, 會產生：leak_score, pred_label, 就會有每個 window 的模型預測結果了
     model_bundle = load_model_bundle(model_metadata_json)
     
-    # 從 model_bundle 取出模型自己記錄的 window_threshold（訓練時決定的最佳門檻），跟 runtime_cfg 取出的 window_threshold
-    model_threshold = float(model_bundle["window_threshold"])
-    rule_threshold = float(runtime_cfg["window_threshold"])
-    
-    # 一致性檢查：確認 threshold 是否一致(訓練時決定的最佳閾值 vs 規則搜尋時用的閾值)
-    if abs(model_threshold - rule_threshold) > 1e-12:
-        raise ValueError(
-            f"模型 window_threshold={model_threshold} 和 postprocess_config 的 {rule_threshold} 不一致："
-            "規則不是用這顆模型選的，請重跑干擾推論")
+    # 模型 / schema / feature config / postprocess 四方一致性（model_id、特徵清單與順序、window_threshold）
+    check_model_bundle_matches_runtime_cfg(model_bundle, runtime_cfg)
 
     # 1. 模型只負責產生每個 window 的機率：模型推論，對每個時間窗算出機率分數（score_col）跟二元判斷（pred_col）
     df_pred = run_model_inference(
@@ -1280,10 +1364,10 @@ def run_runtime_pipeline(
     # ------------ 正式規則 alarm stage ---------------
     df_rule_input = df_pred.copy()
 
-    # 把 runtime_cfg["score_col"] 指到的實際欄位內容,複製一份、轉數值、把轉不成數字的值用 0.0 補上，存進固定名稱 pred_proba
+    # 分數不可補 0：run_model_inference 已確認分數都在 0～1；這裡再轉一次只是固定成 pred_proba 欄位，轉不成數字直接報錯
     df_rule_input["pred_proba"] = pd.to_numeric(
         df_rule_input[runtime_cfg["score_col"]],
-        errors="coerce",).fillna(0.0)
+        errors="raise",)
     
     # 從 runtime_cfg 裡挑出你剛剛在 build_runtime_postprocess_settings 看過的那份回傳字典
     formal_rule_cfg = {
