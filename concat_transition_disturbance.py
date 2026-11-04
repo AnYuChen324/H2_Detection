@@ -58,11 +58,14 @@ df_disturbance_dev["source_dataset"] = "disturbance_train"
 
 
 # 防呆 1：只能用 train 份訓練（dev / holdout 是推論選規則和評估用的，模型不能看過）
+# 沒有 split 欄、有空值、或不是 train，一律停止
 for name, df_ in (("transition", df_transition_dev), ("disturbance", df_disturbance_dev)):
     if "split" not in df_.columns:
-        print(f"⚠️ {name} 沒有 split 欄，無法確認是不是 train 份（可能是舊版切分程式的輸出）")
-        continue
-    wrong = sorted(set(df_["split"].dropna().astype(str)) - {"train"})
+        raise ValueError(f"{name} 沒有 split 欄，無法確認是不是 train 份；請用目前的切分程式重新輸出")
+    n_missing = int(df_["split"].isna().sum())
+    if n_missing:
+        raise ValueError(f"{name} 的 split 欄有 {n_missing} 個空值，無法確認是不是 train 份")
+    wrong = sorted(set(df_["split"].astype(str)) - {"train"})
     if wrong:
         raise ValueError(f"{name} 訓練資料裡出現 split = {wrong}，只能用 train 份訓練，請確認輸入檔路徑")
 
@@ -72,7 +75,11 @@ if n_gray:
     print(f"transition 有 {n_gray} 窗 label 是空值（灰色地帶），不拿來訓練，已排除")
     df_transition_dev = df_transition_dev[df_transition_dev["label"].notna()].copy()
 
-# 干擾資料全部設成 non-leak
+# 干擾資料全部是 non-leak：先確認原本的 label 沒有非 0 的值（有的話代表讀錯檔），再統一設成 0
+if "label" in df_disturbance_dev.columns:
+    bad_label = df_disturbance_dev["label"].notna() & (df_disturbance_dev["label"] != 0)
+    if bad_label.any():
+        raise ValueError(f"disturbance 訓練資料有 {int(bad_label.sum())} 窗 label 不是 0，請確認輸入檔路徑")
 df_disturbance_dev["label"] = 0
 
 # 如果 disturbance 的 record_id 不完整，就用 session_id 補

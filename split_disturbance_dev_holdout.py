@@ -201,6 +201,24 @@ def main():
         if df["split"].isna().any():
             missing = sorted(df.loc[df["split"].isna(), "session_id"].unique().tolist())
             raise ValueError(f"有 session 在 model csv 裡找不到，無法分配：{missing[:10]}")
+            
+    
+    # 窗對齊：model ⊆ rule ⊆ full（每一窗都要在下一份裡找得到）
+    # 三份不是同一次特徵工程的輸出時，session 一樣但窗會對不上，後面規則評估的窗就和模型訓練的窗不一致
+    key_cols = [c for c in ("session_id", "record_id") if all(c in d.columns for d in (df_model, df_rule))]
+    def window_keys(d):
+        k = d[key_cols].astype(str)
+        return set(zip(*[k[c] for c in key_cols], d["t_start"].round(6)))
+    pairs = [("model", df_model, "rule", df_rule)]
+    if df_full is not None:
+        pairs.append(("rule", df_rule, "full", df_full))
+    for a_name, a_df, b_name, b_df in pairs:
+        only_a = window_keys(a_df) - window_keys(b_df)
+        if only_a:
+            raise ValueError(
+                f"{a_name} CSV 有 {len(only_a)} 個窗不在 {b_name} CSV 裡（可能不是同一次特徵工程的輸出），"
+                f"例如：{sorted(only_a)[:5]}"
+            )
     
     # 1. 模型訓練用：只有 train
     model_train_path = output_dir / "disturbance_features_train.csv"

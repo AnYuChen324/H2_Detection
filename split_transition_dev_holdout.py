@@ -231,6 +231,20 @@ def main():
         )
     if len(df_rule) != len(df):
         print(f"⚠️ model CSV 和 rule CSV 的 row 數不同：model={len(df)}, rule={len(df_rule)}")
+        
+    
+    # 窗對齊：model 版的每一窗都必須出現在 rule 版
+    # （model 版排除了灰區，所以是子集；兩份不是同一次特徵工程的輸出時，session 一樣但窗會對不上）
+    key_cols = list(dict.fromkeys([unit_col, "record_id"]))
+    def window_keys(d):
+        k = d[key_cols].astype(str)
+        return set(zip(*[k[c] for c in key_cols], d["t_start"].round(6)))
+    only_model = window_keys(df) - window_keys(df_rule)
+    if only_model:
+        raise ValueError(
+            f"model CSV 有 {len(only_model)} 個窗不在 rule CSV 裡（兩份可能不是同一次特徵工程的輸出），"
+            f"例如：{sorted(only_model)[:5]}"
+        )
 
     # 兩個版本都加上 split 欄，後面的程式一律看這一欄
     df["split"] = df[unit_col].map(split_map)
