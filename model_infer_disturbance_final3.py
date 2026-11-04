@@ -41,6 +41,7 @@ from datetime import datetime
 import json
 import re
 import copy
+import hashlib
 
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR
@@ -58,13 +59,72 @@ from alarm_rule_utils_v2 import (
 # 現場取樣方式：API 每 interval_sec 擷取 capture_sec（"continuous" 時下面參數不使用）
 SAMPLING = {
     "mode": "periodic",
-    "capture_sec": 2.4,
+    "capture_sec": 2.0,
     "warmup_sec": 0.4,
     "interval_sec": 5.0,
     "confirm_m": 2,
     "confirm_n": 3,
     "offsets_sec": [0.0, 1.0, 2.0, 3.0, 4.0],
 }
+
+
+# ============================================================
+# 週期擷取的時間點必須是步長的整數倍
+# ============================================================
+def check_sampling_alignment(sampling, hop_sec):
+    """capture_sec、interval_sec、offsets_sec 都要是 hop_sec 的整數倍：
+    不是的話，離線模擬切出的窗會和 API 實際切出的窗錯開半格，兩邊的規則結果對不上。"""
+    if not sampling or sampling.get("mode") != "periodic":
+        return
+    values = {"capture_sec": sampling["capture_sec"], "interval_sec": sampling["interval_sec"]}
+    values.update({f"offsets_sec[{i}]": o for i, o in enumerate(sampling["offsets_sec"])})
+    bad = {k: v for k, v in values.items() if abs(v / hop_sec - round(v / hop_sec)) > 1e-6}
+    if bad:
+        raise ValueError(f"SAMPLING 的時間不是步長 {hop_sec:.3f} 秒的整數倍：{bad}")
+
+
+# ============================================================
+# 模型版本 = 目前設定檔版本
+# ============================================================
+def check_model_feature_contract(metadata_json):
+    """
+    模型訓練時把 band_config / feature_extraction_config 的 SHA-256、baseline 指紋記在
+    metadata.json 的 signal_processing.feature_contract。這裡重新計算目前磁碟上的同一批檔案：
+    任何一項不一致 → 設定在模型訓練後被改過（或模型是舊流程訓練的），特徵 CSV 和模型不是同一版 → 停止。
+    """
+    meta = json.loads(Path(metadata_json).read_text(encoding="utf-8"))
+    contract = (meta.get("signal_processing") or {}).get("feature_contract")
+    if not contract:
+        raise ValueError("模型 metadata 沒有 signal_processing.feature_contract（舊流程的模型？），"
+                         "無法確認和目前特徵設定同一版；請用目前的流程重新訓練")
+
+    def sha256(p):
+        return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+
+    problems = []
+    for hash_key, path_key in (("band_config_sha256", "band_config_path"),
+                               ("feature_extraction_config_sha256", "feature_extraction_config_path")):
+        p = Path(contract[path_key])
+        if not p.exists():
+            problems.append(f"找不到 {p}")
+        elif sha256(p) != contract[hash_key]:
+            problems.append(f"{p.name} 在模型訓練後被改過")
+
+    bp = Path(contract["baseline_json_path"])
+    if not bp.exists():
+        problems.append(f"找不到 {bp}")
+    else:
+        baseline = json.loads(bp.read_text(encoding="utf-8"))
+        for key, contract_key in (("config_fingerprint", "baseline_config_fingerprint"),
+                                  ("schema_status", "baseline_schema_status"),
+                                  ("base_feature_version", "base_feature_version")):
+            if baseline.get(key) != contract.get(contract_key):
+                problems.append(f"{bp.name} 的 {key} = {baseline.get(key)}，模型訓練時是 {contract.get(contract_key)}")
+
+    if problems:
+        raise ValueError("模型和目前的特徵設定不是同一版：\n  - " + "\n  - ".join(problems))
+    print(f"✅ 模型與目前設定同一版：{contract['base_feature_version']}、"
+          f"baseline {contract['baseline_config_fingerprint']}（{contract['baseline_schema_status']}）")
 
 
 # ============================================================
@@ -479,9 +539,9 @@ def summarize_disturbance_rule(df_rule, tail_sec=DISTURBANCE_TAIL_SEC):
     }
 
     if "eval_class" in df_rule.columns:
-        unknown = set(df_rule["eval_class"].dropna().unique()) - KNOWN_EVAL_CLASSES
-        if unknown:
-            print(f"⚠️ eval_class 有未知的類別 {sorted(unknown)}：視為乾淨段")
+        unknown = set(df_rule["eval_class"].astype(str).unique()) - KNOWN_EVAL_CLASSES
+        if unknown or df_rule["eval_class"].isna().any():
+            raise ValueError(f"eval_class 有空值或未知的類別 {sorted(unknown)}：不可當成乾淨段（會低估誤報率）")
 
         att = attribute_disturbance_windows(df_rule, tail_sec)
         bucket = att["fa_bucket"]
@@ -977,6 +1037,7 @@ def compare_disturbance_alarm_methods(
     """
     configs = build_candidate_rule_configs(df_pred)
     window_sec, hop_sec = estimate_window_timing(df_pred)
+    check_sampling_alignment(sampling, hop_sec)        # 週期擷取的時間點要落在窗格上
     segment_span = compute_segment_span(df_pred)
 
     # 干擾誤報歸屬先算一次（跟規則無關），後面每條規則套完都直接沿用，不用重算
@@ -1640,6 +1701,7 @@ def evaluate_single_rule(df_pred,                     # 已經完成 XGBoost 推
     df_rule = apply_alarm_method_by_record(df_pred, cfg, window_threshold)
     # 從資料本身估計：每個 window 長度, 每次滑窗往前移多少秒。
     window_sec, hop_sec = estimate_window_timing(df_pred)
+    check_sampling_alignment(sampling, hop_sec)        # 週期擷取的時間點要落在窗格上
     # 計算每一段連續訊號實際有多長
     span = compute_segment_span(df_pred)
     
@@ -1755,10 +1817,32 @@ def run_disturbance_feature_inference(
     print("window_threshold =", window_threshold)
     print("file_threshold   =", file_threshold)
     print("model_folder     =", model_folder)
+    
+    # 模型訓練時用的設定檔，必須和現在磁碟上的是同一版（避免舊模型配新特徵，欄位同名卻照樣跑）
+    check_model_feature_contract(metadata_json)
 
     # ---  Step 4 前置：讀特徵資料、對齊檢查  ---
     # 讀特徵資料
-    df = pd.read_csv(feature_csv) 
+    df = pd.read_csv(feature_csv)
+    
+    # 必要欄位一開始就全部檢查（不要跑到一半才發現少欄位）
+    required_cols = ["record_id", "session_id", "t_start", "t_ref", "eval_class", "split"]
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"{feature_csv.name} 缺少必要欄位：{missing_cols}")
+
+    # eval_class 只能是已知的類別：空值或拼錯不可以默默當成乾淨段（會低估誤報率）
+    bad_eval = df["eval_class"].isna() | ~df["eval_class"].isin(KNOWN_EVAL_CLASSES)
+    if bad_eval.any():
+        found = sorted(df.loc[bad_eval, "eval_class"].astype(str).unique().tolist())
+        raise ValueError(f"eval_class 有 {int(bad_eval.sum())} 窗是空值或未知類別 {found}；只接受 {sorted(KNOWN_EVAL_CLASSES)}")
+
+    # 一個 record_id 只能屬於一個 session（干擾歸屬、事件命中、tail 都依 record_id 分組）
+    n_sess = df.groupby("record_id")["session_id"].nunique()
+    cross = n_sess[n_sess > 1].index.tolist()
+    if cross:
+        raise ValueError(f"有 {len(cross)} 個 record_id 跨了多個 session：{cross[:10]}")
+    
     # 先確認模型特徵對齊
     check_feature_alignment(df, feature_names)
 
@@ -1982,8 +2066,6 @@ def run_disturbance_feature_inference(
         "output_dir": output_dir,
         "model_id": model_id,
     }
-
-
 
 
 
