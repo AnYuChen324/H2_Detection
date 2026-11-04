@@ -9,12 +9,12 @@ xgb_classifier_two_sensor_micro_final.py
 
 整體流程（對應 run_xgb_training_and_save）：
     1. 讀入三份特徵表：
-        - dev_csv_path：合併過 transition_dev + disturbance_dev 的訓練資料（concat_transition_disturbance.py 的產物）
+        - 合併過 transition train + disturbance train（檔名沿用 _dev）的訓練資料（concat_transition_disturbance.py 的產物）
         - transition_holdout_csv_path / disturbance_holdout_csv_path：兩支切分腳本各自產生、完全沒碰過訓練流程的 holdout
        並用 feature_config_path 讀出 Step2 選定的正式特徵欄位清單，逐一檢查三份資料是不是都具備這些欄位（validate_feature_columns）。
 
     2. 呼叫 fit_xgb_final()，只用 dev 資料訓練模型，內部再細分三層：
-        - sub-train：用 GroupShuffleSplit 依 record_id 切出 80%，搭配 RandomizedSearchCV + GroupKFold（一樣依 record_id 分組）
+        - sub-train：用 GroupShuffleSplit 依 session_id 切出 80%，搭配 RandomizedSearchCV + GroupKFold（一樣依 session_id 分組）；file-level 聚合仍以 record_id（段）為單位
           找最佳 XGBoost 超參數，避免同一個 session 的 window 同時出現在 train/val 兩邊造成資料外洩。
         - val（切剩的 20%）：分別找出 window-level 最佳判斷閾值
           （_find_optimal_classifier_threshold）跟 file-level 最佳判斷閾值
@@ -46,7 +46,7 @@ xgb_classifier_two_sensor_micro_final.py
 名詞說明：
     - window-level：以單一個特徵 window（切片）為單位的預測/評估。
     - file-level：把同一個 record_id（同一次收集/同一個檔案）底下所有 window 的機率聚合成一個分數（目前用平均值 agg="mean"）之後才做的預測/評估，比 window-level 更貼近「這次收集到底有沒有洩漏」的實際判斷情境。
-    - dev：訓練 + 調參 + 調閾值都會用到的資料（來自 transition_dev + disturbance_dev 合併）。
+    - dev：訓練 + 調參 + 調閾值都會用到的資料（來自 transition train + disturbance train 合併（檔名沿用 dev））。
     - holdout：從頭到尾不參與訓練/調參/調閾值的資料，只在最後拿來做一次正式驗收，分 transition holdout（有正常+洩漏兩類，測抓漏能力）跟 disturbance holdout（全部負樣本，測抗干擾/誤報率）兩份。
 """
 # ======================================
@@ -58,7 +58,7 @@ import json
 import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
-from sklearn.model_selection import GroupShuffleSplit, GroupKFold, RandomizedSearchCV
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold, RandomizedSearchCV
 from sklearn.metrics import (
     f1_score, accuracy_score, precision_score, recall_score,
     classification_report
@@ -110,6 +110,16 @@ def load_feature_config(feature_config_path):
 
     if duplicate_features:
         raise ValueError(f"selected_feature_names 出現重複特徵：{duplicate_features}")
+        
+    
+    # metadata 不可當模型特徵（標籤、分組 ID、實驗條件會讓模型作弊或在現場拿不到）
+    METADATA_COLUMNS = {
+        "label", "session_id", "record_id", "split", "t_start", "t_ref",
+        "distance_cm", "pressure_bar", "leak_quantity", "volume_ml", "onset_gt_sec",
+    }
+    leaked_metadata = sorted(set(feature_cols) & METADATA_COLUMNS)
+    if leaked_metadata:
+        raise ValueError(f"selected_feature_names 混入 metadata 欄位：{leaked_metadata}")
 
     execution_plan = cfg.get("feature_execution_plan")
 
@@ -368,8 +378,11 @@ def _find_optimal_classifier_threshold(classifier, X_val, y_val, metric="f1", ve
 
     # 將結果轉成df格式，找出指定指標最高的那一列
     df = pd.DataFrame(results)
-    best_idx = df[metric].idxmax()
-    best_t = float(df.loc[best_idx, "threshold"])
+    # 同分（平台）時取平台中間的門檻，不取最左邊（最容易誤報的那一端）
+    best_s_all = df[metric].max()
+    plateau = df[np.isclose(df[metric], best_s_all, atol=1e-9)]
+    best_t = float(round(plateau["threshold"].median(), 2))
+    best_idx = (df["threshold"] - best_t).abs().idxmin()
     best_s = float(df.loc[best_idx, metric])
 
     if verbose:     # 是否要印出資訊
@@ -494,8 +507,11 @@ def _find_optimal_file_threshold(df_val, y_val_proba, metric="balanced_accuracy"
 
     # 找出檔案層級最佳閥值
     df = pd.DataFrame(results)
-    best_idx = df[metric].idxmax()
-    best_t = float(df.loc[best_idx, "threshold"])
+    # 同分（平台）時取平台中間的門檻，不取最左邊（最容易誤報的那一端）
+    best_s_all = df[metric].max()
+    plateau = df[np.isclose(df[metric], best_s_all, atol=1e-9)]
+    best_t = float(round(plateau["threshold"].median(), 2))
+    best_idx = (df["threshold"] - best_t).abs().idxmin()
     best_s = float(df.loc[best_idx, metric])
 
     if verbose:
@@ -555,7 +571,7 @@ def _summarize_file_level(file_df, threshold):
 # ============================================================
 # XGBoost 最終訓練：純訓練，不碰 holdout 資料
 # ============================================================
-def fit_xgb_final(X_train,                    # 訓練特徵,注意這裡還帶著record_id欄位,還沒拆掉
+def fit_xgb_final(X_train,                    # 訓練特徵,注意這裡還帶著 record_id、session_id 兩欄，還沒拆掉
                   y_train,                    # 訓練標籤
                   optimize_params=True,       # 要不要做超參數搜尋,預設要
                   optimize_threshold=True):   # 要不要做閾值優化,預設要
@@ -564,14 +580,15 @@ def fit_xgb_final(X_train,                    # 訓練特徵,注意這裡還帶�
     print(f"{'='*80}")
 
     # -- Step 1：檢查輸入格式 --
-    #    確保資料格式正確,一定要有 record_id
-    if "record_id" not in X_train.columns:
-        raise ValueError("X_train 必須包含 record_id 欄位")
-
+    for col in ("record_id", "session_id"):
+        if col not in X_train.columns:
+            raise ValueError(f"X_train 必須包含 {col} 欄位")
+    
     # -- Step 2：拆出真正特徵欄位 --
-    groups = X_train["record_id"]     # groups：之後切 validation 與 CV 用
-    # 真正給模型吃的數值特徵
-    X_train_features = X_train.drop(columns=["record_id"])     # 訓練特徵
+    # 分組用 session_id（和 split 程式同一個單位）：同一個 session 斷成多段時，
+    # 不能一段在內部 train、另一段在內部 validation，否則門檻與超參數會偏樂觀
+    groups = X_train["session_id"].astype(str)
+    X_train_features = X_train.drop(columns=["record_id", "session_id"])     # 只留模型特徵
     print(f"📊 訓練特徵數: {X_train_features.shape[1]}")
 
     # -- Step 3：從 train 裡再切一塊 validation -- 
@@ -583,7 +600,7 @@ def fit_xgb_final(X_train,                    # 訓練特徵,注意這裡還帶�
     '''
     # 如果選擇閥值優化
     if optimize_threshold:
-        # 用 GroupShuffleSplit 避免同一檔案混到 train/val
+        # 用 GroupShuffleSplit 以 session 分組，避免同一個 session 混到 train/val
         gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
         train_idx, val_idx = next(gss.split(X_train_features, y_train, groups))
 
@@ -592,7 +609,15 @@ def fit_xgb_final(X_train,                    # 訓練特徵,注意這裡還帶�
         X_val = X_train_features.iloc[val_idx]
         y_val = y_train[val_idx]
         groups_sub = groups.iloc[train_idx]
-    
+        
+        # 防呆：改用 session 分組後組數變少，validation 可能只剩一類，找出來的門檻就沒有意義
+        n_val_sessions = groups.iloc[val_idx].nunique()
+        if len(np.unique(y_val)) < 2:
+            raise ValueError(
+                f"內部 validation 只有一類 label（{n_val_sessions} 個 session），無法找門檻；"
+                "session 數太少，請增加資料或調整 GroupShuffleSplit 的 random_state / test_size")
+        print(f"📊 內部切分：sub-train {groups_sub.nunique()} 個 session、validation {n_val_sessions} 個 session")
+            
     else:      # 如果不做 threshold optimization，就直接用全部訓練資料
         X_train_sub = X_train_features
         y_train_sub = y_train
@@ -628,7 +653,19 @@ def fit_xgb_final(X_train,                    # 訓練特徵,注意這裡還帶�
     best_params = {}
     if optimize_params:     # 如果選擇要超參數搜尋
         print("🔍 XGBoost RandomizedSearchCV ...")
-        gkf = GroupKFold(n_splits=3)    # 3折交叉驗證
+        
+        # 3 折交叉驗證，以 session 分組，並讓每折的正常 / 洩漏比例盡量接近（StratifiedGroupKFold）
+        # 干擾 session 全是 0：GroupKFold 可能把某折分成只有干擾 session，該折只有一類，balanced accuracy 會失真
+        if groups_sub.nunique() < 3:
+            raise ValueError(f"sub-train 只有 {groups_sub.nunique()} 個 session，不足以做 3 折交叉驗證")
+        sgkf = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=42)
+        cv_splits = list(sgkf.split(X_train_sub, y_train_sub, groups_sub))   # 先轉成 list：新版 sklearn 平行運算時不能傳 generator
+        # 每一折的 train / validation 都必須同時有 0 和 1
+        for k, (tr_idx, va_idx) in enumerate(cv_splits, start=1):
+            for part, idx in (("train", tr_idx), ("validation", va_idx)):
+                if len(np.unique(y_train_sub[idx])) < 2:
+                    raise ValueError(f"CV 第 {k} 折的 {part} 只有一類 label；session 太少或正常 / 洩漏分布太不平均")
+        
         # 設定超參數候選搜尋空間
         param_grid = {
             "n_estimators": [100, 200, 300, 500],        # (樹的數量)的候選值
@@ -643,7 +680,7 @@ def fit_xgb_final(X_train,                    # 訓練特徵,注意這裡還帶�
             base_model,
             param_distributions=param_grid,            # 剛剛定義的搜尋空間
             n_iter=10,                                 # 隨機試 10 組參數
-            cv=list(gkf.split(X_train_sub, y_train_sub, groups_sub)),   # 先轉成 list：新版 sklearn 平行運算時不能傳 generator 
+            cv=cv_splits,                              # 已檢查每折兩類都有
             scoring="balanced_accuracy",    # 以 balanced accuracy 當選參數依據
             random_state=42,
             n_jobs=-1,
@@ -687,7 +724,7 @@ def fit_xgb_final(X_train,                    # 訓練特徵,注意這裡還帶�
         # 取 validation 機率，給 file-level threshold 用
         y_val_proba = model_for_threshold.predict_proba(X_val)[:, 1]
 
-        # 建一個只有 record_id 和 label 的 validation 表
+        # 建一個只有 record_id 和 label 的 validation 表，file-level 以段（record_id）聚合；分組才用 session_id
         df_val_eval = X_train.iloc[val_idx][["record_id"]].copy()
         df_val_eval["label"] = np.asarray(y_val)
         
@@ -1075,6 +1112,31 @@ def run_xgb_training_and_save(
             raise ValueError(f"{split_pair} 出現重複 record_id：{sorted(overlap_ids)[:20]}")
     print("✅ dev 與兩份 holdout 沒有 record_id 重疊")
     
+    # session 層級也不能重疊（split 程式就是以 session 切的；這裡再確認一次）
+    def _sessions(df):
+        return set(df["session_id"].dropna().astype(str)) if "session_id" in df.columns else set()
+    
+    if "session_id" not in df_dev.columns:
+        raise ValueError("dev 缺少 session_id，請重跑 concat_transition_disturbance.py")
+    dev_sessions = _sessions(df_dev)
+    for name, df_h in (("transition_holdout", df_transition_holdout),
+                       ("disturbance_holdout", df_disturbance_holdout)):
+        if "session_id" not in df_h.columns:
+            # 沒有 session_id 就無法證明 holdout 和訓練資料沒有重複 → 直接停止
+            raise ValueError(f"{name} 缺少 session_id，無法做 session 隔離檢查；請用目前的切分程式重新輸出")
+        overlap = dev_sessions & _sessions(df_h)
+        if overlap:
+            raise ValueError(f"dev / {name} 出現重複 session_id：{sorted(overlap)[:20]}")
+    print("✅ dev 與兩份 holdout 沒有 session 重疊")
+    
+    
+    # 兩份 holdout 彼此也不能重疊（同一個 session 不能同時出現在轉換和干擾的 holdout）
+    for col in ("session_id", "record_id"):
+        both = (set(df_transition_holdout[col].dropna().astype(str))
+                & set(df_disturbance_holdout[col].dropna().astype(str)))
+        if both:
+            raise ValueError(f"transition_holdout / disturbance_holdout 出現重複 {col}：{sorted(both)[:20]}")
+    print("✅ 兩份 holdout 彼此沒有 session / record 重疊")
     
     # ========================================================
     # 3. 補 volume_ml
@@ -1125,7 +1187,7 @@ def run_xgb_training_and_save(
     validate_feature_columns(df_disturbance_holdout, feature_cols, "disturbance_holdout")
 
     # 從 df_dev 裡挑出 record_id 欄位加上所有 feature_cols 列出的特徵欄位
-    X_train = df_dev[["record_id"] + feature_cols].copy()
+    X_train = df_dev[["record_id", "session_id"] + feature_cols].copy()
     y_train = df_dev["label"].values    # 取出df_dev的label欄位,
     # 從轉換holdout挑出record_id+特徵欄位,存成X_transition
     X_transition = df_transition_holdout[["record_id"] + feature_cols].copy()
@@ -1298,7 +1360,7 @@ def run_xgb_training_and_save(
 
 
 if __name__ == "__main__":
-    # 合併好的 dev 資料
+    # 合併好的 train 資料（檔名沿用 dev）
     DEV_CSV = Path("/Users/paul/Desktop/Final/test_result/transition_disturbance_dev.csv")
     # 轉換的 Holdout 資料
     TRANSITION_HOLDOUT_CSV = Path("/Users/paul/Desktop/Final/transition_feature_engineering/transition_30ml_test/transition_features_holdout.csv")

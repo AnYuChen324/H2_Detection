@@ -240,6 +240,7 @@ from shared_feature_utils import (
     load_band_config,
     SIGNAL_RMS_MIN,
     build_continuous_segments,    # v22 連續段：依取樣序號把首尾相接的 0.5 秒檔組成一段
+    SUMMARY_BASELINE_COLUMNS,
 )
 
 
@@ -251,6 +252,8 @@ from shared_feature_utils import (
 # False：只顯示警告，僅供舊資料流程測試。
 STRICT_BASELINE_ISOLATION = True
 
+# 干擾事件時間的容許誤差（秒）：事件和 session 的錄製範圍完全沒有重疊（超過這個容許值）就停止
+EVENT_TIME_TOL_SEC = 1.0
 
 # ============================================================
 # 已知有問題、暫時排除的單支 TDMS（寫清楚原因；確認資料後再移除）
@@ -301,7 +304,10 @@ def check_content_duplicates(file_specs, baseline_paths, strict=True):
             baseline_hits.append((Path(bp).stem, seen[h]))
 
     if missing_baseline:
-        print(f"⚠️ baseline 來源檔有 {missing_baseline} 支找不到，這些無法比對內容")
+        msg = f"baseline 來源檔有 {missing_baseline} 支找不到，這些無法比對內容"
+        if strict:
+            raise FileNotFoundError(msg + "（嚴格模式：無法確認資料隔離就停止）")
+        print("⚠️ " + msg)
 
     if not dup_pairs and not baseline_hits:
         print(f"✅ 內容重複檢查通過：{len(seen)} 支 disturbance 彼此不重複，也沒有跟 baseline 檔內容相同")
@@ -433,6 +439,13 @@ def collect_disturbance_sessions(
                 problems.append(f"{where}：manifest 缺少檔名欄位，現有欄位 {df_manifest.columns.tolist()}")
                 continue
             
+            # v22 連續錄製（acquisition_mode = continuous）一定要用 segments：per_file_legacy 會丟掉跨檔的窗，和現場不一致
+            if input_mode == "per_file_legacy" and "acquisition_mode" in df_manifest.columns:
+                modes = set(df_manifest["acquisition_mode"].astype(str).str.strip().str.lower())
+                if "continuous" in modes:
+                    problems.append(f"{where}：這是 v22 連續錄製的資料（acquisition_mode = continuous），請改用 input_mode=\"segments\"")
+                    continue
+            
             # 排除已知有問題的單支檔：同時從 manifest 拿掉，後面的時間檢查才不會再算到它
             row_stems = df_manifest[file_col].map(lambda x: PureWindowsPath(str(x)).stem)
             drop_mask = row_stems.isin(EXCLUDED_FILES)
@@ -510,6 +523,19 @@ def collect_disturbance_sessions(
                 # 將驗證後的數值時間寫回 DataFrame，確保後續使用的是數字型別
                 df_events["start_elapsed_sec"] = ev_start
                 df_events["end_elapsed_sec"] = ev_end
+                
+                # 事件檔必須屬於這個 session：放錯資料夾時，下面會把 session_id 蓋成目前資料夾的，等於默默標錯
+                if "session_id" in df_events.columns:
+                    ev_sids = set(df_events["session_id"].astype(str).str.strip()) - {"", "nan"}
+                    if ev_sids and ev_sids != {session_id}:
+                        problems.append(f"{where}：event 檔的 session_id {sorted(ev_sids)} 和 manifest 的「{session_id}」不一致（event 檔可能放錯資料夾）")
+                        continue
+                # 事件時間要和這個 session 的錄製範圍有重疊（前後容許 EVENT_TIME_TOL_SEC；手動標記有誤差）
+                rec_start, rec_end = float(cap_start.min()), float(cap_end.max())
+                outside = (ev_end < rec_start - EVENT_TIME_TOL_SEC) | (ev_start > rec_end + EVENT_TIME_TOL_SEC)
+                if outside.any():
+                    problems.append(f"{where}：有 {int(outside.sum())} 個事件完全落在錄製範圍 {rec_start:.2f}～{rec_end:.2f} 秒之外")
+                    continue
                 
             # ---- segments 模式：用取樣序號組連續段，取代下面「逐支配對 + 檔名時間順序」的檢查 ----
             if input_mode == "segments":
@@ -1104,14 +1130,8 @@ def build_disturbance_inference_feature_csv(
                 f"Disturbance 缺少 offband 摘要特徵：{missing_summary}"
             )
         
-    rule_baseline_feature_names = [
-        "offband_E_mean",
-        "offband_E_max",
-        "leak_focus_E_mean",
-        "leak_focus_E_max",
-        "resonance_E_mean",
-        "resonance_E_max",
-    ]
+    # 規則需要的摘要欄位（和轉換 FE、runtime 共用，定義在 shared_feature_utils）
+    rule_baseline_feature_names = list(SUMMARY_BASELINE_COLUMNS)
     
     # 模型與規則需要的 baseline 欄位取聯集
     baseline_apply_feature_names = list(dict.fromkeys(
@@ -1301,6 +1321,11 @@ def build_disturbance_inference_feature_csv(
         "z_resonance_E_mean",
         "rel_resonance_E_max",
         "z_resonance_E_max",
+        
+        # ratio veto：比正常時高幾倍（log），干擾推論的候選規則用 rel_ 版本
+        "log_offbandmax_to_leak_focusmax_E_ratio",
+        "rel_log_offbandmax_to_leak_focusmax_E_ratio",
+        "z_log_offbandmax_to_leak_focusmax_E_ratio",
     ]
     
     missing_rule_cols = [c for c in dict.fromkeys(extra_veto_cols) if c not in df.columns]
@@ -1375,6 +1400,7 @@ def build_disturbance_inference_feature_csv(
         "offband_to_leak_focus_E_ratio", "offbandmax_to_leak_focusmax_E_ratio",
         "offband_to_resonance_E_ratio", "offbandmax_to_resonancemax_E_ratio",
         "z_offband_E_mean","z_offband_E_max",
+        "rel_log_offbandmax_to_leak_focusmax_E_ratio",    # ratio veto 用（相對 baseline）
     ]
     
     # 檢查 Rule CSV 所需欄位是否完整。

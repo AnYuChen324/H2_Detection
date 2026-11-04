@@ -8,9 +8,9 @@
 量干擾推論提出的候選規則抓不抓得到洩漏、多久抓到。不重新訓練模型、不重做特徵工程。
 
 在完整流程中的位置：
-  1. 干擾推論  mode="select"            ：干擾 dev 上提出 16 個候選
+  1. 干擾推論  mode="select"            ：干擾 dev 上提出 每種基礎規則一個候選
   2. 轉換推論  run_transition_postprocess_candidates  ← 本程式（只用轉換 dev）
-       16 個候選的偵測率、太早報、延遲，和干擾誤報放同一張表
+       每種基礎規則一個候選的偵測率、太早報、延遲，和干擾誤報放同一張表
        → transition_postprocess_candidate_comparison.csv，你看這張表選定一條
   3. 干擾推論  mode="evaluate"          ：干擾 holdout 上量選定的那條，寫出 postprocess_config.json
                                            （validation_status = pending_transition_holdout）
@@ -29,6 +29,7 @@
   - onset_tolerance_sec（預設 1 秒）：onset 前這麼多秒內的報警不算誤報（手動標記誤差）
   - 沒有 onset 的 record：只要報警就算誤報
   - label 為空的窗（灰色地帶：標記前後、轉閥暫態）不列入 window 指標
+  - sampling.mode="periodic" 時，onset 成績用 simulate_periodic_capture 模擬 API；延遲 = 亮紅燈時間 − onset，不含運算時間
 
 重要原則：
   1. 模型特徵、門檻以模型存檔為準；規則以 postprocess config 為準，缺參數就報錯，不補預設值
@@ -75,6 +76,9 @@ from alarm_rule_utils_v2 import (
     apply_alarm_method_by_record,
     rule_kwargs_from_cfg,     # 規則參數檢查（和干擾推論、runtime 同一套，只維護一份）
     _cfg_value,               # 取設定值：None、NaN 都當作「沒寫」
+    simulate_periodic_capture,  # 週期取樣模擬（每批一段）
+    apply_batch_warmup,         # 批內暖機
+    BatchConfirmer,             # M/N 批次確認（run_periodic_onset_evaluation 用）
 )
 
 # 和干擾推論共用：載入模型、拆推論設定、檢查欄位、正式 runtime schema
@@ -88,6 +92,7 @@ from model_infer_disturbance_final3 import (
     split_dev_holdout_for_rules,      # 依 split 欄分 dev / holdout（沒有 split 欄、session 跨兩邊都會報錯）
     estimate_window_timing,           # 從資料估計窗長、步長
     _json_safe,                       # numpy / NaN → JSON 可寫的型別（NaN 存成 null）
+    check_model_feature_contract,     # 模型 metadata 的 feature_contract 和目前設定檔比對（兩支推論共用）
 )
 
 
@@ -181,6 +186,7 @@ def load_model_and_predict(feature_csv, metadata_json, feature_config_json=None)
     models_dir, model_id, model_folder = resolve_model_location_from_metadata(metadata_json)
     manager = ModelManager(models_dir=str(models_dir))
     model_id, pkg = get_xgb_model(manager, model_id=model_id, metadata_json=metadata_json)
+    check_model_feature_contract(metadata_json)     # 模型訓練時的設定檔 = 目前磁碟上的設定檔（和干擾推論同一個檢查）
     model, scaler, feature_names, window_threshold, file_threshold, metadata, model_type = extract_inference_config(pkg)
 
     if feature_config_json is not None:
@@ -198,6 +204,16 @@ def load_model_and_predict(feature_csv, metadata_json, feature_config_json=None)
 
     df = pd.read_csv(feature_csv)
     check_feature_alignment(df, feature_names)
+    
+    # 偵測率以 record（v22 = 連續段）為單位；每個 session 最多只能有一段帶 onset，
+    # 這樣「段層級」的偵測率才等於「session 層級」（特徵工程已排除沒有切換事件的段、一個 session 只允許一次切換）
+    if "session_id" in df.columns and "onset_gt_sec" in df.columns:
+        has_onset = df.dropna(subset=["onset_gt_sec"])
+        n_onset_rec = has_onset.groupby("session_id")["record_id"].nunique()
+        multi = n_onset_rec[n_onset_rec > 1].index.tolist()
+        if multi:
+            raise ValueError(f"有 {len(multi)} 個 session 有不只一段帶 onset，段層級偵測率不等於 session 層級：{multi[:5]}")
+    
     X = df[feature_names].copy()
     if scaler is not None:
         X = scaler.transform(X)
@@ -443,6 +459,9 @@ def run_onset_evaluation(
 
         pre_mask = t_alarm < early_limit
         valid_idx = np.flatnonzero(rise & (t_alarm >= early_limit))     # 容許範圍開始後「響起」才算偵測到
+        # onset 之前（容許範圍內）就響起的報警：可能是轉閥碰管觸發，不是真的抓到洩漏
+        # 仍算 valid_detection（標記本身有誤差），但另外記錄，讓驗收看得到
+        pre_onset_rise = bool((rise & (t_alarm >= early_limit) & (t_alarm < onset)).any())
         valid_onset = float(t_alarm[valid_idx[0]]) if len(valid_idx) else np.nan
 
         post_mask = (t_alarm >= onset) & (t_alarm <= onset + 1.0)
@@ -456,7 +475,8 @@ def run_onset_evaluation(
             
             # 容許範圍開始時警報已經在響（誤報一路延續過來）：這條 record 的偵測不能算數
             "alarm_ongoing_at_tolerance_start": float(bool(detected[pre_mask][-1] == 1)) if pre_mask.any() else 0.0,
-                        
+            "alarm_rise_before_onset": float(pre_onset_rise),
+            
             "latency_sec": valid_onset - onset if len(valid_idx) else np.nan,
             "first_alarm_lead_sec": first_alarm - onset if len(alarm_idx) else np.nan,
             "pre_onset_detected_windows": int(detected[pre_mask].sum()),
@@ -772,10 +792,31 @@ def load_postprocess_candidates(postprocess_dir, expected_model_id=None, pattern
 # ============================================================
 # 一條規則在轉換資料上的成績（window + onset）
 # ============================================================
-def score_rule_on_transition(df_pred, alarm_cfg, window_threshold, window_sec, onset_tolerance_sec):
-    '''套用規則，回傳 (df_rule, onset_df, 成績 dict)；window 指標只算有標籤的窗（灰色地帶排除）'''
+def score_rule_on_transition(df_pred, 
+                             alarm_cfg,
+                             window_threshold, 
+                             window_sec, 
+                             onset_tolerance_sec,
+                             sampling=None):
+    '''
+    週期模式下 n_leak_records = record 數 × offset 數
+    套用規則，回傳 (df_rule, onset_df, 成績 dict)；window 指標只算有標籤的窗（灰色地帶排除）
+    '''
     df_rule = apply_alarm_method_by_record(df_pred, alarm_cfg, window_threshold)
     onset_df = run_onset_evaluation(df_rule, window_sec=window_sec, onset_tolerance_sec=onset_tolerance_sec)
+    
+    # 週期模式：onset 成績改用模擬 API 取樣（每批獨立 + 批內暖機 + M/N 確認），多個 offset 合併
+    # window 指標（下面的 precision / recall）仍用連續資料，只當參考
+    if sampling and sampling.get("mode") == "periodic":
+        parts = []
+        for off in sampling["offsets_sec"]:
+            df_b = simulate_periodic_capture(df_pred, sampling["capture_sec"], sampling["interval_sec"], off, window_sec)
+            df_b = apply_batch_warmup(apply_alarm_method_by_record(df_b, alarm_cfg, window_threshold),
+                                      sampling["warmup_sec"])
+            parts.append(run_periodic_onset_evaluation(
+                df_b, window_sec, onset_tolerance_sec, sampling["confirm_m"], sampling["confirm_n"]
+            ).assign(offset_sec=off))
+        onset_df = pd.concat(parts, ignore_index=True)
 
     label = pd.to_numeric(df_rule["label"], errors="coerce") if "label" in df_rule.columns else pd.Series(dtype=float)
     # label 只能是 0、1 或空值（灰色地帶）；0.5 之類的值用 astype(int) 會被悄悄截成 0
@@ -789,7 +830,8 @@ def score_rule_on_transition(df_pred, alarm_cfg, window_threshold, window_sec, o
     leak = onset_df[onset_df["has_onset"]]
     normal = onset_df[~onset_df["has_onset"]]
     score = {
-        "n_leak_records": int(len(leak)),
+        "n_leak_records": int(len(leak)),                          # 週期模式 = record 數 × offset 數（評估次數）
+        "n_unique_leak_records": int(leak["record_id"].nunique()),  # 實際有幾條洩漏 record（v22 一個 session 一段，等於 session 數）
         "n_normal_records": int(len(normal)),
         "valid_detection_rate": leak["valid_detection"].mean() if len(leak) else np.nan,     # 洩漏 record 有抓到的比例
         "early_false_alarm_rate": leak["false_alarm"].mean() if len(leak) else np.nan,       # 洩漏 record 在 onset 前就亂報的比例
@@ -803,13 +845,17 @@ def score_rule_on_transition(df_pred, alarm_cfg, window_threshold, window_sec, o
         # 洩漏開始時警報已經在響（誤報一路延續過來）的 record 數：這些 record 的偵測不算數
         "n_alarm_ongoing_at_onset": int(leak["alarm_ongoing_at_tolerance_start"].sum())
                                     if "alarm_ongoing_at_tolerance_start" in leak.columns else 0,
+                                    
+        # 在 onset 前（容許範圍內）就亮紅燈的比例；高的話代表規則可能被開閥碰管觸發
+        "pre_onset_alarm_rate": leak["alarm_rise_before_onset"].mean()
+                                if "alarm_rise_before_onset" in leak.columns and len(leak) else np.nan,
     }
 
     return df_rule, onset_df, score
 
 
 # ============================================================
-# 選規則：16 個候選在轉換 dev 上的偵測成績 + 干擾 dev 的誤報成績，放同一張表
+# 選規則：每種基礎規則一個候選在轉換 dev 上的偵測成績 + 干擾 dev 的誤報成績，放同一張表
 # ============================================================
 def run_transition_postprocess_candidates(
     feature_csv,                   # transition_rule_features_eval.csv（有 split 欄；只用 dev）
@@ -834,6 +880,24 @@ def run_transition_postprocess_candidates(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     candidates = load_postprocess_candidates(candidate_dir, expected_model_id=pred["model_id"])
+    
+    # 所有候選的取樣方式必須相同（都來自同一次干擾推論 select）
+    samplings = {json.dumps(c["payload"].get("sampling"), sort_keys=True) for c in candidates}
+    if len(samplings) != 1:
+        raise ValueError(f"候選檔的 sampling 不一致：{samplings}，請重跑干擾推論 mode='select'")
+    sampling = candidates[0]["payload"].get("sampling")
+    print(f"取樣方式：{sampling}")
+    
+    # 診斷（只看 dev）：洩漏窗的機率要高於候選門檻；veto 比值要小於候選倍數（否則 veto 會擋掉洩漏）
+    lab = pd.to_numeric(df_dev["label"], errors="coerce")
+    labeled = df_dev[lab.notna()].assign(_lab=lab[lab.notna()].astype(int))
+    print("\n模型機率分位數（dev；0 = 正常窗、1 = 洩漏窗）：")
+    print(labeled.groupby("_lab")["pred_proba"].quantile([0.1, 0.5, 0.9]).unstack().round(3).to_string())
+    ratio_col = "rel_log_offbandmax_to_leak_focusmax_E_ratio"
+    if ratio_col in labeled.columns:
+        print("\nveto 比值：比正常高幾倍（dev；洩漏窗應該 < 1，且遠低於候選倍數）：")
+        print(np.exp(labeled.groupby("_lab")[ratio_col].quantile([0.5, 0.9, 0.99]).unstack()).round(2).to_string())
+        
     rows, onset_all = [], []
     for item in candidates:
         rule_cfg = item["rule_cfg"]
@@ -843,7 +907,7 @@ def run_transition_postprocess_candidates(
             raise ValueError(f"規則 {item['rule_name']} 需要的 veto 欄位不在轉換資料裡：{missing}")
 
         _, onset_df, score = score_rule_on_transition(
-            df_dev, alarm_cfg, pred["window_threshold"], window_sec, onset_tolerance_sec)
+            df_dev, alarm_cfg, pred["window_threshold"], window_sec, onset_tolerance_sec, sampling=sampling)
         onset_all.append(onset_df.assign(rule_name=item["rule_name"]))
 
         rows.append({
@@ -858,6 +922,8 @@ def run_transition_postprocess_candidates(
             "dist_clean_normal_fa": rule_cfg.get("clean_normal_false_alarm_rate"),
             "dist_event_hit_rate": rule_cfg.get("disturbance_event_hit_rate"),
             "dist_alarm_onsets": rule_cfg.get("disturbance_negative_alarm_onsets"),
+            "dist_periodic_batch_fa": rule_cfg.get("periodic_batch_fa_dist"),        # 擷取到干擾的批中有報警的比例
+            "dist_periodic_confirmed": rule_cfg.get("periodic_confirmed_alarms_dist"),  # M/N 確認後亮紅燈次數
             # 轉換 dev 的成績
             **{f"trans_{k}": v for k, v in score.items()},
         })
@@ -885,6 +951,7 @@ def run_transition_postprocess_candidates(
         "onset_tolerance_sec": onset_tolerance_sec,
         "candidate_files": [item["path"].name for item in candidates],
         "comparison_csv": str(comparison_csv),
+        "sampling": sampling,
     }
     with open(output_dir / "run_info.json", "w", encoding="utf-8") as f:
         json.dump(_to_builtin(run_info), f, indent=2, ensure_ascii=False)
@@ -893,9 +960,10 @@ def run_transition_postprocess_candidates(
     print(f"候選規則比較（轉換 dev {run_info['n_dev_records']} 筆 record，其中洩漏 {run_info['n_dev_leak_records']} 筆；"
           f"onset 容許 {onset_tolerance_sec} 秒）")
     print("=" * 80)
-    show_cols = ["rule_name", "dist_effective_fa", "dist_event_hit_rate", "dist_meets_fa_limit",
-                 "trans_early_false_alarm_rate", "trans_normal_record_false_alarm_rate",
-                 "trans_valid_detection_rate", "trans_median_latency_sec", "trans_n_alarm_ongoing_at_onset"]
+    show_cols = ["rule_name", "dist_effective_fa", "dist_periodic_confirmed", "dist_event_hit_rate",
+             "dist_meets_fa_limit", "trans_early_false_alarm_rate", "trans_normal_record_false_alarm_rate",
+             "trans_valid_detection_rate", "trans_median_latency_sec", "trans_p90_latency_sec",
+             "trans_n_alarm_ongoing_at_onset", "trans_pre_onset_alarm_rate"]
     print(summary[[c for c in show_cols if c in summary.columns]].to_string(index=False))
     print(f"\n已輸出：{comparison_csv}")
     print("選定規則後，干擾推論 evaluate 的 transition_comparison_csv 請填上面這個路徑")
@@ -914,6 +982,7 @@ ACCEPTANCE_KEYS = {
     "max_normal_record_false_alarm_rate":  ("normal_record_false_alarm_rate", "<="),   # 純正常 record 報警的比例上限
     "max_median_latency_sec":              ("median_latency_sec", "<="),               # 延遲中位數上限（秒）
     "max_p90_latency_sec":                 ("p90_latency_sec", "<="),                  # 延遲 P90 上限（秒）
+    "max_pre_onset_alarm_rate":            ("pre_onset_alarm_rate", "<="),             # onset 前（容許範圍內）就響的比例上限：太高可能是抓到轉閥碰管
 }
 
 
@@ -982,6 +1051,7 @@ def run_transition_feature_inference(
         raise ValueError("這條規則已經在轉換 holdout 上評估過了（holdout 只量一次）；"
                          "確定要重跑請設 allow_reevaluate=True，舊成績會保留在 transition_holdout_history")
     alarm_cfg = rule_cfg_to_alarm_cfg(payload["baseline_rule_settings"])
+    sampling = payload.get("sampling")       # 和 dev 選規則時同一種取樣方式（干擾推論寫進來的）
 
     pred = load_model_and_predict(feature_csv, metadata_json, feature_config_json)
     if payload.get("model_id") not in (None, pred["model_id"]):
@@ -997,13 +1067,13 @@ def run_transition_feature_inference(
     raw_window_metrics = evaluate_window_level(df_hold, pred_col="pred_label", result_name="模型原始 Window-level（holdout）")
     steady_df = evaluate_steady_separability(df_hold, window_sec=window_sec)     # 模型本身分不分得開（不套規則）
     df_rule, onset_df, score = score_rule_on_transition(
-        df_hold, alarm_cfg, pred["window_threshold"], window_sec, onset_tolerance_sec)
+        df_hold, alarm_cfg, pred["window_threshold"], window_sec, onset_tolerance_sec, sampling=sampling)
     window_metrics = evaluate_window_level(df_rule, pred_col="detected_rule", result_name="正式後處理 Window-level（holdout）")
 
     output_dir = pred["model_folder"] / "inference_runs" / f"{run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     settings = {"feature_names": pred["feature_names"], "window_threshold": pred["window_threshold"],
                 "file_threshold": pred["file_threshold"], "window_sec": window_sec,
-                "onset_tolerance_sec": onset_tolerance_sec, "data_split": "holdout", **alarm_cfg}
+                "onset_tolerance_sec": onset_tolerance_sec, "data_split": "holdout", **alarm_cfg, "sampling": sampling}
     save_transition_inference_outputs(
         output_dir=output_dir, df_pred=df_rule, window_metrics=window_metrics,
         raw_window_metrics=raw_window_metrics,
@@ -1022,6 +1092,7 @@ def run_transition_feature_inference(
         "evaluated_at": datetime.now().isoformat(),
         "n_windows": int(len(df_hold)),
         "onset_tolerance_sec": onset_tolerance_sec,
+        "sampling": sampling,
         **score,
         "raw_window_recall": raw_window_metrics["recall"],
         "raw_window_precision": raw_window_metrics["precision"],
@@ -1054,6 +1125,45 @@ def run_transition_feature_inference(
             "output_dir": output_dir, "model_id": pred["model_id"]}
 
 
+# ============================================================
+# 週期模式的 onset 評估
+# ============================================================
+def run_periodic_onset_evaluation(df_rule_b, window_sec, onset_tolerance_sec, confirm_m, confirm_n):
+    '''
+    週期模式下，每條原始 record 依時間逐批套 M/N 確認：
+      亮紅燈時間 = 確認那一批中，第一個報警窗的結束時間（不含運算時間）
+      early_false_alarm = 在 onset − 容許秒數之前就亮紅燈
+      latency_sec = 亮紅燈時間 − onset
+    '''
+    rows = []
+    for src, sub in df_rule_b.groupby("source_record_id"):
+        onset_vals = pd.to_numeric(sub["onset_gt_sec"], errors="coerce").dropna() if "onset_gt_sec" in sub else pd.Series(dtype=float)
+        
+        # 同一條 record 只能有一個 onset（和連續模式 run_onset_evaluation 同一個檢查）：多個值代表標記有問題，不可默默取第一個
+        if onset_vals.nunique() > 1:
+            raise ValueError(f"record {src} 的 onset_gt_sec 不只一個值：{sorted(onset_vals.unique().tolist())[:5]}")
+        onset = float(onset_vals.iloc[0]) if len(onset_vals) else np.nan
+
+        conf = BatchConfirmer(confirm_m, confirm_n)
+        t_confirm = np.nan
+        for _, b in sub.sort_values("t_start").groupby("batch_index", sort=True):
+            hit = b["detected_rule"].to_numpy() == 1
+            if conf.update(hit.any()) and np.isnan(t_confirm):
+                t_end = (2.0 * b["t_ref"] - b["t_start"]).to_numpy()
+                t_confirm = float(t_end[hit][0])          # 確認只會在有報警的批發生
+                break
+        has_onset = not np.isnan(onset)
+        rows.append({
+            "record_id": src, "has_onset": has_onset, "onset_gt_sec": onset,
+            "confirmed_alarm_sec": t_confirm,
+            "false_alarm": float(not np.isnan(t_confirm) and (not has_onset or t_confirm < onset - onset_tolerance_sec)),
+            "valid_detection": float(has_onset and not np.isnan(t_confirm) and t_confirm >= onset - onset_tolerance_sec) if has_onset else np.nan,
+            "latency_sec": (t_confirm - onset) if has_onset and not np.isnan(t_confirm) and t_confirm >= onset - onset_tolerance_sec else np.nan,
+            "alarm_rise_before_onset": float(has_onset and not np.isnan(t_confirm)
+                                 and onset - onset_tolerance_sec <= t_confirm < onset),
+        })
+    return pd.DataFrame(rows)
+
 
 
 if __name__ == "__main__":
@@ -1073,7 +1183,7 @@ if __name__ == "__main__":
 
     # ============================================================
     # 第 2 步（選規則）：干擾推論 mode="select" 之後執行
-    #   16 個候選在轉換 dev 上的成績 + 干擾 dev 的誤報成績 → 看表選定一條
+    #   每種基礎規則一個候選在轉換 dev 上的成績 + 干擾 dev 的誤報成績 → 看表選定一條
     # ============================================================
     run_transition_postprocess_candidates(
         feature_csv=FEATURE_CSV,
@@ -1093,8 +1203,10 @@ if __name__ == "__main__":
         "min_valid_detection_rate": 0.95,            # 洩漏至少抓到 95%
         "max_early_false_alarm_rate": 0.05,          # 洩漏前就亂報的比例最多 5%
         "max_normal_record_false_alarm_rate": 0.0,   # 純正常 record 不能報警（holdout 沒有純正常 record 時改成 None）
-        "max_median_latency_sec": 2.0,               # 延遲中位數最多 2 秒
+        "max_median_latency_sec": None,   # 週期模式：從洩漏開始到亮紅燈（含等下一批與 M/N 確認）；
+                                          # 先看模擬資料的延遲分布再訂，不能沿用連續模式的 2 秒
         "max_p90_latency_sec": None,                 # 不檢查
+        "max_pre_onset_alarm_rate": None,            # 先不檢查；看完模擬資料的分布再訂（例如 0.2）
     }
     result = run_transition_feature_inference(
         feature_csv=FEATURE_CSV,

@@ -64,10 +64,12 @@ dev / holdout 以錄音場次為單位切分（每個「label × 距離」各自
 2. 對全部掃描頻帶計算 window-level 原始特徵（有快取就直接讀）。
 3. 只用原始特徵排名：每個頻帶 × 通道（ai0 / ai1 / diff）× 指標（STEP2_EXPAND_SUFFIXES）。
    rel_ / z_ 只是平移縮放，區分力和原始值完全相同，所以不納入排名。
+   Step2a 用 STEP2_EXPAND_SUFFIXES；Step2b 建 z_ 的指標由 BASELINE_FEATURE_POLICY 決定
 4. 聚合成 record-level median，每個特徵算正常 vs 洩漏的 |Cohen's d|。
 5. 彙整成頻帶分數：
    - 證據家族 = 通道（ai0 / ai1 / diff）
    - 一個通道的 |d| ≥ SUPPORT_MIN_IMPORTANCE 才算「支持」
+   - 而且正常 vs 洩漏的中位數相對差異 ≥ max(下限, K × 正常 session 間漂移)（避免穩定雜訊頻帶靠小差異拿到高 |d|）
    - 至少 MIN_FEATURE_FAMILY_COUNT 個通道支持才保留
    - band_score = 0.6 × 最強特徵 + 0.4 × 各通道平均
 6. （BUILD_CROSS_WINDOW_FEATURES = True 時）對前 PRELIMINARY_BANDS_TO_KEEP 名
@@ -166,8 +168,10 @@ Dev 與 holdout 使用同一份預先建立的固定正常 Baseline。
 可進模型的特徵：
 
 - final_main_bands（洩漏 + 共振）的原始特徵與 rel_ / z_
-- 單一視窗內的時間結構特徵（temporal_band_names 指定的頻帶，例如 residual cusum_peak）
+- （目前不使用）單一視窗內的時間結構特徵（cusum_peak / burst）：runtime 抽取器還算不出來，
+   temporal_band_names 設為空；要啟用必須先補 shared 的 extract_required_window_features
 - 且 runtime 特徵抽取器算得出來（validate_runtime_extractable_features）
+- BASELINE_FEATURE_POLICY=z_only 時，增益相關特徵（E/RMS/EnvRMS/Peak/EnvMean/EnvStd）只用 z_ 版本；理由是現場只重建 baseline、不重訓
 
 不可進模型的特徵（保留在完整特徵表，原因記錄在 model_excluded_features.csv）：
 
@@ -390,8 +394,8 @@ FORCE_BAND_DISCOVERY = False
 # 實驗室 baseline 是 candidate → False；現場正式部署時改 True
 REQUIRE_FINAL_BASELINE = False
 
-# baseline 與 Step2 資料重複時：False 只警告（目前實驗室資料共用）；現場資料到位後改 True 直接停止
-STRICT_BASELINE_ISOLATION = False
+# baseline 與 Step2 資料重複時：True 直接停止（11/03 起 baseline 用獨立的正常 session）；舊資料流程測試才改 False
+STRICT_BASELINE_ISOLATION = True
 
 N_JOBS = 6              # 特徵計算的平行數（記憶體不足時調小）
 RUN_SOFT_QC = False     # Soft QC 報表只輸出 CSV 給人看，不影響任何篩選；需要檢查資料時再打開
@@ -406,6 +410,9 @@ RUN_PERMUTATION_TEST = False
 # ============================================================
 # 保留給最終模型推論的日期：Step2 完全不讀（選頻帶、選特徵也算訓練的一部分）
 RESERVED_TEST_DATES = []            # 例如 ["20261023"]；舊資料流程測試留空
+
+# 日期與標籤完全綁定（沒有任何一天同時有正常和洩漏）時：False 直接停止；舊資料流程測試才改 True
+ALLOW_DATE_LABEL_CONFOUND = False
 
 # 內容完全相同的重複檔案："error" 直接停止（新資料）；"drop_conflicts" 排除矛盾的副本（舊資料流程測試）
 DUPLICATE_POLICY = "drop_conflicts"
@@ -431,7 +438,15 @@ ANALYSIS_LEAK_LEVELS = sorted(TARGET_LEAK_LEVELS)  # [30]
 PRELIMINARY_BANDS_TO_KEEP = 25    # 第一輪：98 個候選頻帶先保留幾個
 TOP_BANDS_TO_KEEP = 12            # 第二輪（加入 temporal 後）：最後保留幾個
 MIN_FEATURE_FAMILY_COUNT = 2      # 每個頻帶至少要有幾個通道（ai0 / ai1 / diff）明顯支持
+# 注意：|d| 不看差異的絕對大小，要搭配下面的 MEDIAN_GAP_DRIFT_K
 SUPPORT_MIN_IMPORTANCE = 0.5      # 一個通道的 |Cohen's d| 至少多少，才算「支持」這個頻帶（0.5 = 中等效果）
+
+# 正常 vs 洩漏的中位數相對差異門檻（每個特徵各自一個門檻，由 dev 資料算出）：
+#   門檻 = max(MIN_MEDIAN_REL_GAP_FLOOR, MEDIAN_GAP_DRIFT_K × 正常漂移)
+#   正常漂移 = 各正常 session 中位數的標準差 ÷ 正常整體中位數（正常狀態自己在 session 之間會飄多少）
+# |d| 只看「差異 ÷ 標準差」，正常資料很穩定時，session 間的小漂移也能拿到高 |d|（例如 245～255k）
+MEDIAN_GAP_DRIFT_K = 3.0             # 洩漏偏移至少要是正常漂移的幾倍
+MIN_MEDIAN_REL_GAP_FLOOR = 0.005     # 下限：正常 session 太少或完全不漂移時（例如模擬資料）的保底值
 
 # 候選洩漏頻帶的上限頻率：取樣率 1 MHz 的奈奎斯特是 500 kHz，越接近越受抗混疊濾波器影響
 # 請依 nyquist_check 的結果調整
@@ -450,8 +465,23 @@ if PRELIMINARY_BANDS_TO_KEEP < TOP_BANDS_TO_KEEP:
 # ============================================================
 # 要建立 rel / z 的頻帶特徵種類。
 # E、RMS、EnvRMS 三者高度相關（RMS = √E），共線性篩選通常只會留一個；
-# 想加速可改成 ("E",)，想多一種不同角度可改成 ("E", "EnvStd")
+# Step2a 選頻帶排名用的指標（也是舊版 Step2b 建 rel / z 的指標）。
+# ⚠️ 改這裡會改變 Step2a 的頻帶排名；Step2b 要建 z_ 的指標改看下面的 SCALE_DEPENDENT_METRICS
 STEP2_EXPAND_SUFFIXES = ("E", "RMS", "EnvRMS")
+
+# 模型使用 baseline 衍生特徵的策略（部署假設：高壓實驗室訓練，現場只重建 site baseline、不重訓）
+#   "z_only"  ：會隨增益變化的特徵只允許 z_ 版本進模型 → 現場換 baseline 後，偏移和尺度都會校正
+#   "raw_only"：模型只用原始值，baseline 只給告警規則用 → 現場會整套重訓時用
+# 三種版本（X、rel_X、z_X）只差平移和縮放，對樹模型的區分力完全相同；
+# 差別只在現場換 baseline 時，模型輸入會不會跟著校正，所以要明確指定，不能交給名稱排序決定
+BASELINE_FEATURE_POLICY = "z_only"
+
+# 會隨感測器增益、安裝條件等比例放大縮小的指標（需要 baseline 校正）
+# Entropy、Flatness、Centroid、DomFreq、Shape*、frac_core、env_kurtosis 是比例或形狀，不受增益影響，維持 raw
+SCALE_DEPENDENT_METRICS = ("E", "RMS", "EnvRMS", "Peak", "EnvMean", "EnvStd")
+
+if BASELINE_FEATURE_POLICY not in ("z_only", "raw_only"):
+    raise ValueError(f"BASELINE_FEATURE_POLICY 只能是 z_only 或 raw_only：{BASELINE_FEATURE_POLICY}")
 
 TOP_K_CANDIDATES = 200        # 統計排名後，取前幾名進入模型重要性與共線性篩選
 CORR_THRESHOLD = 0.95         # 共線性門檻：相關係數超過這個值的兩個特徵只留一個
@@ -1319,6 +1349,67 @@ def infer_feature_family(feature_name):
     return match.group(1) if match else "other"
 
 
+# ============================================================
+# 中位數相對差異 vs 正常 session 間漂移：洩漏造成的偏移要明顯大於正常自己的漂移
+# ============================================================
+def add_median_gap_requirement(ranking_df, record_df, base_level=0, leak_level=None,
+                               k=MEDIAN_GAP_DRIFT_K, floor=MIN_MEDIAN_REL_GAP_FLOOR):
+    '''
+    排名表加三欄：
+      median_rel_gap   ：|median_洩漏 − median_正常| / |median_正常|
+      normal_drift     ：正常 session 間漂移（各 session 中位數的標準差 / 正常整體中位數）
+      required_rel_gap ：max(floor, k × normal_drift)，每個特徵各自的門檻
+    正常 session 少於 2 個時算不出漂移，門檻只用 floor，並提醒
+    '''
+    leak_level = leak_level if leak_level is not None else max(ANALYSIS_LEAK_LEVELS)
+    out = ranking_df.copy()
+    tiny = np.finfo(float).tiny
+
+    # 1. 正常 vs 洩漏的相對差異
+    m0 = pd.to_numeric(out[f"median_{int(base_level)}"], errors="coerce")
+    m1 = pd.to_numeric(out[f"median_{int(leak_level)}"], errors="coerce")
+    out["median_rel_gap"] = (m1 - m0).abs() / m0.abs().clip(lower=tiny)
+
+    # 2. 正常狀態在 session 之間自己會飄多少
+    feats = [f for f in out["feature"] if f in record_df.columns]
+    normal = record_df[record_df["leak_quantity"] == base_level]
+    n_sess = normal["session_id"].nunique() if "session_id" in normal.columns else 0
+    if n_sess >= 2:
+        per_sess = normal.groupby("session_id")[feats].median()                 # 每個正常 session 的中位數
+        drift = per_sess.std(ddof=1) / normal[feats].median().abs().clip(lower=tiny)
+        out["normal_drift"] = out["feature"].map(drift)
+    else:
+        print(f"⚠️ 正常資料只有 {n_sess} 個 session，算不出 session 間漂移，門檻只用下限 {floor:.1%}")
+        out["normal_drift"] = np.nan
+
+    # 3. 每個特徵的門檻
+    out["required_rel_gap"] = np.maximum(floor, k * out["normal_drift"].fillna(0.0))
+    print(f"ℹ️ 正常 session 數 {n_sess}；正常漂移中位數 {out['normal_drift'].median():.2%}，"
+          f"門檻中位數 {out['required_rel_gap'].median():.2%}")
+    return out
+
+
+def apply_median_gap_filter(feature_importance_df, ranking_df):
+    '''
+    相對差異沒超過自己門檻的特徵，重要性設為 0（不刪，頻帶仍出現在彙整表，只是不算支持）。
+    回傳 (處理後的重要性表, 每個頻帶的診斷表)
+    診斷表每個頻帶取 gap_margin（= 相對差異 / 門檻）最大的那個特徵，> 1 才算通過
+    '''
+    info = ranking_df.set_index("feature")[["median_rel_gap", "required_rel_gap", "normal_drift"]]
+    out = feature_importance_df.merge(info, left_on="feature", right_index=True, how="left")
+    weak = ~(out["median_rel_gap"] >= out["required_rel_gap"])          # NaN 也算不通過
+    out.loc[weak, "importance"] = 0.0
+    print(f"ℹ️ 中位數偏移沒超過「K × 正常漂移」的特徵：{int(weak.sum())} / {len(out)} 個，不算支持")
+
+    out["band_name"] = out["feature"].map(infer_band_name_from_feature)
+    out["gap_margin"] = out["median_rel_gap"] / out["required_rel_gap"]
+    band_diag = (out.sort_values("gap_margin", ascending=False)
+                    .groupby("band_name")
+                    .first()[["median_rel_gap", "required_rel_gap", "normal_drift", "gap_margin"]]
+                    .add_prefix("best_"))
+    return out[["feature", "importance"]], band_diag
+
+
 # ==========================
 # 從特徵重要性彙整成頻帶分數
 # ==========================
@@ -1818,6 +1909,7 @@ def run_band_discovery_stage(
             "leak_quantity": r["meta"]["leak_quantity"],
             "distance_cm": int(round(r["meta"]["distance"] * 100)),
             "pressure": r["meta"]["pressure"],
+            "session_id": r.get("session_id", ""),
         }
         for r in records_dev
     ]).drop_duplicates(subset=["record_id"])
@@ -1857,13 +1949,28 @@ def run_band_discovery_stage(
 
     # 特徵排名：score = |Cohen's d|（正常 vs 洩漏）,每個特徵算「正常 vs 洩漏」的區分力（|Cohen’s d|），存成 feature_importance_first_pass.csv
     first_pass_ranking_df = rank_features_for_leak_levels(first_pass_record_df, target_levels=tuple(ANALYSIS_LEVELS))
+    # 每個特徵的中位數差異 vs 自己的門檻（K × 正常 session 漂移），一起存檔方便檢查
+    first_pass_ranking_df = add_median_gap_requirement(first_pass_ranking_df, first_pass_record_df)
     first_pass_ranking_df.to_csv(output_dir / "feature_importance_first_pass.csv", index=False, encoding="utf-8-sig")
     first_pass_feature_importance_df = build_feature_importance_table(first_pass_ranking_df, importance_col="score")
-
+    first_pass_feature_importance_df, first_pass_band_diag = apply_median_gap_filter(
+        first_pass_feature_importance_df, first_pass_ranking_df)
+    
     # 彙整成頻帶分數；至少 MIN_FEATURE_FAMILY_COUNT 個通道明顯支持才保留
     first_pass_band_summary_df = summarize_feature_importance_by_band(
         first_pass_feature_importance_df, discovery_bands=discovery_bands,
     )
+    # 補上每個頻帶的診斷欄（best_median_rel_gap / best_required_rel_gap / best_normal_drift / best_gap_margin）
+    first_pass_band_summary_df = first_pass_band_summary_df.merge(
+        first_pass_band_diag, left_on="band_name", right_index=True, how="left")
+    
+    # 診斷：分數最高的頻帶，偏移是不是明顯超過正常漂移（best_gap_margin > 1 才算）
+    print("\n分數前 15 名頻帶的中位數偏移 vs 門檻：")
+    print(first_pass_band_summary_df.sort_values("band_score", ascending=False)
+          [["band_name", "band_score", "supported_family_count",
+            "best_median_rel_gap", "best_required_rel_gap", "best_gap_margin"]]
+          .head(15).round(4).to_string(index=False))
+
     first_pass_band_summary_df = first_pass_band_summary_df[
         first_pass_band_summary_df["supported_family_count"] >= MIN_FEATURE_FAMILY_COUNT
     ].copy().reset_index(drop=True)
@@ -1881,6 +1988,7 @@ def run_band_discovery_stage(
     # ============================================================
     # 開關打開：取第一輪前 PRELIMINARY_BANDS_TO_KEEP 名，加上跨窗特徵（delta / local / rolling）重新排名（很慢，純資料上跨窗特徵接近 0）
     if BUILD_CROSS_WINDOW_FEATURES:
+        
         # 從第一輪挑出初選頻帶(取前 25 名)
         preliminary_bands = [
             band_lookup[name]
@@ -1919,11 +2027,14 @@ def run_band_discovery_stage(
         
         # 重新排名特徵
         ranking_df = rank_features_for_leak_levels(record_df, target_levels=tuple(ANALYSIS_LEVELS))
+        ranking_df = add_median_gap_requirement(ranking_df, record_df)
         ranking_df.to_csv(output_dir / "feature_importance_summary.csv", index=False, encoding="utf-8-sig")
         feature_importance_df = build_feature_importance_table(ranking_df, importance_col="score")
+        feature_importance_df, band_diag = apply_median_gap_filter(feature_importance_df, ranking_df)
 
         # 彙整成頻帶分數並篩選
         band_summary_df = summarize_feature_importance_by_band(feature_importance_df, discovery_bands=preliminary_bands)
+        band_summary_df = band_summary_df.merge(band_diag, left_on="band_name", right_index=True, how="left")
         band_summary_df = band_summary_df[
             band_summary_df["supported_family_count"] >= MIN_FEATURE_FAMILY_COUNT
         ].copy().reset_index(drop=True)
@@ -1992,7 +2103,8 @@ def run_band_discovery_stage(
         leak_focused_bands=selected_bands,
         resonance_bands=resonance_bands,
         offband_bands=OFFBAND_BANDS,                                  # 自動帶入 shared 定義的 offband
-        temporal_band_names={b["name"] for b in selected_bands},       # 洩漏頻帶算單一視窗內的時間結構特徵
+        temporal_band_names=set(),      # 單窗時間結構特徵（cusum_peak / burst）runtime 抽取器算不出來，Step2 一律判 not_runtime；
+                                        # 先不算，等 shared 的 runtime 抽取器支援後再填回 {b["name"] for b in selected_bands}
         source_note="step2_band_discovery_with_resonance",
         schema_status="candidate",
     )
@@ -2619,8 +2731,12 @@ def remove_collinear_features(
     # 相關係數矩陣只算一次，取絕對值（正相關、負相關一樣算「太像」）
     corr = X[numeric_cols].corr(method=method).abs()
 
-    # 依分數由高到低排序；同分時依名稱排序，確保每次結果一致
-    order = sorted(numeric_cols, key=lambda f: (-cohen_dict.get(f, 0.0), f))
+    # 依分數由高到低排序。X、rel_X、z_X 的分數只差浮點誤差（平移縮放不改變 |d| 與排序），
+    # 先四捨五入，同分時依偏好 z_ > raw > rel_，不再讓名稱字母順序決定留哪個版本
+    # （Step 9 照 BASELINE_FEATURE_POLICY 篩過的話不會遇到；這裡是保險）
+    def _variant_rank(f):
+        return 0 if f.startswith("z_") else (2 if f.startswith("rel_") else 1)
+    order = sorted(numeric_cols, key=lambda f: (-round(cohen_dict.get(f, 0.0), 9), _variant_rank(f), f))
 
     kept, dropped_features, corr_pairs_history = [], [], []
     for feat in order:
@@ -2915,12 +3031,30 @@ def select_model_features(
             "model_importance_rank": [model_norm[f] for f in survivors],    # 模型重要性的排名百分比
             "combined_score": [combined[f] for f in survivors],             # 最終排序依據
         }).sort_values("combined_score", ascending=False).reset_index(drop=True)
+        
+        # 模型重要性 > 0：打亂它 AUC 會掉 → 保留
+        # 模型重要性 = 0：打亂它 AUC 不變（模型已飽和、或資訊被其他特徵涵蓋，不代表沒用）
+        #                → 只在不足 MIN_FINAL_FEATURES 時，依 combined_score 補
+        # 模型重要性 < 0：打亂它 AUC 反而變好 → 視為雜訊，一律不補
+        tol = 1e-12
+        positive = final_df[final_df["model_importance"] > tol]
+        zero = final_df[final_df["model_importance"].abs() <= tol]
+        n_fill = min(max(0, MIN_FINAL_FEATURES - len(positive)), len(zero))
+        filled = zero.head(n_fill)                 # final_df 已依 combined_score 排序，head 就是分數最高的
+        keep = final_df[final_df["feature"].isin(set(positive["feature"]) | set(filled["feature"]))].copy()
+        keep["filled_by_min_features"] = keep["feature"].isin(filled["feature"])   # 報表看得出哪些是補進來的
+        n_drop = len(final_df) - len(keep)
+        n_negative = int((final_df["model_importance"] < -tol).sum())
+        final_df = keep.reset_index(drop=True)
 
     # 印出每一步剩下多少特徵，方便確認哪一步刪掉最多
     if verbose:
         print(f"\n✅ 選特徵完成：可用 {len(feature_cols)} → 方向一致 {len(rank_df)} → "
               f"前 {len(candidates)} 名 → 去共線性後 {len(survivors)} 個"
               + ("（含跨天穩定性）" if use_date else "（無跨天資料，未納入跨天穩定性）"))
+        # 模型重要性篩選後，至少保留幾個特徵（依綜合排序補足）
+        print(f"   模型重要性 > 0：{len(final_df) - n_fill} 個；= 0 補入 {n_fill} 個（至少 {MIN_FINAL_FEATURES}）；"
+              f"剔除 {n_drop} 個（其中 < 0 的 {n_negative} 個一律不補）；最終 {len(final_df)} 個")
 
     return {
         "selected_features": final_df["feature"].tolist(),   # 最終特徵（依重要性排序）
@@ -3545,6 +3679,8 @@ def save_feature_config_json(
         "target_levels": sorted(target_levels),
         "top_k_candidates": top_k_candidates,
         "corr_threshold": corr_threshold,
+        "baseline_feature_policy": BASELINE_FEATURE_POLICY,          # z_only / raw_only：模型怎麼用 baseline 衍生特徵
+        "scale_dependent_metrics": list(SCALE_DEPENDENT_METRICS),    # 哪些指標被視為會隨增益變化
         "model_excluded_prefixes": list(MODEL_EXCLUDED_PREFIXES),    # 不進模型的跨窗特徵前綴
         "build_cross_window_features": BUILD_CROSS_WINDOW_FEATURES,  # 這次有沒有算跨窗特徵
         # 要算「單一視窗內」時間結構特徵的頻帶（和跨窗特徵無關）
@@ -3644,7 +3780,7 @@ Step 4. 以場次為單位切分 dev / holdout
 Step 5. dev-only EDA（預設關閉）
 Step 6～7. 正式特徵工程、套固定 baseline（跨窗特徵預設不算）
 Step 8. record-level 診斷、抗干擾假設檢查
-Step 9. 建立可進模型的特徵清單（排除 offband、跨窗、距離高風險、runtime 不支援）
+Step 9. 建立可進模型的特徵清單（排除 offband、跨窗、距離高風險、baseline 版本不符策略、runtime 不支援）
 Step 10. 正式選特徵（select_model_features）
 Step 11～12. 最終特徵的分布與距離摘要
 Step 13～15. reference CV、fold-wise CV（主要指標）、LODO（每輪重新選特徵）
@@ -3804,9 +3940,12 @@ if __name__ == "__main__":
     
     n_mixed_days = int(((date_label_df[0] > 0) & (date_label_df[1] > 0)).sum())
     if n_mixed_days == 0:
+        msg = ("沒有任何一天同時錄了正常和洩漏：日期與標籤完全綁在一起。\n"
+               "   選出的頻帶與特徵可能是在分辨「哪天錄的」，結果只能當流程測試，不能定案。")
+        if not ALLOW_DATE_LABEL_CONFOUND:
+            raise ValueError(msg + "\n   舊資料流程測試要繼續跑，請把 ALLOW_DATE_LABEL_CONFOUND 改成 True")
         print("\n" + "!" * 60)
-        print("⚠️ 沒有任何一天同時錄了正常和洩漏：日期與標籤完全綁在一起。")
-        print("   選出的頻帶與特徵可能是在分辨「哪天錄的」，結果只能當流程測試，不能定案。")
+        print("⚠️ " + msg)
         print("!" * 60)
     elif n_mixed_days < len(date_label_df):
         print(f"ℹ️ {len(date_label_df)} 天中有 {n_mixed_days} 天同時有正常和洩漏，其餘只有一種類別")
@@ -4232,9 +4371,13 @@ if __name__ == "__main__":
 
     # ============================================================
     # Step 7.3. 要套固定 baseline 的原始特徵
-    # 每個正式頻帶 × 通道（ai0 / ai1 / diff）× 指標（STEP2_EXPAND_SUFFIXES，預設 E / RMS / EnvRMS）
+    # 每個正式頻帶 × 通道（ai0 / ai1 / diff）× 指標（指標依 BASELINE_FEATURE_POLICY 決定）
     # ============================================================
-    expand_base_feature_cols = select_step2_expand_base_features(df=df_dev, bands=final_main_bands)
+    # z_only：所有增益相關指標都要有 z_ 版本可選（Peak / EnvMean / EnvStd 原本沒有）
+    # raw_only：rel_ / z_ 不進模型，沿用原本的指標即可（仍要建，供分析與比對）
+    expand_suffixes = SCALE_DEPENDENT_METRICS if BASELINE_FEATURE_POLICY == "z_only" else STEP2_EXPAND_SUFFIXES
+    expand_base_feature_cols = select_step2_expand_base_features(
+        df=df_dev, bands=final_main_bands, suffixes=expand_suffixes)
     print(f"\n套用 baseline 的原始特徵數量 = {len(expand_base_feature_cols)}")
 
     # ============================================================
@@ -4322,6 +4465,11 @@ if __name__ == "__main__":
                 return feature_name[len(prefix):]
         return feature_name
 
+    def _is_scale_dependent(base):
+        """名稱格式 {頻帶}_{ai0|ai1|diff}_{指標}，而且指標會隨增益變化"""
+        return any(base.endswith(f"_{ch}_{m}")
+                   for ch in ("ai0", "ai1", "diff") for m in SCALE_DEPENDENT_METRICS)
+    
     # runtime 特徵抽取器算不算得出來
     # 同一個原始特徵只檢查一次（X、rel_X、z_X 共用結果），存在 _runtime_ok_cache 裡
     _runtime_ok_cache = {}
@@ -4354,6 +4502,11 @@ if __name__ == "__main__":
             reason = "cross_window（跨窗特徵，時間特性由後規則處理）"
         elif _base_name(c) in DROP_DISTANCE_SENSITIVE:
             reason = "distance_risk（已知距離高風險）"
+        elif (BASELINE_FEATURE_POLICY == "z_only"
+              and _is_scale_dependent(_base_name(c)) and not c.startswith("z_")):
+            reason = "baseline_variant（增益相關特徵只用 z_ 版本）"
+        elif BASELINE_FEATURE_POLICY == "raw_only" and c.startswith(("rel_", "z_")):
+            reason = "baseline_variant（模型只用原始值）"
         elif not _runtime_ok(c):
             reason = "not_runtime（runtime 特徵抽取器算不出來）"
         else:
@@ -4583,6 +4736,16 @@ if __name__ == "__main__":
     print("\n=== Holdout 評估 ===")
     print(classification_report(y_holdout, y_holdout_pred, digits=3, zero_division=0))
     print(f"Holdout AUC = {holdout_auc:.4f}")
+    
+    
+    # file-level（每支檔案取平均機率）：同一支檔的 7 個窗高度相關，不是 7 個獨立樣本 → 以這個為主要指標
+    file_eval = (pd.DataFrame({"record_id": df_holdout["record_id"].to_numpy(),
+                               "y": np.asarray(y_holdout), "p": y_holdout_prob})
+                 .groupby("record_id").agg(y=("y", "first"), p=("p", "mean")))
+    file_auc = _safe_auc(file_eval["y"], file_eval["p"])
+    print("\n=== Holdout 評估（file-level，每支檔案平均機率；主要指標）===")
+    print(classification_report(file_eval["y"], (file_eval["p"] >= 0.5).astype(int), digits=3, zero_division=0))
+    print(f"Holdout file-level AUC = {file_auc:.4f}（{len(file_eval)} 支檔）")
 
     # 依距離、洩漏量、場次分組，各輸出一張表：每組的誤報率、偵測率、F1、AUC
     # 會自動標出誤報最高、偵測最低的組別（現場最可能出問題的條件）
