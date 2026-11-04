@@ -90,7 +90,7 @@ GRID_STRIDE = 5_000
 #   - 共振程式用它決定哪些格子固定不納入
 # ======================================
 OFFBAND_BANDS = [
-    {"name": "off_010_020k", "f_low": 10_000, "f_high": 20_000},
+    {"name": "off_015_020k", "f_low": 15_000, "f_high": 20_000},
     {"name": "off_050_060k", "f_low": 50_000, "f_high": 60_000},
     {"name": "off_210_220k", "f_low": 210_000, "f_high": 220_000},
     {"name": "off_315_325k", "f_low": 315_000, "f_high": 325_000},
@@ -202,6 +202,7 @@ def load_band_config(
         *,
         expected_status=None,
         require_offband=False,     # 正式流程（final）設 True：offband 不可為空
+        fs=FS,                     # 取樣率：用來檢查每個頻帶的 f_high 都低於 Nyquist（fs/2）
     ):
     """
     讀取並驗證 band config。
@@ -258,6 +259,9 @@ def load_band_config(
             continue
         if not (0 < lo < hi):
             problems.append(f"{name}：上下界不合理（f_low={lo}, f_high={hi}）")
+        elif hi >= 0.5 * fs:
+            # f_high 碰到或超過 Nyquist：濾波器做不出來，bandpass_filter 也不會偷改上限，所以在讀設定時就擋下
+            problems.append(f"{name}：f_high={hi} 已達 Nyquist（fs/2={0.5 * fs}），請改小於 {0.5 * fs}")
 
     names = [str(b.get("name")) for b in all_bands if b.get("name")]
     # 檢查頻帶名稱是否重複
@@ -297,14 +301,16 @@ def load_band_config(
 def generate_sliding_bands(f_min=5_000,        # 從 5 kHz 開始掃
                            f_max=500_000,      # 最多掃到 500 kHz
                            band_width=10_000,  # 每一段 band 寬度 10 kHz
-                           stride=5_000):      # 每次往前滑 5 kHz
+                           stride=5_000,       # 每次往前滑 5 kHz
+                           fs=FS):             # 取樣率：上界必須低於 Nyquist（fs/2）
     # 儲存所有候選頻帶
     bands = []
     cur = f_min    # 目前掃描到的起始頻率
     idx = 1        # 候選頻帶編號，從 1 開始
     
-    # 只要目前這段 band 還沒超出上限，就持續往前滑動
-    while cur + band_width <= f_max:
+    # 只要目前這段 band 還沒超出上限，就持續往前滑動；上界也不可碰到 Nyquist（fs/2），否則濾波器做不出來
+    # （1 MHz 時 490–500k 這格的上界剛好等於 Nyquist，會被 load_band_config 擋下，所以在產生時就不放）
+    while cur + band_width <= f_max and cur + band_width < 0.5 * fs:
         # 把這一段 band 用字典的形式加到 bands 裡
         bands.append({
             # scan：代表這是 sliding scan 產生的候選 band
@@ -603,12 +609,9 @@ def load_one_tdms_record(
     # 用檔名去解析 metadata
     meta = parse_filename(filepath.name)
     
-    # 兩聲道長度應該相同；不同時截成一樣長，並提示（可能是擷取時某個聲道掉資料）
-    n = min(len(ai0), len(ai1))
+    # 兩聲道長度必須相同；不同直接報錯，不截短（可能是擷取時某個聲道掉資料，截短會讓兩聲道時間錯位）
     if len(ai0) != len(ai1):
-        print(f"⚠️ {filepath.name}：ai0 與 ai1 長度不同（{len(ai0)} / {len(ai1)}），已截成 {n} 點")
-    ai0 = ai0[:n]
-    ai1 = ai1[:n]
+        raise ValueError(f"{filepath.name}：ai0 與 ai1 長度不同（{len(ai0)} / {len(ai1)}），可能擷取時某個聲道掉資料")
     
     # 如果有啟用 REMOVE_DC，就先把每個聲道做去直流
     if REMOVE_DC:
@@ -885,6 +888,17 @@ def load_segment_record(
     ai1 = np.concatenate(parts_ai1)
     del parts_ai0, parts_ai1
     diff = ai1 - ai0
+
+    # 同一段的每支檔，檔名解析出的距離 / 壓力要一致（只用第一支檔的 metadata，不一致代表段切錯或檔名打錯）
+    first_meta = parse_filename(Path(filepaths[0]).name)
+    for fp in filepaths[1:]:
+        m = parse_filename(Path(fp).name)
+        if (m["distance"], m["pressure"]) != (first_meta["distance"], first_meta["pressure"]):
+            raise ValueError(
+                f"{segment_spec['record_id']}：段內檔名條件不一致 "
+                f"{Path(filepaths[0]).name}（{first_meta['distance']} m, {first_meta['pressure']} bar） vs "
+                f"{Path(fp).name}（{m['distance']} m, {m['pressure']} bar）"
+            )
 
     first_name = Path(filepaths[0]).name
     return {
@@ -1196,6 +1210,14 @@ def load_or_compute_features(
     target_levels=None,  # 這次分析的 leak levels
     feature_version="v2_global_dc",   # 這版特徵工程的版本名字
 ):
+    # 舊版入口：cache hash 有記 window / hop / nperseg / feature_version，
+    # 但實際計算的 _extract_features_parallel 沒收到這些參數（用的是全域預設值，且是舊的 global DC），
+    # cache 名稱和實際計算條件可能不一致。正式流程一律改用 extract_window_features_core_bands。
+    raise RuntimeError(
+        "load_or_compute_features() 已停用（v2_global_dc 舊流程，參數沒有傳到實際計算）；"
+        "請改用 extract_window_features_core_bands()"
+    )
+    
     # 把 cache_dir 轉成 Path 物件, 如果資料夾不存在，就先建立
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1345,7 +1367,7 @@ def parse_filename(filename):
             
     #  -------  壓力  -------
     pressure = 0.0
-    pressure_match = re.search(r'(\d+)\s*bar', filename_lower)
+    pressure_match = re.search(r'(\d+(?:\.\d+)?)\s*bar', filename_lower)     # 支援小數，例如 0.3bar、4bar
     if pressure_match:
         pressure = float(pressure_match.group(1))
         
@@ -1380,9 +1402,9 @@ def compute_diff_signal(records):
         ai0 = np.asarray(r["signal"]["ai0"])
         ai1 = np.asarray(r["signal"]["ai1"])
         
-        n = min(len(ai0), len(ai1))   # 預防兩的通道訊號長度不同，以短的為主，方便對齊
-        ai0 = ai0[:n]
-        ai1 = ai1[:n]
+        # 兩聲道長度不同直接報錯，不截短（截短會讓兩聲道時間錯位，diff 失真）
+        if len(ai0) != len(ai1):
+            raise ValueError(f"compute_diff_signal：{r.get('filename', r.get('record_id'))} 的 ai0 / ai1 長度不同（{len(ai0)} / {len(ai1)}）")
         
         if REMOVE_DC:
             ai0 = ai0 - np.mean(ai0)
@@ -2470,12 +2492,12 @@ def bandpass_filter(signal, fs, lowcut= 200_000, highcut= 450_000, order=4):    
     signal = np.asarray(signal, dtype=np.float64)    
 
     nyq = 0.5 * fs    # 若fs=1_000_000,最高安全分析道500kHz
-    # 設定 Nyquist 保護,避免高截止頻率碰到 Nyquist
-    highcut = min(highcut, nyq * 0.999) 
-    
-    # 避免頻率設定不合法時直接炸掉
-    if lowcut <= 0 or highcut <= 0 or lowcut >= highcut:
-        return signal
+    # 頻帶不合法或碰到 Nyquist 直接報錯：不偷改 highcut，也不回傳沒濾波的原訊號
+    # （之前會把 highcut 壓到 0.999*Nyquist、或 lowcut<=0 時直接回傳原訊號，特徵會算在錯的頻帶上而沒有任何提示）
+    if not (0 < lowcut < highcut < nyq):
+        raise ValueError(
+            f"bandpass_filter：頻帶不合法（lowcut={lowcut}, highcut={highcut}, Nyquist={nyq}）；請修正 band config"
+        )
     
     # 避免 window 太短時 sosfiltfilt 不穩或報錯
     if len(signal) < order * 30:
@@ -2530,8 +2552,10 @@ def build_offband_summary_features(df, band_config):
         for b in bands:
             for ch in ("ai0", "ai1"):
                 col = f"{b['name']}_{ch}_E"
-                if col in df.columns:
-                    cols.append(col)
+                if col not in df.columns:
+                    # band config 有這個頻帶，特徵表卻沒有對應能量欄位：直接報錯，不默默少算一個頻帶
+                    raise ValueError(f"build_offband_summary_features：特徵表缺少 {col}（band config 有 {b['name']}）")
+                cols.append(col)
         return cols
 
     # 找出 offband 頻帶的能量欄位
@@ -2615,7 +2639,11 @@ def add_cusum_features(
     
         # 取出這個特徵在同一個 record 裡的時間序列
         for feat in input_feature_cols:
-            x = sub[feat].fillna(0.0).values      # 把缺值補成 0，轉成陣列方便運算
+            x = pd.to_numeric(sub[feat], errors="coerce").to_numpy(dtype=float)
+            # 不補 0：輸入有 NaN / Inf 直接報錯（補 0 會讓 CUSUM 把缺值當成「正常」，偏移被吞掉）
+            if not np.isfinite(x).all():
+                raise ValueError(f"add_cusum_features：{record_id} 的 {feat} 有 NaN / Inf，請先查上游特徵")
+            
             # 建立兩條累積序列
             s_pos = np.zeros(len(x), dtype=float)   # 記錄正向與負向的累積量
             s_neg = np.zeros(len(x), dtype=float)
@@ -3138,6 +3166,16 @@ def apply_fixed_normal_baseline(
 
         # 真正計算 rel_* 跟 z_*
         values = pd.to_numeric(out[feature_name],errors="coerce",)
+        
+        # raw 特徵有 NaN / Inf（或不是數字被 coerce 成 NaN）直接報錯，不要讓 rel_ / z_ / CUSUM 帶著缺值往下走
+        bad_mask = ~np.isfinite(values.to_numpy(dtype=float))
+        if bad_mask.any():
+            bad_rows = out.loc[bad_mask, [c for c in ("record_id", "t_start") if c in out.columns]].head(5)
+            raise ValueError(
+                f"raw 特徵 {feature_name} 有 {int(bad_mask.sum())} 個窗是 NaN / Inf；"
+                f"請先查這些窗的訊號品質，不要補 0。前幾筆：\n{bad_rows.to_string(index=False)}"
+            )
+        
         out[f"rel_{feature_name}"] = (values - mean_value)               # rel_* 是原始值減掉 baseline 的平均值（絕對偏移量,單位跟原始特徵一樣）
         out[f"z_{feature_name}"] = (values - mean_value) / std_value     # z_* 是再除以 baseline 的標準差（標準化偏移量,單位變成「偏離幾個標準差」
    
