@@ -1429,6 +1429,24 @@ def remove_dc(ai0: np.ndarray, ai1: np.ndarray):
 
 
 # =======================================
+# 秒數 → 樣本點數（離線切窗與 runtime 串流共用，兩邊只能用這一個）
+# =======================================
+def seconds_to_samples(sec, fs, name="sec"):
+    """
+    把秒數換成整數樣本點數。
+    必須剛好是整數個樣本（容許浮點誤差 1e-6 點），否則直接報錯，不默默 int() 截掉或四捨五入。
+    例：fs=1_000_000、0.2 秒 → 200000；0.05 秒 → 50000。
+    """
+    n_float = float(sec) * float(fs)
+    n = int(round(n_float))
+    if n <= 0:
+        raise ValueError(f"{name}={sec} 秒換成樣本點數後 <= 0（fs={fs}）")
+    if abs(n_float - n) > 1e-6:
+        raise ValueError(f"{name}={sec} 秒 × fs={fs} = {n_float} 點，不是整數個樣本；請改成整數點數對應的秒數")
+    return n
+
+
+# =======================================
 # sliding window
 # =======================================
 # 將一個 tdms 檔案切成小視窗 window slide
@@ -1451,9 +1469,9 @@ def sliding_window_records(records, fs=1_000_000, window_sec=0.2, hop_sec=0.05):
             f"實際範圍: {fs_values.min():.2f} ~ {fs_values.max():.2f} Hz"
         )
     
-    # 把秒轉成樣本點數(每個window有20萬點,每次往前移5萬點)
-    window_size = int(fs * window_sec)     # 每個 window_sec = 0.2 秒,若 fs=1,000,000，那就代表每個window有20萬點
-    hop_size    = int(fs * hop_sec)        # 75% overlap,優點：時間解析度高,leak onset 比較容易抓到,probability stream 會更平滑細緻
+    # 把秒轉成樣本點數(每個window有20萬點,每次往前移5萬點)；和 runtime 串流共用同一個換算規則
+    window_size = seconds_to_samples(window_sec, fs, "window_sec")     # 每個 window_sec = 0.2 秒,若 fs=1,000,000，那就代表每個window有20萬點
+    hop_size    = seconds_to_samples(hop_sec, fs, "hop_sec")           # 75% overlap,優點：時間解析度高,leak onset 比較容易抓到,probability stream 會更平滑細緻
 
     windowed = []
     for r in records:
