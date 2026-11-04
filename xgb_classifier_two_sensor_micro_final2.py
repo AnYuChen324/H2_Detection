@@ -58,7 +58,7 @@ import json
 import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
-from sklearn.model_selection import GroupShuffleSplit, GroupKFold, RandomizedSearchCV
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold, RandomizedSearchCV
 from sklearn.metrics import (
     f1_score, accuracy_score, precision_score, recall_score,
     classification_report
@@ -110,6 +110,16 @@ def load_feature_config(feature_config_path):
 
     if duplicate_features:
         raise ValueError(f"selected_feature_names 出現重複特徵：{duplicate_features}")
+        
+    
+    # metadata 不可當模型特徵（標籤、分組 ID、實驗條件會讓模型作弊或在現場拿不到）
+    METADATA_COLUMNS = {
+        "label", "session_id", "record_id", "split", "t_start", "t_ref",
+        "distance_cm", "pressure_bar", "leak_quantity", "volume_ml", "onset_gt_sec",
+    }
+    leaked_metadata = sorted(set(feature_cols) & METADATA_COLUMNS)
+    if leaked_metadata:
+        raise ValueError(f"selected_feature_names 混入 metadata 欄位：{leaked_metadata}")
 
     execution_plan = cfg.get("feature_execution_plan")
 
@@ -644,10 +654,17 @@ def fit_xgb_final(X_train,                    # 訓練特徵,注意這裡還帶�
     if optimize_params:     # 如果選擇要超參數搜尋
         print("🔍 XGBoost RandomizedSearchCV ...")
         
-        # 3 折交叉驗證，以 session 分組；session 不足 3 個時 GroupKFold 會直接報錯
+        # 3 折交叉驗證，以 session 分組，並讓每折的正常 / 洩漏比例盡量接近（StratifiedGroupKFold）
+        # 干擾 session 全是 0：GroupKFold 可能把某折分成只有干擾 session，該折只有一類，balanced accuracy 會失真
         if groups_sub.nunique() < 3:
-            raise ValueError(f"sub-train 只有 {groups_sub.nunique()} 個 session，不足以做 3 折 GroupKFold")
-        gkf = GroupKFold(n_splits=3)
+            raise ValueError(f"sub-train 只有 {groups_sub.nunique()} 個 session，不足以做 3 折交叉驗證")
+        sgkf = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=42)
+        cv_splits = list(sgkf.split(X_train_sub, y_train_sub, groups_sub))   # 先轉成 list：新版 sklearn 平行運算時不能傳 generator
+        # 每一折的 train / validation 都必須同時有 0 和 1
+        for k, (tr_idx, va_idx) in enumerate(cv_splits, start=1):
+            for part, idx in (("train", tr_idx), ("validation", va_idx)):
+                if len(np.unique(y_train_sub[idx])) < 2:
+                    raise ValueError(f"CV 第 {k} 折的 {part} 只有一類 label；session 太少或正常 / 洩漏分布太不平均")
         
         # 設定超參數候選搜尋空間
         param_grid = {
@@ -663,7 +680,7 @@ def fit_xgb_final(X_train,                    # 訓練特徵,注意這裡還帶�
             base_model,
             param_distributions=param_grid,            # 剛剛定義的搜尋空間
             n_iter=10,                                 # 隨機試 10 組參數
-            cv=list(gkf.split(X_train_sub, y_train_sub, groups_sub)),   # 先轉成 list：新版 sklearn 平行運算時不能傳 generator 
+            cv=cv_splits,                              # 已檢查每折兩類都有
             scoring="balanced_accuracy",    # 以 balanced accuracy 當選參數依據
             random_state=42,
             n_jobs=-1,
@@ -1105,12 +1122,21 @@ def run_xgb_training_and_save(
     for name, df_h in (("transition_holdout", df_transition_holdout),
                        ("disturbance_holdout", df_disturbance_holdout)):
         if "session_id" not in df_h.columns:
-            print(f"⚠️ {name} 沒有 session_id 欄，略過 session 重疊檢查")
-            continue
+            # 沒有 session_id 就無法證明 holdout 和訓練資料沒有重複 → 直接停止
+            raise ValueError(f"{name} 缺少 session_id，無法做 session 隔離檢查；請用目前的切分程式重新輸出")
         overlap = dev_sessions & _sessions(df_h)
         if overlap:
             raise ValueError(f"dev / {name} 出現重複 session_id：{sorted(overlap)[:20]}")
     print("✅ dev 與兩份 holdout 沒有 session 重疊")
+    
+    
+    # 兩份 holdout 彼此也不能重疊（同一個 session 不能同時出現在轉換和干擾的 holdout）
+    for col in ("session_id", "record_id"):
+        both = (set(df_transition_holdout[col].dropna().astype(str))
+                & set(df_disturbance_holdout[col].dropna().astype(str)))
+        if both:
+            raise ValueError(f"transition_holdout / disturbance_holdout 出現重複 {col}：{sorted(both)[:20]}")
+    print("✅ 兩份 holdout 彼此沒有 session / record 重疊")
     
     # ========================================================
     # 3. 補 volume_ml
