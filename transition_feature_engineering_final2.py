@@ -254,7 +254,11 @@ def check_content_duplicates(file_specs, baseline_paths, strict=True):
             baseline_hits.append((Path(bp).stem, seen[h]))
 
     if missing_baseline:
-        print(f"⚠️ baseline 來源檔有 {missing_baseline} 支找不到，這些無法比對內容")
+        msg = f"baseline 來源檔有 {missing_baseline} 支找不到，這些無法比對內容"
+        if strict:
+            raise FileNotFoundError(msg + "（嚴格模式：無法確認資料隔離就停止）")
+        print("⚠️ " + msg)
+        
     # 資料完整性檢查通過:沒有任何內部重複，也沒有撞到 baseline
     if not dup_pairs and not baseline_hits:
         print(f"✅ 內容重複檢查通過：{len(seen)} 支 transition 彼此不重複，也沒有跟 baseline 檔內容相同")
@@ -720,10 +724,12 @@ def build_inference_feature_csv(
     bad_order = df_meta[(df_meta["normal_end_sec"] < 0) | (df_meta["normal_end_sec"] > df_meta["leak_start_sec"])]
     if not bad_order.empty:
         raise ValueError(f"normal_end_sec 必須 ≤ leak_start_sec：{bad_order['record_id'].tolist()[:10]}")
-    # onset 在兩者之間（只警告）
+    
+    # onset 必須在 normal_end ~ leak_start 之間：不在代表標註錯了，後面整段的 0 / 1 / 灰區都會跟著錯 → 直接停止
+    # （segments 模式的 normal_end / leak_start 是由 onset 往前後推灰區算出來的，一定成立；主要擋 merged_legacy 的 meta）
     odd_onset = df_meta[(df_meta["onset_gt_sec"] < df_meta["normal_end_sec"]) | (df_meta["onset_gt_sec"] > df_meta["leak_start_sec"])]
     if not odd_onset.empty:
-        print(f"⚠️ onset_gt_sec 不在 normal_end ~ leak_start 之間：{odd_onset['record_id'].tolist()[:10]}")
+        raise ValueError(f"onset_gt_sec 不在 normal_end ~ leak_start 之間（標註有誤）：{odd_onset['record_id'].tolist()[:10]}")
     
     # 讀 4 份正式設定
     # 用哪些頻帶，必須是 final，而且要有 offband
@@ -1152,6 +1158,13 @@ def build_inference_feature_csv(
 
     # 檢查
     audit_selected_feature_alignment(df, feature_cfg)
+    
+    # 模型特徵不可有 NaN / Inf（推論程式也會擋，但在這裡先擋，免得輸出不能用的 CSV）
+    feat_values = df[final_keep_features].to_numpy(dtype=float)
+    bad_values = ~np.isfinite(feat_values)
+    if bad_values.any():
+        bad_cols = [c for c, n in zip(final_keep_features, bad_values.sum(axis=0)) if n]
+        raise ValueError(f"模型特徵有 NaN / Inf：{bad_cols[:10]}（共 {int(bad_values.sum())} 個值）")
     
     
     # ============================================================
