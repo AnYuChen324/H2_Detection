@@ -3136,6 +3136,12 @@ function applyResult(data, sourceLabel){
   // 狀態說明 · 時間（後端沒給時間時顯示「時間未知」）
   const statusSub = document.getElementById('statusSub');
   statusSub.textContent = st.sub + ' · ' + (data.timestamp || '時間未知');
+  
+  // 疑似干擾：附上突升最明顯的頻帶與 dB（後端有給才顯示）
+  if (data.disturbance_burst && Array.isArray(data.disturbance_bands) && data.disturbance_bands.length) {
+    statusSub.textContent += ' · 突升 ' + data.disturbance_bands.join('、')
+      + (data.max_burst_db != null ? '（+' + Number(data.max_burst_db).toFixed(1) + ' dB）' : '');
+  }
 
   // TDMS 檔名放在下一行小字：太長用 … 截斷，滑鼠移上去顯示完整名稱
   if (sourceLabel && sourceLabel !== '即時') {
@@ -3155,7 +3161,9 @@ function applyResult(data, sourceLabel){
   // 2. 近 10 秒統計
   document.getElementById('leakWinVal').textContent  = showNum(data.n_leak_windows);         // 幾個窗判定為洩漏
   document.getElementById('totalWinVal').textContent = showNum(data.n_total_windows);        // 總共幾個窗
-  document.getElementById('distWinVal').textContent  = showNum(data.n_disturbance_windows);  // 幾個窗判定為干擾
+  // 疑似干擾窗數：veto 擋下的窗數；即時監控再附上「突升」窗數（0.2 秒窗）
+  document.getElementById('distWinVal').textContent  = showNum(data.n_disturbance_windows)
+    + (data.n_burst_windows != null ? ' / 突升 ' + data.n_burst_windows : '');
   document.getElementById('confVal').textContent     = showNum(data.confidence, 0);          // 異常窗比例（%，取整數）
 
   // 3. 本次擷取
