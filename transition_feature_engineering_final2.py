@@ -354,8 +354,8 @@ def attach_window_labels_from_transition_meta(
 #   ONSET 前：按按鈕和實際開閥之間有人的反應時間（約 0.2～0.5 秒），按早按晚都有可能
 #   ONSET 後：閥門打開後流量要一點時間才穩定，洩漏訊號不是瞬間到位
 # 兩個值會寫進標註表，改了要重跑轉換特徵工程
-TRANSITION_GRAY_BEFORE_SEC = 0.5         # 設定切換事件發生前的 0.5 秒為不確定區間，不將這段資料標記為正常或洩漏。
-TRANSITION_GRAY_AFTER_SEC = 1.0          # 設定切換事件發生後的 1 秒為不確定區間，避免將閥門剛開啟、洩漏尚未穩定的訊號直接標記為洩漏。
+TRANSITION_GRAY_BEFORE_SEC = 6.0          # 11/12 上午有幾段在按按鈕前 3～5 秒就已經開閥（洩漏聲先出現），0.5 秒會把洩漏標成正常
+TRANSITION_GRAY_AFTER_SEC = 10.0          # 開閥後 6～10 秒流量才穩定（有的先衝高再回落），10 秒後訊號已在穩態
 
 # 取得感測器距離：從 Manifest 的 position 欄位擷取距離
 def _parse_distance_cm(position):
