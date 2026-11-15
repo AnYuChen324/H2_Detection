@@ -249,6 +249,19 @@ def main():
     # 兩個版本都加上 split 欄，後面的程式一律看這一欄
     df["split"] = df[unit_col].map(split_map)
     df_rule["split"] = df_rule[unit_col].map(split_map)
+    
+    # 防呆：兩份資料都必須成功依相同 unit 分到 train / dev / holdout
+    for name, table in (("model", df), ("rule", df_rule)):
+        if table["split"].isna().any():
+            missing = sorted(
+                table.loc[table["split"].isna(), unit_col]
+                .dropna()
+                .unique()
+                .tolist()
+            )
+            raise ValueError(
+                f"{name} CSV 有單位未被分配 split：{missing[:10]}"
+            )
 
     # 1. 模型訓練用：只有 train
     train_path = output_dir / "transition_features_train.csv"

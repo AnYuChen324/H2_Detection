@@ -2968,9 +2968,10 @@ def validate_feature_stage_requirements(
 # ============================================================
 # 固定 baseline 與特徵設定契約工具
 # ============================================================
-def calculate_file_sha256(path):      # 接收一個參數 path，可以是字串路徑也可以是 Path 物件
+def calculate_file_sha256(path, chunk_size=1 << 20):      # 接收一個參數 path，可以是字串路徑也可以是 Path 物件
     '''
-    把一個檔案的內容變成一組獨一無二的「指紋」- 這份設定檔的內容有沒有變，之後只要重新對同一個檔案算一次，指紋不一樣就代表內容變了
+    計算檔案完整 SHA-256 指紋。
+    以分段讀取方式處理，避免大型 TDMS 一次全部載入記憶體。
     
     主要用來鎖住這幾種東西：
      - band_config_step2.json
@@ -2993,7 +2994,13 @@ def calculate_file_sha256(path):      # 接收一個參數 path，可以是字�
     if not path.exists():
         raise FileNotFoundError(f"找不到檔案：{path}")    # 如果檔案不存在，主動丟出一個 FileNotFoundError，並用 f-string 把實際找不到的路徑塞進錯誤訊息裡
 
-    return hashlib.sha256(path.read_bytes()).hexdigest()     
+    hasher = hashlib.sha256()
+
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            hasher.update(chunk)
+
+    return hasher.hexdigest()
 
 
 # ============================================================

@@ -102,6 +102,13 @@ def check_model_feature_contract(metadata_json):
         return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 
     problems = []
+    
+    # 週期模擬的前提：模型特徵沒有跨窗狀態（API 每批重新開始，CUSUM / rolling 這類特徵和離線連續資料算出來會不同）
+    cross_window = [f for f in meta.get("features", {}).get("feature_names", [])
+                    if f.startswith(("delta_", "local_", "rolling_", "cusum_pos_", "cusum_neg_"))]
+    if cross_window:
+        problems.append(f"模型含跨窗特徵（週期模式下和 API 不一致）：{cross_window[:5]}")
+        
     for hash_key, path_key in (("band_config_sha256", "band_config_path"),
                                ("feature_extraction_config_sha256", "feature_extraction_config_path")):
         p = Path(contract[path_key])

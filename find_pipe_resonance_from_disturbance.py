@@ -1699,10 +1699,13 @@ def find_validated_peaks(tap_records, bg_records, val_tap_records, val_bg_record
 
         # 驗證也必須是「真正的局部峰」：用和搜尋階段相同的 find_peaks 條件（高度、prominence、間距）。
         # 只在 ±validation_tol_hz 內取最大值的話，斜坡或平台的邊緣也可能被當成通過。
-        val_peak_idx, _ = find_peaks(val_local_db,
-                                     height=args.local_peak_db,
-                                     distance=5,
-                                     prominence=args.peak_prominence)
+        val_peak_idx, _ = find_peaks(
+            val_local_db,
+            height=args.local_peak_db,
+            distance=5,
+            prominence=args.peak_prominence,
+            width=args.peak_min_width_hz / df_hz,
+        )
         val_peak_freqs = val_freqs[val_peak_idx]
 
         # 兩個驗證數值都從「同一個峰」讀取
