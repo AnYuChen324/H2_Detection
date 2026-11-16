@@ -1015,6 +1015,116 @@ def check_signal_quality(
 
 
 # ============================================================
+# 連續段「邊讀邊算」：一次只留「下一批窗需要的那幾秒」在記憶體，算完就丟
+# 結果和 load_segment_record + sliding_window_records 整段讀進來再切窗「逐窗完全相同」
+#   - 窗起點一樣：從段的第 0 點開始、每 hop 一個（全段的樣本序號）
+#   - 窗內容一樣：同樣的原始 float64 樣本；diff = ai1 − ai0 在窗內算（逐點相減，和整段算完再切一樣）
+#   - 去直流、濾波、特徵都在 extract_window_features_core_bands 逐窗各自做（本來就不跨窗）
+#   - 窗名稱、t_start / t_end / t_ref、label、meta 都照原本格式
+# 記憶體：每個 worker 只留約 chunk_sec 秒的訊號（預設 10 秒 ≈ 0.2 GB），段再長都一樣
+#         → 轉換 / 干擾 FE 可以開 n_jobs=4（原本整段 180 秒 ≈ 4 GB / worker，只能 n_jobs=1）
+# ============================================================
+def _process_segment_in_chunks(
+    segment_spec,          # build_continuous_segments 回傳的一段（有 filepaths / file_sample_counts）
+    core_bands,
+    aux_bands,
+    low_bands,
+    window_sec,
+    hop_sec,
+    fs,
+    max_points,
+    nperseg,
+    temporal_band_names,
+    chunk_sec=10.0,        # 每累積這麼多秒的窗就先算特徵、釋放記憶體（不影響結果）
+):
+    filepaths = segment_spec["filepaths"]
+    expected_counts = segment_spec["file_sample_counts"]
+    record_id = segment_spec["record_id"]
+
+    # 段內每支檔的距離 / 壓力要一致（和 load_segment_record 同一條規則）
+    first_meta = parse_filename(Path(filepaths[0]).name)
+    for fp in filepaths[1:]:
+        m = parse_filename(Path(fp).name)
+        if (m["distance"], m["pressure"]) != (first_meta["distance"], first_meta["pressure"]):
+            raise ValueError(
+                f"{record_id}：段內檔名條件不一致 "
+                f"{Path(filepaths[0]).name}（{first_meta['distance']} m, {first_meta['pressure']} bar） vs "
+                f"{Path(fp).name}（{m['distance']} m, {m['pressure']} bar）"
+            )
+
+    window_size = seconds_to_samples(window_sec, fs, "window_sec")
+    hop_size = seconds_to_samples(hop_sec, fs, "hop_sec")
+    windows_per_chunk = max(1, int(round(chunk_sec / hop_sec)))
+
+    buf_ai0 = np.empty(0, dtype=np.float64)    # 目前留在記憶體的訊號
+    buf_ai1 = np.empty(0, dtype=np.float64)
+    buf_start = 0                              # buf 第 0 點在整段裡的樣本序號
+    next_start = 0                             # 下一個窗的起點（整段樣本序號）
+    win_idx = 0
+    pending = []                               # 還沒算特徵的窗
+    feats = []
+
+    def flush():
+        # 先算完特徵再丟訊號：pending 裡的窗是 buf 的切片（view），算完才可以截掉 buf
+        if pending:
+            feats.extend(extract_window_features_core_bands(
+                pending,
+                core_bands=core_bands,
+                aux_bands=aux_bands,
+                low_bands=low_bands,
+                verbose=False,
+                nperseg=nperseg,
+                temporal_band_names=temporal_band_names,
+            ))
+            pending.clear()
+
+    for fp, n_expected in zip(filepaths, expected_counts):
+        a0, a1 = _read_tdms_ai0_ai1_raw(fp, max_points, fs)
+        # 實際點數要和 manifest 一致，不然後面每支檔在段內的時間位置都會算錯
+        if len(a0) != int(n_expected):
+            raise ValueError(f"{Path(fp).name}：檔案有 {len(a0)} 點，manifest 記錄 {n_expected} 點")
+        buf_ai0 = np.concatenate([buf_ai0, np.asarray(a0, dtype=np.float64)])
+        buf_ai1 = np.concatenate([buf_ai1, np.asarray(a1, dtype=np.float64)])
+        buf_end = buf_start + len(buf_ai0)
+
+        # 這批資料夠切幾個完整的窗就切幾個（和 sliding_window_records 的條件相同：start + window ≤ 段長）
+        while next_start + window_size <= buf_end:
+            s = next_start - buf_start
+            e = s + window_size
+            w0 = buf_ai0[s:e]
+            w1 = buf_ai1[s:e]
+            t_start = next_start / fs
+            t_end = (next_start + window_size) / fs
+            pending.append({
+                "filename": f"{record_id}_w{win_idx:03d}",
+                "record_id": record_id,
+                "t_start": t_start,
+                "t_end": t_end,
+                "t_ref": (t_start + t_end) / 2.0,
+                "fs": fs,
+                "label": segment_spec.get("label"),
+                "meta": first_meta,
+                "signal": {"ai0": w0, "ai1": w1, "diff": w1 - w0},
+            })
+            next_start += hop_size
+            win_idx += 1
+
+        # 累積夠多窗就先算掉，再把用不到的舊訊號截掉（只保留下一個窗起點之後的部分）
+        if len(pending) >= windows_per_chunk:
+            flush()
+            drop = next_start - buf_start
+            if drop > 0:
+                buf_ai0 = buf_ai0[drop:].copy()
+                buf_ai1 = buf_ai1[drop:].copy()
+                buf_start = next_start
+
+    flush()
+    print(f"✅ windowing 完成（邊讀邊算）：{record_id} → {win_idx} windows")
+    return feats
+
+
+
+# ============================================================
 # 一次處理一個檔案 -> 讀 TDMS -> 切 windows -> 算這個檔案 window 的特徵
 # ============================================================
 def _process_one_file_worker(args):
@@ -1031,13 +1141,12 @@ def _process_one_file_worker(args):
         temporal_band_names,     # 需要算 temporal 特徵的頻帶（明確傳入，子行程才看得到）
     ) = args
     
-    # 有 filepaths（多支檔）＝連續段：把整段串成一條訊號再切窗，跨檔的窗也會切出來
+    # 有 filepaths（多支檔）＝連續段：邊讀邊算（每個 worker 只留約 10 秒訊號），結果和整段讀進來再切窗完全相同
     # 只有 filepath（單支檔）＝舊流程：一支檔各自切窗
     if "filepaths" in file_spec:
-        rec = load_segment_record(
-            segment_spec=file_spec,
-            max_points_per_file=max_points,
-            fs_target=fs,
+        return _process_segment_in_chunks(
+            file_spec, core_bands, aux_bands, low_bands,
+            window_sec, hop_sec, fs, max_points, nperseg, temporal_band_names,
         )
     else:
         # 讀一個 TDMS 檔案，整理成一筆 record
