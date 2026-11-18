@@ -61,10 +61,10 @@ SAMPLING = {
     "mode": "periodic",
     "capture_sec": 2.0,
     "warmup_sec": 0.4,
-    "interval_sec": 5.0,
+    "interval_sec": 3.0,     # 11/18：5 → 3（多程序後每批計算約 1 s）
     "confirm_m": 2,
     "confirm_n": 3,
-    "offsets_sec": [0.0, 1.0, 2.0, 3.0, 4.0],
+    "offsets_sec": [0.0, 1.0, 2.0],
 }
 
 
