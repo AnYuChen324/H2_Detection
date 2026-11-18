@@ -25,9 +25,9 @@ import pandas as pd
 # ============================================================
 # 路徑（改這裡）
 # ============================================================
-RESULT_DIR = Path("/Users/paul/Desktop/Final/sim_e2e_v2/test_result")
-EVAL_CSV = Path("/Users/paul/Desktop/Final/sim_e2e_v2/transition_fe/transition_rule_features_eval.csv")
-SESSION_ROOT = Path("/Users/paul/Desktop/Final/sim_e2e_v2/data/transition")
+RESULT_DIR = Path("/Users/paul/Desktop/Final/lab1115_run/test_result")
+EVAL_CSV = Path("/Users/paul/Desktop/Final/lab1115_run/transition_fe/transition_rule_features_eval.csv")
+SESSION_ROOT = Path("/Users/paul/Desktop/AE Data/run_1115/transition")
 SPLIT = "holdout"
 
 import runtime_inference_v2 as RI
