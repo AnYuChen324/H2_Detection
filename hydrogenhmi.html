@@ -3370,7 +3370,7 @@ async function exportCSV(){
   // 後端沒有任何紀錄，不產生空檔案
   if (records.length === 0) { showInlineError('ℹ️ 尚無資料可匯出', 'info'); return; }
   // CSV 第一列：欄位名稱
-  const headers = ['序號','時間','來源','診斷結果','洩漏分數','判定門檻','洩漏窗','干擾窗','總窗數','模型計算時間(s)','異常窗比例(%)'];
+  const headers = ['序號','時間','來源','診斷結果','洩漏分數','判定門檻','洩漏窗','干擾窗','總窗數','模型計算時間(s)','異常窗比例(%)','狀態原因','突升頻帶','最大突升(dB)','延遲(s)'];
   // 每筆紀錄轉成一列，順序要跟 headers 一樣
   const rows = records.map((r, i) => [
     records.length - i,            // 序號：最新的編號最大
@@ -3385,6 +3385,10 @@ async function exportCSV(){
     r.n_total_windows ?? '',
     r.calc_time_sec ?? '',
     r.confidence ?? '',
+    r.status_reason ?? '',                                                   // 11/16：原因代碼
+    Array.isArray(r.disturbance_bands) ? r.disturbance_bands.join(' / ') : '', // 11/16：突升頻帶
+    r.max_burst_db ?? '',                                                    // 11/16：最大突升 dB
+    r.latency_sec ?? '',                                                     // 11/16：延遲
   ]);
 
   // 把標題和每一列組成 CSV 文字：
