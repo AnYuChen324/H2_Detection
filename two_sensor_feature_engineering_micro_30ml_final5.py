@@ -389,7 +389,7 @@ RESONANCE_JSON_PATH = Path("/Users/paul/Desktop/Final/resonance/approved_resonan
 # 執行模式（切換流程時要改的地方）
 # ============================================================
 # True：執行 Step2a 頻帶探索（即使 band_config_step2.json 已存在）；False：執行 Step2b
-FORCE_BAND_DISCOVERY = True
+FORCE_BAND_DISCOVERY = False
 
 # 實驗室 baseline 是 candidate → False；現場正式部署時改 True
 REQUIRE_FINAL_BASELINE = False
