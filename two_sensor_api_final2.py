@@ -1760,7 +1760,7 @@ def realtime_detect():
     # 從設定檔取得採樣率（如 100000 Hz）
     fs = float(state.runtime_cfg["fs"])
     # 換算目前大水庫已經累積了幾秒鐘的資料：【總點數 / 採樣率】
-    buffer_sec_current = min(current_samples / fs, RAW_BUFFER_SEC,)    # 確保算出來的秒數不會超過最大限制（5.0秒）
+    buffer_sec_current = min(current_samples / fs, DAQ_CAPTURE_SEC,)   # 11/23：上限改成一批的擷取秒數
 
     # ──「開機暖機中」應變方案 ──
     # 因為剛按啟動時，硬體一瞬間就抓好波形了（waveform 有資料），但 AI 模型算特徵可能需要 0.05 秒，在 AI 模型「還沒交出這輩子第一筆答案」的這極短空檔內，inference_result 會是 None
@@ -1783,7 +1783,7 @@ def realtime_detect():
             "window_probas": None,
             "buffer_ready": False,                               # 標記：水庫還沒完全存滿
             "buffer_sec_current": round(buffer_sec_current,2,),  # 告訴網頁目前累積到幾秒了（例如 0.5 秒、1.0 秒...）
-            "buffer_sec_target": RAW_BUFFER_SEC,                 # 目標是 5.0 秒
+            "buffer_sec_target": DAQ_CAPTURE_SEC,                # 11/23：週期取樣只要第一批擷取完（capture_sec）就能推論
         }
 
     # ── 網頁零延遲（解耦）──
