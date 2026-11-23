@@ -1104,10 +1104,10 @@
         <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary);">
           <span>畫面更新間隔</span>
           <input type="number" id="cfg_interval"
-                title="只控制網頁多久更新一次畫面；感測器實際每 5 秒擷取一次，由後端設定控制"
+                title="只控制網頁多久更新一次畫面；感測器實際擷取週期由後端設定控制"
                 style="width:55px;padding:5px 8px;border:1px solid var(--border-bright);
                         border-radius:6px;font-family:var(--mono);font-size:13px;text-align:center;"
-                value="2" min="1" step="1"
+                value="1" min="1" step="1"
                 onchange="cfg.interval = normalizePollInterval(this.value); this.value = cfg.interval">
           <span>秒</span>
           <span style="font-size:10px;color:var(--text-dim)">
@@ -1660,7 +1660,7 @@ function getRetryDelayMs() {
 // ═══════════════════════════════════════
 // 前端本機設定（不會送到後端）
 // ═══════════════════════════════════════
-const DEFAULT_POLL_INTERVAL_SEC = 2;   // 畫面更新間隔預設值，需與 HTML 輸入框的 value 一致
+const DEFAULT_POLL_INTERVAL_SEC = 1;   // 畫面更新間隔預設值，需與 HTML 輸入框的 value 一致（11/18：2 → 1）
 
 // 本機顯示設定（只影響 Demo 波形與圖表座標軸，不送後端）
 // 這些參數主要是當後端沒準備好、前端要單獨跑純網頁模擬或繪製 X 軸時間刻度（如 interval: 2 秒一格）時使用的參考變數
@@ -2772,12 +2772,16 @@ function finishResult(data, sourceLabel) {
 
     // 暖機秒數只算實際擷取的訊號，實際等待時間要乘上「取樣週期 ÷ 每次擷取」
     // 例如每 5 秒擷取 1 秒，累積 5 秒訊號實際要約 25 秒
-    const loopSec = Number(runtimeParams?.daq_loop_interval_sec) || 5;
-    const captureSec = Number(runtimeParams?.daq_capture_sec) || 1;
+    const loopSec = Number(runtimeParams?.daq_loop_interval_sec) || 3;     // 11/23：5 → 3
+    const captureSec = Number(runtimeParams?.daq_capture_sec) || 2;        // 11/23：1 → 2
     const remainSec = Math.max(0, Math.ceil((target - current) / captureSec * loopSec));
 
+    // 11/23：第一批擷取完、模型還在算時，不顯示「還需 0 秒」
     document.getElementById('statusSub').textContent =
-      `已擷取 ${current.toFixed(1)} / ${target > 0 ? target.toFixed(1) : '—'} 秒訊號，預計還需約 ${remainSec} 秒`;
+      (target > 0 && current >= target)
+        ? '第一批資料已擷取，模型計算中...'
+        : `已擷取 ${current.toFixed(1)} / ${target > 0 ? target.toFixed(1) : '—'} 秒訊號，預計還需約 ${remainSec} 秒`;
+    
     // 進度條
     document.getElementById('warmup-bar-wrap').style.display = 'block';
     document.getElementById('warmup-bar').style.width = Math.round(progress) + '%';
