@@ -143,6 +143,10 @@
   .status-banner.ok   .status-dot{animation:breathe 3s ease-in-out infinite;box-shadow:0 0 10px var(--ok);}
   .status-banner.warn .status-dot{animation:blinkOrange 1.2s ease-in-out infinite;box-shadow:0 0 10px var(--warn);}
   .status-banner.leak .status-dot{animation:blinkRed 1s ease-in-out infinite;box-shadow:0 0 10px var(--leak);}
+  
+  /* 11/23：等待檢測 / 資料累積中 / 監控已停止：還沒有判斷結果，用中性灰藍色 */
+  .status-banner.idle{background:#eef3f8;border-color:var(--border-bright);color:var(--text-secondary);}
+  .status-banner.idle .status-dot{animation:breathe 3s ease-in-out infinite;}
   .status-info{ width:min(820px, 75%);text-align:center;}
   .status-label{font-size:11px;letter-spacing:.15em;opacity:.7;margin-bottom:5px;font-weight:500;}
   .status-text{font-size:28px;font-weight:700;}
@@ -1168,7 +1172,7 @@
        由後端 leak_status 決定，前端不自行判斷
        包含：狀態燈、診斷文字、計算時間
   -->
-  <div class="status-banner ok" id="statusBanner">
+  <div class="status-banner idle" id="statusBanner">
     <div class="status-indicator"><div class="status-dot"></div></div>
     <div class="status-info">
       <div class="status-label">診斷結果 · DIAGNOSTIC RESULT</div>
@@ -1178,7 +1182,7 @@
       <!-- 暖機進度條 -->
       <div id="warmup-bar-wrap" style="display:none; margin-top:6px; margin-bottom:4px;">
         <div style="background:rgba(255,255,255,0.15); border-radius:4px; height:6px; overflow:hidden;">
-          <div id="warmup-bar" style="height:100%; width:0%; background:#2ecc71; transition:width 0.3s;"></div>
+          <div id="warmup-bar" style="height:100%; width:0%; background:var(--accent-blue); transition:width 0.3s;"></div>
         </div>
       </div>
 
@@ -2179,7 +2183,7 @@ async function startAuto() {
   lastLiveLogKey = null;
 
   markDataFresh();   // 解除灰階並清掉轉灰前存的舊說明
-  document.getElementById('statusBanner').className = 'status-banner ok';
+  document.getElementById('statusBanner').className = 'status-banner idle';   // 11/23：ok → idle
   document.getElementById('statusText').textContent = '資料累積中...';
   document.getElementById('statusSub').textContent = '正在等待第一批感測器資料';
   ['Ai0', 'Ai1'].forEach(channel => {
@@ -2768,7 +2772,8 @@ function finishResult(data, sourceLabel) {
     // target 沒給或是 0 時不做除法
     const progress = target > 0 ? Math.max( 0, Math.min(100, current / target * 100),): 0;
 
-    document.getElementById('statusText').textContent = '資料累積中...'; 
+    document.getElementById('statusBanner').className = 'status-banner idle';   // 11/23：暖機中還沒有判斷結果，用中性色
+    document.getElementById('statusText').textContent = '資料累積中...';
 
     // 暖機秒數只算實際擷取的訊號，實際等待時間要乘上「取樣週期 ÷ 每次擷取」
     // 例如每 5 秒擷取 1 秒，累積 5 秒訊號實際要約 25 秒
@@ -3539,7 +3544,7 @@ async function clearData(){
 
     // 診斷結果 Banner 回到綠色「等待檢測」
     const banner=document.getElementById('statusBanner');
-    banner.className='status-banner ok';
+    banner.className='status-banner idle';   // 11/23：等待檢測用中性色，不是「正常」
     document.getElementById('statusText').textContent='等待檢測';
     document.getElementById('statusSub').textContent='請啟動自動監控，或選擇 TDMS 檔案';
 
