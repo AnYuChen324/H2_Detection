@@ -2011,12 +2011,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"ai0 : {DAQ_CHANNEL_AI0}")
     print(f"ai1 : {DAQ_CHANNEL_AI1}")
-    print(f"DAQ_CAPTURE_SEC = {DAQ_CAPTURE_SEC}s")
-    print(f"DAQ_LOOP_INTERVAL_SEC = {DAQ_LOOP_INTERVAL_SEC}s")
-    print(
-        f"推論取樣策略：每 {DAQ_LOOP_INTERVAL_SEC:.1f} 秒抓 "
-        f"{DAQ_CAPTURE_SEC:.1f} 秒資料進行一次推論"
-    )
+    print("取樣參數：啟動後由 postprocess_config.json 的 sampling 載入（見下方「週期取樣」）")   # 11/23：這裡還沒讀設定檔，印預設值會誤導
     print("API 文件：http://localhost:8000/docs")
     print("前端介面：http://localhost:8000/hydrogenhmi.html")
     print("=" * 60)
