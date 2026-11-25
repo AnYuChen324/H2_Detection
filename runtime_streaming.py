@@ -94,23 +94,26 @@ from runtime_inference_v2 import (
 # 程序池只建一次、一直留著重複用（每批重開會更慢）；任何錯誤都會退回執行緒版本，不會讓偵測停掉。
 # 注意：用 spawn 開程序時，主程式要有 if __name__ == "__main__": 保護（API 已經有）。
 # =============================================================================
-_MP_POOL = None
-_MP_POOL_WORKERS = 0
+_MP_POOL = None          # 程序池本身，一開始還沒建立
+_MP_POOL_WORKERS = 0     # 目前池子裡有幾個工人
 
-
+# 取得程序池
 def _mp_get_pool(n_workers):
     """取得（必要時建立）共用的程序池。"""
     global _MP_POOL, _MP_POOL_WORKERS
+    # 還沒有池子，或池子的人數和要求的不同，才重新建立；其他情況直接沿用舊的
     if _MP_POOL is None or _MP_POOL_WORKERS != int(n_workers):
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
+        # 如果有舊池子但人數不對，先把它關掉
         if _MP_POOL is not None:
             _MP_POOL.shutdown(wait=False, cancel_futures=True)
+        # 建立一個有 n_workers（8）個程序的池子
         _MP_POOL = ProcessPoolExecutor(max_workers=int(n_workers), mp_context=mp.get_context("spawn"))
         _MP_POOL_WORKERS = int(n_workers)
-    return _MP_POOL
+    return _MP_POOL     # 回傳池子
 
-
+# 關掉程序池:出錯要退回執行緒版本時，用它把 8 個程序收掉，並把變數歸零
 def _mp_shutdown_pool():
     global _MP_POOL, _MP_POOL_WORKERS
     if _MP_POOL is not None:
@@ -118,27 +121,40 @@ def _mp_shutdown_pool():
     _MP_POOL, _MP_POOL_WORKERS = None, 0
 
 
+# 只回傳 True
+# 看起來什麼都沒做，但它是用來暖機的。API 啟動時會先叫每個程序跑一次這個函式，逼它們先把 Python 和套件載入好。這樣第一批真正的資料進來時，就不用等程序啟動。
 def _mp_ping():
     return True
 
 
-def _mp_extract_group(stretch_ai0, stretch_ai1, metas, window_samples, band_config, required_feature_names):
+# 每個工人要做的事
+def _mp_extract_group(stretch_ai0,                # 這個工人負責的那一段連續原始訊號，不是整批 2 秒
+                      stretch_ai1, 
+                      metas,                      # 這段裡每個窗的資訊（時間、編號），加上 local_start：窗在這段訊號裡從第幾點開始
+                      window_samples,             # 一個窗有幾點
+                      band_config,                # 頻帶設定
+                      required_feature_names):    # 模型需要哪些特徵，只算這些
     """
     子程序：從一段連續的原始訊號切出這一組窗，做法和 StreamingFeatureEngine._prepare_feature_windows 完全相同
     （每窗用自己的平均去 DC、diff = ai1_dc − ai0_dc），再呼叫同一支 extract_required_window_features（單執行緒）。
     metas：每個窗的欄位（不含 signal）與 local_start（在這段訊號裡的起點）
     """
     records = []
+    # 迴圈：每個窗做一次
     for meta in metas:
+        # 從這段訊號切出第 s 點到第 e 點，也就是一個 0.2 秒的窗，兩個通道各切一份。
         s = int(meta["local_start"])
         e = s + int(window_samples)
         ai0 = np.asarray(stretch_ai0[s:e], dtype=np.float64)
         ai1 = np.asarray(stretch_ai1[s:e], dtype=np.float64)
+        # 去直流：減掉這個窗自己的平均值，讓訊號以 0 為中心。每個窗各自算，不會用到別的窗。
         ai0_dc = (ai0 - np.mean(ai0))
         ai1_dc = (ai1 - np.mean(ai1))
+        # 把窗的資訊複製一份，放進三個通道的訊號：ai0、ai1，以及 diff = ai1 − ai0，加進清單。
         item = {k: v for k, v in meta.items() if k != "local_start"}
         item["signal"] = {"ai0": ai0_dc, "ai1": ai1_dc, "diff": (ai1_dc - ai0_dc)}
         records.append(item)
+    # 算特徵：呼叫原本那支特徵函式，算出這幾個窗的特徵，回傳給主程式
     return extract_required_window_features(
         records, band_config=band_config, required_feature_names=required_feature_names,
         n_jobs=1, verbose=False)
