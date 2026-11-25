@@ -1669,8 +1669,8 @@ const DEFAULT_POLL_INTERVAL_SEC = 1;   // 畫面更新間隔預設值，需與 H
 // 本機顯示設定（只影響 Demo 波形與圖表座標軸，不送後端）
 // 這些參數主要是當後端沒準備好、前端要單獨跑純網頁模擬或繪製 X 軸時間刻度（如 interval: 2 秒一格）時使用的參考變數
 let cfg = {
-  fs:        1000000,    // fs：後端沒回傳取樣率時的備用值，用來計算波形長度和顯示取樣率
-  interval: 2,           // interval：畫面更新間隔（秒），由主監控頁輸入框設定
+  fs:        1000000,                     // fs：後端沒回傳取樣率時的備用值，用來計算波形長度和顯示取樣率
+  interval:  DEFAULT_POLL_INTERVAL_SEC,   // 11/23：2 → 跟預設值一致（1 秒），由主監控頁輸入框設定
 };
 
 
@@ -2002,8 +2002,11 @@ function renderParamTable() {
     ['模型 ID',          p.model_id ?? '—'],
     ['視窗長度',         withUnit(p.window_sec, '秒')],             // 模型每次看多長的一小段
     ['滑動間隔',         withUnit(p.hop_sec, '秒')],                // 每一小段之間隔多久
-    // 告警門檻：平滑後的分數要超過它才算命中（去掉浮點誤差）
-    ['告警門檻（平滑後）', p.window_threshold != null ? String(Number(Number(p.window_threshold).toPrecision(6))) : '—'],
+    // 11/23：告警門檻改讀 alarm_threshold（0.50，跟主畫面「判定門檻」一致）
+    ['告警門檻（平滑後）', p.alarm_threshold != null ? String(Number(Number(p.alarm_threshold).toPrecision(6))) : '—'],
+    // 11/23：單窗門檻只用來統計洩漏窗數（0.33），不決定亮紅燈
+    ['單窗門檻',         p.window_threshold != null ? String(Number(Number(p.window_threshold).toPrecision(6))) : '—'],
+    
     ['平滑窗數',         p.smooth_window ?? '—'],                  // 每窗分數取自己＋前幾窗的平均
     ['連續命中窗數',     p.consecutive ?? '—'],                     // 要連續幾小段都有洩漏才告警
     ['最短告警時間',     withUnit(p.min_leak_duration_sec, '秒')],  // 洩漏至少要持續多久才告警
@@ -2012,7 +2015,9 @@ function renderParamTable() {
     ['是否使用 Veto',    p.use_veto == null ? '—' : (p.use_veto ? '是' : '否')],
     ['DAQ 每次擷取',     withUnit(p.daq_capture_sec, '秒')],        // 每次抓多長的訊號
     ['DAQ 擷取週期',     withUnit(p.daq_loop_interval_sec, '秒')],  // 每隔多久抓一次
-    ['Raw Buffer',       withUnit(p.buffer_sec, '秒')],             // 後端給模型用的訊號保留多久
+    // 11/23：週期取樣不再使用 Raw Buffer，改顯示批次確認條件
+    ['批次確認',         (p.sampling && p.sampling.confirm_m != null)
+                           ? `最近 ${p.sampling.confirm_n} 批中 ${p.sampling.confirm_m} 批` : '—'],
     ['模型特徵數',       featureCount],
     ['感測器模式',       '雙感測器（AI0、AI1）'],
   ];
