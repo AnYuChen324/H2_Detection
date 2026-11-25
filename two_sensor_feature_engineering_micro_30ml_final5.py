@@ -369,8 +369,8 @@ plt.rcParams["axes.unicode_minus"] = False
 # ============================================================
 # 路徑
 # ============================================================
-DATA_ROOT = Path("/Users/paul/Desktop/Final/normal_leak_test")    # 純正常（leak0）/ 純洩漏（leak1）資料
-FINAL_OUTPUT_ROOT = Path("/Users/paul/Desktop/Final/test_result")
+DATA_ROOT = Path("/Users/paul/Desktop/AE Data/run_1115/step2")    # leak0 = 正常、leak1 = 洩漏
+FINAL_OUTPUT_ROOT = Path("/Users/paul/Desktop/Final/lab1115_run/test_result")
 FEATURE_EXTRACTION_CONFIG_PATH = FINAL_OUTPUT_ROOT / "feature_extraction_config.json"
 
 # Step2a（頻帶探索）
@@ -426,8 +426,8 @@ RANDOM_STATE = 42
 # ============================================================
 # 分析對象
 # ============================================================
-TARGET_LEVELS = {0, 30}                            # 比較的洩漏量（0 = 正常）
-TARGET_LEAK_LEVELS = {30}                          # 其中屬於洩漏的
+TARGET_LEVELS = {0, 300, 500}                      # 比較的洩漏量（0 = 正常）；11/15：200 以下沒有訊號
+TARGET_LEAK_LEVELS = {300, 500}                    # 其中屬於洩漏的
 ANALYSIS_LEVELS = sorted(TARGET_LEVELS)            # [0, 30]
 ANALYSIS_LEAK_LEVELS = sorted(TARGET_LEAK_LEVELS)  # [30]
 
@@ -4683,12 +4683,20 @@ if __name__ == "__main__":
 
     # (B) fold-wise CV：每折只用訓練折重新跑完整選特徵流程（主要指標）
     #     分組自動決定：每天都有正常和洩漏、且至少 3 天 → 留整天；否則 → 留整個場次
-    foldwise_scores, foldwise_feature_info, feature_freq_df = run_group_cv_with_foldwise_feature_selection(
-        df_dev=df_dev,
-        record_meta_dev_df=record_meta_dev_df,
-        eligible_features=eligible_features,      # 和正式流程同一份可用特徵清單
-        random_state=RANDOM_STATE,
-    )
+    # 實驗室資料場次少：fold-wise CV 選特徵失敗時跳過這項驗證（只影響報表，不影響最終特徵選擇）
+    try:
+        foldwise_scores, foldwise_feature_info, feature_freq_df = run_group_cv_with_foldwise_feature_selection(
+            df_dev=df_dev,
+            record_meta_dev_df=record_meta_dev_df,
+            eligible_features=eligible_features,      # 和正式流程同一份可用特徵清單
+            random_state=RANDOM_STATE,
+        )
+    except ValueError as e:
+        print(f"⚠️ Fold-wise CV 跳過：{e}（場次太少；正式資料每類至少要 3 個場次）")
+        foldwise_scores = np.array([np.nan])
+        foldwise_feature_info = [{"fold": 0, "auc": np.nan, "f1": np.nan, "features": []}]
+        feature_freq_df = pd.DataFrame(columns=["feature", "n_folds_selected"])
+        
     foldwise_aucs = np.array([item["auc"] for item in foldwise_feature_info])
     print(f"Fold-wise CV（主要指標）：AUC {foldwise_aucs.mean():.3f} ± {foldwise_aucs.std():.3f}、"
           f"F1 {foldwise_scores.mean():.3f} ± {foldwise_scores.std():.3f}")

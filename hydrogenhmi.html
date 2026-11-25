@@ -143,6 +143,10 @@
   .status-banner.ok   .status-dot{animation:breathe 3s ease-in-out infinite;box-shadow:0 0 10px var(--ok);}
   .status-banner.warn .status-dot{animation:blinkOrange 1.2s ease-in-out infinite;box-shadow:0 0 10px var(--warn);}
   .status-banner.leak .status-dot{animation:blinkRed 1s ease-in-out infinite;box-shadow:0 0 10px var(--leak);}
+  
+  /* 11/23：等待檢測 / 資料累積中 / 監控已停止：還沒有判斷結果，用中性灰藍色 */
+  .status-banner.idle{background:#eef3f8;border-color:var(--border-bright);color:var(--text-secondary);}
+  .status-banner.idle .status-dot{animation:breathe 3s ease-in-out infinite;}
   .status-info{ width:min(820px, 75%);text-align:center;}
   .status-label{font-size:11px;letter-spacing:.15em;opacity:.7;margin-bottom:5px;font-weight:500;}
   .status-text{font-size:28px;font-weight:700;}
@@ -1104,10 +1108,10 @@
         <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary);">
           <span>畫面更新間隔</span>
           <input type="number" id="cfg_interval"
-                title="只控制網頁多久更新一次畫面；感測器實際每 5 秒擷取一次，由後端設定控制"
+                title="只控制網頁多久更新一次畫面；感測器實際擷取週期由後端設定控制"
                 style="width:55px;padding:5px 8px;border:1px solid var(--border-bright);
                         border-radius:6px;font-family:var(--mono);font-size:13px;text-align:center;"
-                value="2" min="1" step="1"
+                value="1" min="1" step="1"
                 onchange="cfg.interval = normalizePollInterval(this.value); this.value = cfg.interval">
           <span>秒</span>
           <span style="font-size:10px;color:var(--text-dim)">
@@ -1168,7 +1172,7 @@
        由後端 leak_status 決定，前端不自行判斷
        包含：狀態燈、診斷文字、計算時間
   -->
-  <div class="status-banner ok" id="statusBanner">
+  <div class="status-banner idle" id="statusBanner">
     <div class="status-indicator"><div class="status-dot"></div></div>
     <div class="status-info">
       <div class="status-label">診斷結果 · DIAGNOSTIC RESULT</div>
@@ -1178,7 +1182,7 @@
       <!-- 暖機進度條 -->
       <div id="warmup-bar-wrap" style="display:none; margin-top:6px; margin-bottom:4px;">
         <div style="background:rgba(255,255,255,0.15); border-radius:4px; height:6px; overflow:hidden;">
-          <div id="warmup-bar" style="height:100%; width:0%; background:#2ecc71; transition:width 0.3s;"></div>
+          <div id="warmup-bar" style="height:100%; width:0%; background:var(--accent-blue); transition:width 0.3s;"></div>
         </div>
       </div>
 
@@ -1660,13 +1664,13 @@ function getRetryDelayMs() {
 // ═══════════════════════════════════════
 // 前端本機設定（不會送到後端）
 // ═══════════════════════════════════════
-const DEFAULT_POLL_INTERVAL_SEC = 2;   // 畫面更新間隔預設值，需與 HTML 輸入框的 value 一致
+const DEFAULT_POLL_INTERVAL_SEC = 1;   // 畫面更新間隔預設值，需與 HTML 輸入框的 value 一致（11/18：2 → 1）
 
 // 本機顯示設定（只影響 Demo 波形與圖表座標軸，不送後端）
 // 這些參數主要是當後端沒準備好、前端要單獨跑純網頁模擬或繪製 X 軸時間刻度（如 interval: 2 秒一格）時使用的參考變數
 let cfg = {
-  fs:        1000000,    // fs：後端沒回傳取樣率時的備用值，用來計算波形長度和顯示取樣率
-  interval: 2,           // interval：畫面更新間隔（秒），由主監控頁輸入框設定
+  fs:        1000000,                     // fs：後端沒回傳取樣率時的備用值，用來計算波形長度和顯示取樣率
+  interval:  DEFAULT_POLL_INTERVAL_SEC,   // 11/23：2 → 跟預設值一致（1 秒），由主監控頁輸入框設定
 };
 
 
@@ -1998,8 +2002,11 @@ function renderParamTable() {
     ['模型 ID',          p.model_id ?? '—'],
     ['視窗長度',         withUnit(p.window_sec, '秒')],             // 模型每次看多長的一小段
     ['滑動間隔',         withUnit(p.hop_sec, '秒')],                // 每一小段之間隔多久
-    // 告警門檻：平滑後的分數要超過它才算命中（去掉浮點誤差）
-    ['告警門檻（平滑後）', p.window_threshold != null ? String(Number(Number(p.window_threshold).toPrecision(6))) : '—'],
+    // 11/23：告警門檻改讀 alarm_threshold（0.50，跟主畫面「判定門檻」一致）
+    ['告警門檻（平滑後）', p.alarm_threshold != null ? String(Number(Number(p.alarm_threshold).toPrecision(6))) : '—'],
+    // 11/23：單窗門檻只用來統計洩漏窗數（0.33），不決定亮紅燈
+    ['單窗門檻',         p.window_threshold != null ? String(Number(Number(p.window_threshold).toPrecision(6))) : '—'],
+    
     ['平滑窗數',         p.smooth_window ?? '—'],                  // 每窗分數取自己＋前幾窗的平均
     ['連續命中窗數',     p.consecutive ?? '—'],                     // 要連續幾小段都有洩漏才告警
     ['最短告警時間',     withUnit(p.min_leak_duration_sec, '秒')],  // 洩漏至少要持續多久才告警
@@ -2008,7 +2015,9 @@ function renderParamTable() {
     ['是否使用 Veto',    p.use_veto == null ? '—' : (p.use_veto ? '是' : '否')],
     ['DAQ 每次擷取',     withUnit(p.daq_capture_sec, '秒')],        // 每次抓多長的訊號
     ['DAQ 擷取週期',     withUnit(p.daq_loop_interval_sec, '秒')],  // 每隔多久抓一次
-    ['Raw Buffer',       withUnit(p.buffer_sec, '秒')],             // 後端給模型用的訊號保留多久
+    // 11/23：週期取樣不再使用 Raw Buffer，改顯示批次確認條件
+    ['批次確認',         (p.sampling && p.sampling.confirm_m != null)
+                           ? `最近 ${p.sampling.confirm_n} 批中 ${p.sampling.confirm_m} 批` : '—'],
     ['模型特徵數',       featureCount],
     ['感測器模式',       '雙感測器（AI0、AI1）'],
   ];
@@ -2179,7 +2188,7 @@ async function startAuto() {
   lastLiveLogKey = null;
 
   markDataFresh();   // 解除灰階並清掉轉灰前存的舊說明
-  document.getElementById('statusBanner').className = 'status-banner ok';
+  document.getElementById('statusBanner').className = 'status-banner idle';   // 11/23：ok → idle
   document.getElementById('statusText').textContent = '資料累積中...';
   document.getElementById('statusSub').textContent = '正在等待第一批感測器資料';
   ['Ai0', 'Ai1'].forEach(channel => {
@@ -2768,16 +2777,21 @@ function finishResult(data, sourceLabel) {
     // target 沒給或是 0 時不做除法
     const progress = target > 0 ? Math.max( 0, Math.min(100, current / target * 100),): 0;
 
-    document.getElementById('statusText').textContent = '資料累積中...'; 
+    document.getElementById('statusBanner').className = 'status-banner idle';   // 11/23：暖機中還沒有判斷結果，用中性色
+    document.getElementById('statusText').textContent = '資料累積中...';
 
     // 暖機秒數只算實際擷取的訊號，實際等待時間要乘上「取樣週期 ÷ 每次擷取」
     // 例如每 5 秒擷取 1 秒，累積 5 秒訊號實際要約 25 秒
-    const loopSec = Number(runtimeParams?.daq_loop_interval_sec) || 5;
-    const captureSec = Number(runtimeParams?.daq_capture_sec) || 1;
+    const loopSec = Number(runtimeParams?.daq_loop_interval_sec) || 3;     // 11/23：5 → 3
+    const captureSec = Number(runtimeParams?.daq_capture_sec) || 2;        // 11/23：1 → 2
     const remainSec = Math.max(0, Math.ceil((target - current) / captureSec * loopSec));
 
+    // 11/23：第一批擷取完、模型還在算時，不顯示「還需 0 秒」
     document.getElementById('statusSub').textContent =
-      `已擷取 ${current.toFixed(1)} / ${target > 0 ? target.toFixed(1) : '—'} 秒訊號，預計還需約 ${remainSec} 秒`;
+      (target > 0 && current >= target)
+        ? '第一批資料已擷取，模型計算中...'
+        : `已擷取 ${current.toFixed(1)} / ${target > 0 ? target.toFixed(1) : '—'} 秒訊號，預計還需約 ${remainSec} 秒`;
+    
     // 進度條
     document.getElementById('warmup-bar-wrap').style.display = 'block';
     document.getElementById('warmup-bar').style.width = Math.round(progress) + '%';
@@ -3136,6 +3150,12 @@ function applyResult(data, sourceLabel){
   // 狀態說明 · 時間（後端沒給時間時顯示「時間未知」）
   const statusSub = document.getElementById('statusSub');
   statusSub.textContent = st.sub + ' · ' + (data.timestamp || '時間未知');
+  
+  // 疑似干擾：附上突升最明顯的頻帶與 dB（後端有給才顯示）
+  if (data.disturbance_burst && Array.isArray(data.disturbance_bands) && data.disturbance_bands.length) {
+    statusSub.textContent += ' · 突升 ' + data.disturbance_bands.join('、')
+      + (data.max_burst_db != null ? '（+' + Number(data.max_burst_db).toFixed(1) + ' dB）' : '');
+  }
 
   // TDMS 檔名放在下一行小字：太長用 … 截斷，滑鼠移上去顯示完整名稱
   if (sourceLabel && sourceLabel !== '即時') {
@@ -3155,7 +3175,9 @@ function applyResult(data, sourceLabel){
   // 2. 近 10 秒統計
   document.getElementById('leakWinVal').textContent  = showNum(data.n_leak_windows);         // 幾個窗判定為洩漏
   document.getElementById('totalWinVal').textContent = showNum(data.n_total_windows);        // 總共幾個窗
-  document.getElementById('distWinVal').textContent  = showNum(data.n_disturbance_windows);  // 幾個窗判定為干擾
+  // 疑似干擾窗數：veto 擋下的窗數；即時監控再附上「突升」窗數（0.2 秒窗）
+  document.getElementById('distWinVal').textContent  = showNum(data.n_disturbance_windows)
+    + (data.n_burst_windows != null ? ' / 突升 ' + data.n_burst_windows : '');
   document.getElementById('confVal').textContent     = showNum(data.confidence, 0);          // 異常窗比例（%，取整數）
 
   // 3. 本次擷取
@@ -3362,7 +3384,7 @@ async function exportCSV(){
   // 後端沒有任何紀錄，不產生空檔案
   if (records.length === 0) { showInlineError('ℹ️ 尚無資料可匯出', 'info'); return; }
   // CSV 第一列：欄位名稱
-  const headers = ['序號','時間','來源','診斷結果','洩漏分數','判定門檻','洩漏窗','干擾窗','總窗數','模型計算時間(s)','異常窗比例(%)'];
+  const headers = ['序號','時間','來源','診斷結果','洩漏分數','判定門檻','洩漏窗','干擾窗','總窗數','模型計算時間(s)','異常窗比例(%)','狀態原因','突升頻帶','最大突升(dB)','延遲(s)'];
   // 每筆紀錄轉成一列，順序要跟 headers 一樣
   const rows = records.map((r, i) => [
     records.length - i,            // 序號：最新的編號最大
@@ -3377,6 +3399,10 @@ async function exportCSV(){
     r.n_total_windows ?? '',
     r.calc_time_sec ?? '',
     r.confidence ?? '',
+    r.status_reason ?? '',                                                   // 11/16：原因代碼
+    Array.isArray(r.disturbance_bands) ? r.disturbance_bands.join(' / ') : '', // 11/16：突升頻帶
+    r.max_burst_db ?? '',                                                    // 11/16：最大突升 dB
+    r.latency_sec ?? '',                                                     // 11/16：延遲
   ]);
 
   // 把標題和每一列組成 CSV 文字：
@@ -3523,7 +3549,7 @@ async function clearData(){
 
     // 診斷結果 Banner 回到綠色「等待檢測」
     const banner=document.getElementById('statusBanner');
-    banner.className='status-banner ok';
+    banner.className='status-banner idle';   // 11/23：等待檢測用中性色，不是「正常」
     document.getElementById('statusText').textContent='等待檢測';
     document.getElementById('statusSub').textContent='請啟動自動監控，或選擇 TDMS 檔案';
 

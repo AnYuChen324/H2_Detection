@@ -1361,22 +1361,22 @@ def run_xgb_training_and_save(
 
 if __name__ == "__main__":
     # 合併好的 train 資料（檔名沿用 dev）
-    DEV_CSV = Path("/Users/paul/Desktop/Final/test_result/transition_disturbance_dev.csv")
+    DEV_CSV = Path("/Users/paul/Desktop/Final/lab1115_run/test_result/transition_disturbance_dev.csv")
     # 轉換的 Holdout 資料
-    TRANSITION_HOLDOUT_CSV = Path("/Users/paul/Desktop/Final/transition_feature_engineering/transition_30ml_test/transition_features_holdout.csv")
+    TRANSITION_HOLDOUT_CSV = Path("/Users/paul/Desktop/Final/lab1115_run/transition_fe/transition_features_holdout.csv")
     # 干擾的 Holdout 資料
-    DISTURBANCE_HOLDOUT_CSV = Path("/Users/paul/Desktop/Final/disturbance_feature_engineering/disturbance_features_holdout.csv")
+    DISTURBANCE_HOLDOUT_CSV = Path("/Users/paul/Desktop/Final/lab1115_run/disturbance_fe/disturbance_features_holdout.csv")
     # 特徵 JSON 路徑(Step2/Step3選定特徵的設定檔路徑)
-    FEATURE_CONFIG_JSON = Path("/Users/paul/Desktop/Final/test_result/feature_config_micro.json")
+    FEATURE_CONFIG_JSON = Path("/Users/paul/Desktop/Final/lab1115_run/test_result/feature_config_micro.json")
     
-    BAND_CONFIG_JSON = Path("/Users/paul/Desktop/Final/test_result/band_config_step2.json")
+    BAND_CONFIG_JSON = Path("/Users/paul/Desktop/Final/lab1115_run/test_result/band_config_step2.json")
 
-    FEATURE_EXTRACTION_CONFIG_JSON = Path("/Users/paul/Desktop/Final/test_result/feature_extraction_config.json")
+    FEATURE_EXTRACTION_CONFIG_JSON = Path("/Users/paul/Desktop/Final/lab1115_run/test_result/feature_extraction_config.json")
     
-    BASELINE_JSON = Path("/Users/paul/Desktop/Final/test_result/site_baseline.json")
+    BASELINE_JSON = Path("/Users/paul/Desktop/Final/lab1115_run/test_result/site_baseline.json")
     
     # 儲存路徑
-    SAVE_BASE_PATH = Path("/Users/paul/Desktop/Final/test_result")
+    SAVE_BASE_PATH = Path("/Users/paul/Desktop/Final/lab1115_run/test_result")
 
     # 整個訓練+評估+存檔+畫圖的流程
     results, model_id = run_xgb_training_and_save(

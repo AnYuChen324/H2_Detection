@@ -31,11 +31,11 @@ import pandas as pd
 import json  
 
 # 兩支切分程式的 train 份（模型訓練用）；dev / holdout 留給推論選規則和評估，不能拿來訓練
-transition_dev_csv = Path("/Users/paul/Desktop/Final/transition_feature_engineering/transition_30ml_test/transition_features_train.csv")
-disturbance_dev_csv = Path("/Users/paul/Desktop/Final/disturbance_feature_engineering/disturbance_features_train.csv")
-selected_json = Path("/Users/paul/Desktop/Final/test_result/feature_config_micro.json")
+transition_dev_csv = Path("/Users/paul/Desktop/Final/lab1115_run/transition_fe/transition_features_train.csv")
+disturbance_dev_csv = Path("/Users/paul/Desktop/Final/lab1115_run/disturbance_fe/disturbance_features_train.csv")
+selected_json = Path("/Users/paul/Desktop/Final/lab1115_run/test_result/feature_config_micro.json")
 
-output_dir = Path("/Users/paul/Desktop/Final/test_result")
+output_dir = Path("/Users/paul/Desktop/Final/lab1115_run/test_result")
 output_dir.mkdir(parents=True, exist_ok=True)
 
 output_dev_csv = output_dir / "transition_disturbance_dev.csv"
